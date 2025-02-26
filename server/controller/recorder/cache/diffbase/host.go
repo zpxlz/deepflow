@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddHost(dbItem *mysql.Host, seq int) {
+func (b *DataSet) AddHost(dbItem *metadbmodel.Host, seq int) {
 	b.Hosts[dbItem.Lcuuid] = &Host{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -32,23 +32,25 @@ func (b *DataSet) AddHost(dbItem *mysql.Host, seq int) {
 		RegionLcuuid: dbItem.Region,
 		AZLcuuid:     dbItem.AZ,
 		IP:           dbItem.IP,
+		Hostname:     dbItem.Hostname,
 		HType:        dbItem.HType,
 		VCPUNum:      dbItem.VCPUNum,
 		MemTotal:     dbItem.MemTotal,
 		ExtraInfo:    dbItem.ExtraInfo,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_HOST_EN, b.Hosts[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_HOST_EN, b.Hosts[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteHost(lcuuid string) {
 	delete(b.Hosts, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_HOST_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_HOST_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type Host struct {
 	DiffBase
 	Name         string `json:"name"`
 	IP           string `json:"ip"`
+	Hostname     string `json:"hostname"`
 	HType        int    `json:"htype"`
 	VCPUNum      int    `json:"vcpu_num"`
 	MemTotal     int    `json:"mem_total"`
@@ -60,6 +62,7 @@ type Host struct {
 func (h *Host) Update(cloudItem *cloudmodel.Host) {
 	h.Name = cloudItem.Name
 	h.IP = cloudItem.IP
+	h.Hostname = cloudItem.Hostname
 	h.HType = cloudItem.HType
 	h.VCPUNum = cloudItem.VCPUNum
 	h.MemTotal = cloudItem.MemTotal

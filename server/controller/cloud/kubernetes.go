@@ -17,30 +17,41 @@
 package cloud
 
 import (
+	"time"
+
+	uuid "github.com/satori/go.uuid"
+
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 // Kubernetes平台直接使用对应kubernetesgather的resource作为cloud的resource
-func (c *Cloud) getKubernetesData() (model.Resource, float64) {
+func (c *Cloud) getKubernetesData() model.Resource {
 	k8sGatherTask, ok := c.kubernetesGatherTaskMap[c.basicInfo.Lcuuid]
 	if !ok {
-		log.Warningf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name)
+		log.Warningf("domain (%s) no related kubernetes_gather_task", c.basicInfo.Name, logger.NewORGPrefix(c.orgID))
 		return model.Resource{
 			ErrorState: common.RESOURCE_STATE_CODE_SUCCESS,
-		}, 0
+		}
 	}
 	kubernetesGatherResource := k8sGatherTask.GetResource()
 
 	// 避免合并时产生默认的空值，对kubernetes_gather resource的az做判断
 	if kubernetesGatherResource.AZ.Lcuuid == "" {
-		log.Infof("domain (%s) kubernetes_gather_task resource is null", c.basicInfo.Name)
+		log.Infof("domain (%s) kubernetes_gather_task resource is null", c.basicInfo.Name, logger.NewORGPrefix(c.orgID))
 		// return k8s gather error info
 		return model.Resource{
 			ErrorState:   kubernetesGatherResource.ErrorState,
 			ErrorMessage: kubernetesGatherResource.ErrorMessage,
-		}, 0
+		}
+	}
+
+	if len(kubernetesGatherResource.PodNodes) == 0 {
+		return model.Resource{
+			ErrorState:   common.RESOURCE_STATE_CODE_WARNING,
+			ErrorMessage: "invalid pod node count (0)",
+		}
 	}
 
 	// 合并网络
@@ -76,7 +87,7 @@ func (c *Cloud) getKubernetesData() (model.Resource, float64) {
 		regions = append(regions, kubernetesGatherResource.Region)
 	}
 
-	// 将所有容器节点默认同步为云服务器
+	// 将所有容器节点默认同步为云主机
 	vms := []model.VM{}
 	vmPodNodeConnections := []model.VMPodNodeConnection{}
 	for _, node := range kubernetesGatherResource.PodNodes {
@@ -91,6 +102,8 @@ func (c *Cloud) getKubernetesData() (model.Resource, float64) {
 			Label:        node.Lcuuid,
 			HType:        common.VM_HTYPE_VM_C,
 			State:        state,
+			IP:           node.IP,
+			Hostname:     node.Hostname,
 			VPCLcuuid:    node.VPCLcuuid,
 			AZLcuuid:     node.AZLcuuid,
 			RegionLcuuid: node.RegionLcuuid,
@@ -102,8 +115,13 @@ func (c *Cloud) getKubernetesData() (model.Resource, float64) {
 		})
 	}
 
+	if kubernetesGatherResource.ErrorState == common.RESOURCE_STATE_CODE_SUCCESS {
+		c.sendStatsd(k8sGatherTask.GetGatherCost())
+	}
+
 	return model.Resource{
 		Verified:               true,
+		SyncAt:                 time.Now(),
 		AZs:                    []model.AZ{kubernetesGatherResource.AZ},
 		VPCs:                   []model.VPC{kubernetesGatherResource.VPC},
 		PodClusters:            []model.PodCluster{kubernetesGatherResource.PodCluster},
@@ -120,7 +138,6 @@ func (c *Cloud) getKubernetesData() (model.Resource, float64) {
 		PodServicePorts:        kubernetesGatherResource.PodServicePorts,
 		PodIngressRules:        kubernetesGatherResource.PodIngressRules,
 		PodIngressRuleBackends: kubernetesGatherResource.PodIngressRuleBackends,
-		PrometheusTargets:      kubernetesGatherResource.PrometheusTargets,
 		IPs:                    ips,
 		VMs:                    vms,
 		Regions:                regions,
@@ -128,5 +145,5 @@ func (c *Cloud) getKubernetesData() (model.Resource, float64) {
 		Networks:               networks,
 		VInterfaces:            vinterfaces,
 		VMPodNodeConnections:   vmPodNodeConnections,
-	}, k8sGatherTask.GetGatherCost()
+	}
 }

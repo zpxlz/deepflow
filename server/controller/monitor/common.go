@@ -22,11 +22,12 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	logging "github.com/op/go-logging"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("monitor")
+var log = logger.MustGetLogger("monitor")
 
 type dfHostCheck struct {
 	lastTimeUnix int64
@@ -62,15 +63,15 @@ func getIPMap(hostType string) (map[string]bool, error) {
 	var res map[string]bool
 	switch hostType {
 	case common.HOST_TYPE_CONTROLLER:
-		var controllers []mysql.Controller
-		mysql.Db.Where("state = ?", common.HOST_STATE_COMPLETE).Find(&controllers)
+		var controllers []metadbmodel.Controller
+		metadb.DefaultDB.Find(&controllers)
 		res = make(map[string]bool, len(controllers))
 		for _, controller := range controllers {
 			res[controller.IP] = true
 		}
 	case common.HOST_TYPE_ANALYZER:
-		var analyzers []mysql.Analyzer
-		mysql.Db.Where("state = ?", common.HOST_STATE_COMPLETE).Find(&analyzers)
+		var analyzers []metadbmodel.Analyzer
+		metadb.DefaultDB.Find(&analyzers)
 		res = make(map[string]bool, len(analyzers))
 		for _, analyzer := range analyzers {
 			res[analyzer.IP] = true

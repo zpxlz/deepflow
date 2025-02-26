@@ -37,15 +37,19 @@ var log = logging.MustGetLogger("config")
 const (
 	DefaultLocalIP                  = "127.0.0.1"
 	DefaultControllerPort           = 20035
-	DefaultCheckInterval            = 300 // clickhouse是异步删除
+	DefaultCheckInterval            = 180 // clickhouse是异步删除
 	DefaultDiskUsedPercent          = 80
-	DefaultDiskFreeSpace            = 100
-	DefaultDFDiskPrefix             = "path_" // In the config.xml of ClickHouse, the disk name of the storage policy 'df_storage' written by deepflow-server starts with 'path_'
+	DefaultDiskFreeSpace            = 300
+	DefaultDFDiskPrefix             = "path_"           // In the config.xml of ClickHouse, the disk name of the storage policy 'df_storage' written by deepflow-server starts with 'path_'
+	DefaultSystemDiskPrefix         = "default"         // In the config.xml of ClickHouse, the disk name of default storage policy 'default'
+	DefaultByconityLocalDiskPrefix  = "server_local_"   // In the config.xml of ByConity, the disk name of the storage policy 'default'
+	DefaultBycontiyS3DiskPrefix     = "server_s3_disk_" // In the config.xml of ByConity, the disk name of the storage policy 'cnch_default_s3'
 	EnvK8sNodeIP                    = "K8S_NODE_IP_FOR_DEEPFLOW"
 	EnvK8sPodName                   = "K8S_POD_NAME_FOR_DEEPFLOW"
 	EnvK8sNodeName                  = "K8S_NODE_NAME_FOR_DEEPFLOW"
 	EnvK8sNamespace                 = "K8S_NAMESPACE_FOR_DEEPFLOW"
 	DefaultCKDBService              = "deepflow-clickhouse"
+	DefaultByconityService          = "deepflow-byconity-server"
 	DefaultCKDBServicePort          = 9000
 	DefaultListenPort               = 20033
 	DefaultGrpcBufferSize           = 41943040
@@ -60,6 +64,10 @@ const (
 	FormatDecimal                   = "decimal"
 	EnvRunningMode                  = "DEEPFLOW_SERVER_RUNNING_MODE"
 	RunningModeStandalone           = "STANDALONE"
+	DefaultByconityStoragePolicy    = "cnch_default_s3"
+	// the maximum number of endpoints for a server corresponding to ClickHouse;
+	//   any endpoints beyond this limit will be ignored
+	MaxClickHouseEndpointsPerServer = 128
 )
 
 type DatabaseTable struct {
@@ -75,9 +83,25 @@ type DiskCleanup struct {
 }
 
 type CKDiskMonitor struct {
-	CheckInterval int             `yaml:"check-interval"` // s
-	DiskCleanups  []DiskCleanup   `yaml:"disk-cleanups"`
-	PriorityDrops []DatabaseTable `yaml:"priority-drops"`
+	CheckInterval    int             `yaml:"check-interval"` // s
+	TTLCheckDisabled bool            `yaml:"ttl-check-disabled"`
+	DiskCleanups     []DiskCleanup   `yaml:"disk-cleanups"`
+	PriorityDrops    []DatabaseTable `yaml:"priority-drops"`
+}
+
+func (m *CKDiskMonitor) Validate() {
+	if m.CheckInterval == 0 {
+		m.CheckInterval = DefaultCheckInterval
+	}
+	for i := range m.DiskCleanups {
+		clean := &m.DiskCleanups[i]
+		if clean.FreeSpace == 0 {
+			clean.FreeSpace = DefaultDiskFreeSpace
+		}
+		if clean.UsedPercent == 0 || clean.UsedPercent > 100 {
+			clean.UsedPercent = DefaultDiskUsedPercent
+		}
+	}
 }
 
 type Disk struct {
@@ -115,15 +139,28 @@ type CKWriterConfig struct {
 }
 
 type CKDB struct {
-	External            bool   `yaml:"external"`
-	Host                string `yaml:"host"`
-	ActualAddrs         []string
+	External            bool     `yaml:"external"`
+	Type                string   `yaml:"type"`
+	Host                string   `yaml:"host"`
+	actualAddrsValue    []string // the maximum length must not exceed MaxClickHouseEndpointsPerServer.
+	ActualAddrs         *[]string
 	Watcher             *Watcher
 	Port                int    `yaml:"port"`
 	EndpointTCPPortName string `yaml:"endpoint-tcp-port-name"`
 	ClusterName         string `yaml:"cluster-name"`
 	StoragePolicy       string `yaml:"storage-policy"`
 	TimeZone            string `yaml:"time-zone"`
+}
+
+func (c *CKDB) updateActualAddrs(endpoints []Endpoint) {
+	if c.actualAddrsValue == nil {
+		c.actualAddrsValue = make([]string, 0, MaxClickHouseEndpointsPerServer)
+	}
+	c.actualAddrsValue = c.actualAddrsValue[:0]
+	for _, endpoint := range endpoints {
+		c.actualAddrsValue = append(c.actualAddrsValue, endpoint.String())
+	}
+	c.ActualAddrs = &c.actualAddrsValue
 }
 
 type Config struct {
@@ -160,7 +197,7 @@ type Location struct {
 }
 
 type TraceIdWithIndex struct {
-	Enabled               bool     `yaml:"enabled"`
+	Disabled              bool     `yaml:"disabled"`
 	Type                  string   `yaml:"type"`
 	IncrementalIdLocation Location `yaml:"incremental-id-location"`
 	FormatIsHex           bool
@@ -184,7 +221,11 @@ func (c *Config) Validate() error {
 	// in standalone mode, only supports single node and does not support horizontal expansion
 	c.IsRunningModeStandalone = runningMode == RunningModeStandalone
 
-	if c.TraceIdWithIndex.Enabled {
+	if !c.TraceIdWithIndex.Disabled {
+		if c.TraceIdWithIndex.Type == "" {
+			c.TraceIdWithIndex.Type = IndexTypeHash
+		}
+
 		if c.TraceIdWithIndex.Type != IndexTypeIncremetalIdLocation && c.TraceIdWithIndex.Type != IndexTypeHash {
 			log.Errorf("invalid 'type'(%s) of 'trace-id-with-index', must be '%s' or '%s'", c.TraceIdWithIndex.Type, IndexTypeIncremetalIdLocation, IndexTypeHash)
 			sleepAndExit()
@@ -260,7 +301,9 @@ func (c *Config) Validate() error {
 			c.CKDB.Port = DefaultCKDBServicePort
 		}
 		// in standalone mode, only supports one ClickHouse node
-		c.CKDB.ActualAddrs = append(c.CKDB.ActualAddrs, fmt.Sprintf("%s:%d", c.CKDB.Host, c.CKDB.Port))
+		var actualAddrs []string
+		actualAddrs = append(actualAddrs, fmt.Sprintf("%s:%d", c.CKDB.Host, c.CKDB.Port))
+		c.CKDB.ActualAddrs = &actualAddrs
 	} else {
 		if c.NodeIP == "" && c.ControllerIPs[0] == DefaultLocalIP {
 			nodeIP, exist := os.LookupEnv(EnvK8sNodeIP)
@@ -293,9 +336,23 @@ func (c *Config) Validate() error {
 	if c.StorageDisabled {
 		return nil
 	}
+	c.CKDiskMonitor.Validate()
+
+	if c.CKDB.Type == "" {
+		c.CKDB.Type = ckdb.CKDBTypeClickhouse
+	}
+
+	if c.CKDB.Type != ckdb.CKDBTypeByconity && c.CKDB.Type != ckdb.CKDBTypeClickhouse {
+		log.Errorf("the setting of 'ckdb.type' (%s) is invalid, should be '%s' or '%s'", c.CKDB.Type, ckdb.CKDBTypeClickhouse, ckdb.CKDBTypeByconity)
+		sleepAndExit()
+	}
 
 	if c.CKDB.Host == "" {
-		c.CKDB.Host = DefaultCKDBService
+		if c.CKDB.Type == ckdb.CKDBTypeClickhouse {
+			c.CKDB.Host = DefaultCKDBService
+		} else {
+			c.CKDB.Host = DefaultByconityService
+		}
 	}
 	if c.CKDB.Port == 0 {
 		c.CKDB.Port = DefaultCKDBServicePort
@@ -316,6 +373,9 @@ func (c *Config) Validate() error {
 		} else {
 			c.CKDB.StoragePolicy = ckdb.DF_STORAGE_POLICY
 		}
+		if c.CKDB.Type == ckdb.CKDBTypeByconity {
+			c.CKDB.StoragePolicy = DefaultByconityStoragePolicy
+		}
 	}
 	if c.CKDB.TimeZone == "" {
 		c.CKDB.TimeZone = ckdb.DF_TIMEZONE
@@ -333,43 +393,37 @@ func (c *Config) Validate() error {
 			time.Sleep(time.Second * 30)
 		}
 		if watcher == nil {
-			watcher, err = NewWatcher(myNodeName, myPodName, myNamespace, c.CKDB.Host, c.CKDB.EndpointTCPPortName, c.CKDB.External, c.ControllerIPs, int(c.ControllerPort), c.GrpcBufferSize)
+			watcher, err = NewWatcher(c, myNodeName, myPodName, myNamespace)
 			if err != nil {
-				log.Warningf("get kubernetes watcher failed %s", err)
+				log.Warningf("get kubernetes watcher failed: %s", err)
 				continue
 			}
 		}
 
 		endpoints, err := watcher.GetMyClickhouseEndpoints()
 		if err != nil {
-			log.Warningf("get clickhouse endpoints(%s) failed, err: %s", c.CKDB.Host, err)
+			log.Warningf("get clickhouse endpoints (%s) failed: %s", c.CKDB.Host, err)
 			continue
 		}
-		c.CKDB.ActualAddrs = c.CKDB.ActualAddrs[:0]
-		for _, endpoint := range endpoints {
-			// if it is an IPv6 address, it needs to be enclosed in []
-			if strings.Contains(endpoint.Host, ":") {
-				c.CKDB.ActualAddrs = append(c.CKDB.ActualAddrs, fmt.Sprintf("[%s]:%d", endpoint.Host, endpoint.Port))
-			} else {
-				c.CKDB.ActualAddrs = append(c.CKDB.ActualAddrs, fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port))
-			}
-		}
+		c.CKDB.updateActualAddrs(endpoints)
 		c.CKDB.Watcher = watcher
-		log.Infof("get clickhouse actual address: %s", c.CKDB.ActualAddrs)
+		log.Infof("get clickhouse actual address: %s", c.CKDB.actualAddrsValue)
 
-		conns, err := common.NewCKConnections(c.CKDB.ActualAddrs, c.CKDBAuth.Username, c.CKDBAuth.Password)
+		conns, err := common.NewCKConnections(c.CKDB.actualAddrsValue, c.CKDBAuth.Username, c.CKDBAuth.Password)
 		if err != nil {
-			log.Warningf("connect to clickhouse %s failed, err: %s", c.CKDB.ActualAddrs, err)
+			log.Warningf("connect to clickhouse %s failed: %s", c.CKDB.actualAddrsValue, err)
 			continue
 		}
 
-		if err := CheckCluster(conns, c.CKDB.ClusterName); err != nil {
-			log.Errorf("get clickhouse cluster(%s) info from table 'system.clusters' failed, err: %s", c.CKDB.ClusterName, err)
-			continue
+		if c.CKDB.Type != ckdb.CKDBTypeByconity {
+			if err := CheckCluster(conns, c.CKDB.ClusterName); err != nil {
+				log.Errorf("get clickhouse cluster (%s) info from table 'system.clusters' failed: %s", c.CKDB.ClusterName, err)
+				continue
+			}
 		}
 
 		if err := CheckStoragePolicy(conns, c.CKDB.StoragePolicy); err != nil {
-			log.Errorf("get clickhouse storage policy(%s) info from table 'system.storage_polices' failed, err: %s", c.CKDB.StoragePolicy, err)
+			log.Errorf("get clickhouse storage policy (%s) info from table 'system.storage_polices' failed: %s", c.CKDB.StoragePolicy, err)
 			continue
 		}
 		break
@@ -444,15 +498,34 @@ func Load(path string) *Config {
 			TCPReaderBuffer: 1 << 20,
 			CKDiskMonitor: CKDiskMonitor{
 				DefaultCheckInterval,
+				false,
 				[]DiskCleanup{
+					{
+						DefaultSystemDiskPrefix,
+						DefaultDiskUsedPercent,
+						DefaultDiskFreeSpace,
+						0,
+					},
 					{
 						DefaultDFDiskPrefix,
 						DefaultDiskUsedPercent,
 						DefaultDiskFreeSpace,
 						0,
 					},
+					{
+						DefaultByconityLocalDiskPrefix,
+						DefaultDiskUsedPercent,
+						DefaultDiskFreeSpace,
+						0,
+					},
+					{
+						DefaultBycontiyS3DiskPrefix,
+						DefaultDiskUsedPercent,
+						DefaultDiskFreeSpace,
+						0,
+					},
 				},
-				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}},
+				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}, {"profile", ""}, {"application_log", ""}},
 			},
 			ListenPort:               DefaultListenPort,
 			GrpcBufferSize:           DefaultGrpcBufferSize,
@@ -489,8 +562,8 @@ func CheckCluster(conns common.DBs, clusterName string) error {
 	}
 	var addr string
 	var port uint16
-	for rows.Next() {
-		return rows.Scan(&addr, &port)
+	for rows[0].Next() {
+		return rows[0].Scan(&addr, &port)
 	}
 
 	return fmt.Errorf("cluster '%s' not find", clusterName)
@@ -503,8 +576,8 @@ func CheckStoragePolicy(conns common.DBs, storagePolicy string) error {
 		return err
 	}
 	var policyName string
-	for rows.Next() {
-		return rows.Scan(&policyName)
+	for rows[0].Next() {
+		return rows[0].Scan(&policyName)
 	}
 	return fmt.Errorf("storage policy '%s' not find", storagePolicy)
 }

@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type PodIngress struct {
-	OperatorBase[mysql.PodIngress]
+	OperatorBase[*metadbmodel.PodIngress, metadbmodel.PodIngress]
 }
 
 func NewPodIngress() *PodIngress {
 	operater := &PodIngress{
-		OperatorBase[mysql.PodIngress]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.PodIngress](
+			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *PodIngress) setDBItemID(dbItem *mysql.PodIngress, id int) {
-	dbItem.ID = id
 }

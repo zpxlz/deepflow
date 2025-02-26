@@ -23,7 +23,7 @@ import (
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -31,28 +31,33 @@ import (
 	"time"
 
 	simplejson "github.com/bitly/go-simplejson"
-	logging "github.com/op/go-logging"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	cloudconfig "github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.qingcloud")
+var log = logger.MustGetLogger("cloud.qingcloud")
 
 type QingCloud struct {
-	Uuid          string
-	UuidGenerate  string
-	Name          string
-	RegionUuid    string
-	url           string
-	secretID      string
-	secretKey     string
-	isPublicCloud bool
-	httpTimeout   int
+	orgID                 int
+	teamID                int
+	Uuid                  string
+	UuidGenerate          string
+	Name                  string
+	RegionUuid            string
+	url                   string
+	secretID              string
+	secretKey             string
+	isPublicCloud         bool
+	DisableSyncLBListener bool
+	httpTimeout           int
+	MaxRetries            uint
+	RetryDuration         uint
 
 	defaultVPCName   string
 	defaultVxnetName string
@@ -77,33 +82,30 @@ type QingCloud struct {
 	debugger *cloudcommon.Debugger
 }
 
-func NewQingCloud(domain mysql.Domain, cfg cloudconfig.CloudConfig) (*QingCloud, error) {
+func NewQingCloud(orgID int, domain metadbmodel.Domain, cfg cloudconfig.CloudConfig) (*QingCloud, error) {
 	config, err := simplejson.NewJson([]byte(domain.Config))
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
 	secretID, err := config.Get("secret_id").String()
 	if err != nil {
-		log.Error("secret_id must be specified")
+		log.Error("secret_id must be specified", logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
 	secretKey, err := config.Get("secret_key").String()
 	if err != nil {
-		log.Error("secret_key must be specified")
+		log.Error("secret_key must be specified", logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 	decryptSecretKey, err := common.DecryptSecretKey(secretKey)
 	if err != nil {
-		log.Error("decrypt secret_key failed (%s)", err.Error())
+		log.Error("decrypt secret_key failed (%s)", err.Error(), logger.NewORGPrefix(orgID))
 		return nil, err
 	}
-	log.Debugf(
-		"domain (%s) secret_key: %s, decrypt secret_key: %s",
-		domain.Name, secretKey, decryptSecretKey,
-	)
+	log.Debugf("domain (%s) secret_key: %s, decrypt secret_key: %s", domain.Name, secretKey, decryptSecretKey, logger.NewORGPrefix(orgID))
 
 	url := config.Get("url").MustString()
 	if url == "" {
@@ -111,16 +113,21 @@ func NewQingCloud(domain mysql.Domain, cfg cloudconfig.CloudConfig) (*QingCloud,
 	}
 
 	return &QingCloud{
-		Uuid: domain.Lcuuid,
+		orgID:  orgID,
+		teamID: domain.TeamID,
+		Uuid:   domain.Lcuuid,
 		// TODO: display_name后期需要修改为uuid_generate
-		UuidGenerate:  domain.DisplayName,
-		Name:          domain.Name,
-		RegionUuid:    config.Get("region_uuid").MustString(),
-		url:           url,
-		secretID:      secretID,
-		secretKey:     decryptSecretKey,
-		isPublicCloud: domain.Type == common.QINGCLOUD,
-		httpTimeout:   cfg.HTTPTimeout,
+		UuidGenerate:          domain.DisplayName,
+		Name:                  domain.Name,
+		RegionUuid:            config.Get("region_uuid").MustString(),
+		url:                   url,
+		secretID:              secretID,
+		secretKey:             decryptSecretKey,
+		isPublicCloud:         domain.Type == common.QINGCLOUD,
+		httpTimeout:           cfg.HTTPTimeout,
+		MaxRetries:            cfg.QingCloudConfig.MaxRetries,
+		RetryDuration:         cfg.QingCloudConfig.RetryDuration,
+		DisableSyncLBListener: cfg.QingCloudConfig.DisableSyncLBListener,
 
 		defaultVPCName:            domain.Name + "_default_vpc",
 		defaultVxnetName:          "vxnet-0",
@@ -188,13 +195,13 @@ func (q *QingCloud) GetResponse(action string, resultKey string, kwargs []*Param
 	var response []*simplejson.Json
 	startTime := time.Now()
 	count := 0
-
+	var retry, maxRetries uint = 0, q.MaxRetries
 	offset, limit := 0, 100
 	for {
 		url := q.getURL(action, kwargs, offset, limit)
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
-			log.Errorf("new (%s) request failed, (%v)", action, err)
+			log.Errorf("new (%s) request failed, (%v)", action, err, logger.NewORGPrefix(q.orgID))
 			return nil, err
 		}
 
@@ -206,38 +213,63 @@ func (q *QingCloud) GetResponse(action string, resultKey string, kwargs []*Param
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Errorf("curl (%s) failed, (%v)", url, err)
+			errMSG := fmt.Sprintf("curl (%s) failed, (%v)", url, err)
+			log.Warning(errMSG, logger.NewORGPrefix(q.orgID))
+			if retry < maxRetries {
+				retry += 1
+				log.Warningf("(%s) try again (%d/%d) in (%d) seconds", action, retry, maxRetries, q.RetryDuration, logger.NewORGPrefix(q.orgID))
+				time.Sleep(time.Duration(q.RetryDuration) * time.Second)
+				continue
+			}
+			log.Error(errMSG, logger.NewORGPrefix(q.orgID))
 			return nil, err
 		} else if resp.StatusCode != http.StatusOK {
-			log.Errorf("curl (%s) failed, (%v)", url, resp)
-			defer resp.Body.Close()
-			return nil, errors.New(fmt.Sprintf("curl (%s) failed, (%v)", url, resp))
+			errMSG := fmt.Sprintf("curl (%s) failed, (%v)", url, resp)
+			log.Warning(errMSG, logger.NewORGPrefix(q.orgID))
+			if retry < maxRetries {
+				retry += 1
+				log.Warningf("(%s) try again (%d/%d) in (%d) seconds", action, retry, maxRetries, q.RetryDuration, logger.NewORGPrefix(q.orgID))
+				time.Sleep(time.Duration(q.RetryDuration) * time.Second)
+				continue
+			}
+			log.Error(errMSG, logger.NewORGPrefix(q.orgID))
+			return nil, errors.New(errMSG)
 		}
 		defer resp.Body.Close()
 
-		respBytes, err := ioutil.ReadAll(resp.Body)
+		respBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Errorf("read (%s) response failed, (%v)", action, err)
+			log.Errorf("read (%s) response failed, (%v)", action, err, logger.NewORGPrefix(q.orgID))
 			return nil, err
 		}
 		respJson, err := simplejson.NewJson(respBytes)
 		if err != nil {
-			log.Errorf("parse (%s) response failed, (%v)", action, err)
+			log.Errorf("parse (%s) response body (%s) failed, (%v)", action, string(respBytes), err, logger.NewORGPrefix(q.orgID))
 			return nil, err
 		}
-		if curResp, ok := respJson.CheckGet(resultKey); ok {
-			response = append(response, curResp)
-			curRespLens := len(curResp.MustArray())
-			count += curRespLens
-			if curRespLens < limit {
-				break
+
+		curResp, ok := respJson.CheckGet(resultKey)
+		if !ok {
+			errMSG := fmt.Sprintf("get (%s) response (%s) failed, (%v)", action, resultKey, respJson)
+			log.Warning(errMSG, logger.NewORGPrefix(q.orgID))
+			if retry < maxRetries {
+				retry += 1
+				log.Warningf("(%s) try again (%d/%d) in (%d) seconds", action, retry, maxRetries, q.RetryDuration, logger.NewORGPrefix(q.orgID))
+				time.Sleep(time.Duration(q.RetryDuration) * time.Second)
+				continue
 			}
-			offset += limit
-		} else {
-			err := errors.New(fmt.Sprintf("get (%s) response (%s) failed, (%v)", action, resultKey, respJson))
-			log.Error(respJson)
-			return nil, err
+			log.Error(errMSG, logger.NewORGPrefix(q.orgID))
+			return nil, errors.New(errMSG)
 		}
+		response = append(response, curResp)
+		curRespLens := len(curResp.MustArray())
+		count += curRespLens
+		if curRespLens < limit {
+			break
+		}
+		offset += limit
+		// get api success, reset retry times
+		retry = 0
 	}
 
 	// qingcloud has a unified call API，so this could be very convenient
@@ -259,7 +291,7 @@ func (q *QingCloud) GetRegionLcuuid(lcuuid string) string {
 func (q *QingCloud) CheckRequiredAttributes(json *simplejson.Json, attributes []string) error {
 	for _, attribute := range attributes {
 		if _, ok := json.CheckGet(attribute); !ok {
-			log.Debugf("get attribute (%s) failed", attribute)
+			log.Debugf("get attribute (%s) failed", attribute, logger.NewORGPrefix(q.orgID))
 			return errors.New(fmt.Sprintf("get attribute (%s) failed", attribute))
 		}
 	}
@@ -279,6 +311,8 @@ func (q *QingCloud) GetStatter() statsd.StatsdStatter {
 	}
 
 	return statsd.StatsdStatter{
+		OrgID:      q.orgID,
+		TeamID:     q.teamID,
 		GlobalTags: globalTags,
 		Element:    statsd.GetCloudStatsd(q.CloudStatsd),
 	}
@@ -286,34 +320,35 @@ func (q *QingCloud) GetStatter() statsd.StatsdStatter {
 
 func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	var resource model.Resource
+
 	// every tasks must init
 	q.CloudStatsd = statsd.NewCloudStatsd()
 
 	// 区域和可用区
 	regions, azs, err := q.getRegionAndAZs()
 	if err != nil {
-		log.Error("get region and az data failed")
+		log.Error("get region and az data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 
 	// VPC
 	vpcs, err := q.GetVPCs()
 	if err != nil {
-		log.Error("get vpc data failed")
+		log.Error("get vpc data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 
 	// 子网及网段
 	networks, subnets, err := q.GetNetworks()
 	if err != nil {
-		log.Error("get network and subnet data failed")
+		log.Error("get network and subnet data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 
-	// 虚拟机及关联安全组信息
-	vms, vmSecurityGroups, tmpSubnets, err := q.GetVMs()
+	// 虚拟机信息
+	vms, tmpSubnets, err := q.GetVMs()
 	if err != nil {
-		log.Error("get vm data failed")
+		log.Error("get vm data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 	subnets = append(subnets, tmpSubnets...)
@@ -321,21 +356,14 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	// 虚拟机网卡及IP信息
 	vinterfaces, ips, err := q.GetVMNics()
 	if err != nil {
-		log.Error("get vm nic data failed")
-		return resource, err
-	}
-
-	// 安全组及规则
-	securityGroups, securityGroupRules, err := q.GetSecurityGroups()
-	if err != nil {
-		log.Error("get security_group and rule data failed")
+		log.Error("get vm nic data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 
 	// 路由表及规则
 	vrouters, routingTables, tmpVInterfaces, tmpIPs, err := q.GetRouterAndTables()
 	if err != nil {
-		log.Error("get router and rule data failed")
+		log.Error("get router and rule data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 	vinterfaces = append(vinterfaces, tmpVInterfaces...)
@@ -344,7 +372,7 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	// NAT网关
 	natGateways, tmpVInterfaces, tmpIPs, natVMConnections, err := q.GetNATGateways()
 	if err != nil {
-		log.Error("get nat_gateway data failed")
+		log.Error("get nat_gateway data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 	vinterfaces = append(vinterfaces, tmpVInterfaces...)
@@ -353,7 +381,7 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	// 负载均衡器及规则
 	lbs, lbListeners, lbTargetServers, tmpVInterfaces, tmpIPs, lbVMConnections, err := q.GetLoadBalances()
 	if err != nil {
-		log.Error("get load_balance data failed")
+		log.Error("get load_balance data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 	vinterfaces = append(vinterfaces, tmpVInterfaces...)
@@ -362,7 +390,7 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	// FloatingIP
 	tmpVInterfaces, tmpIPs, floatingIPs, err := q.GetFloatingIPs()
 	if err != nil {
-		log.Error("get floating_ip data failed")
+		log.Error("get floating_ip data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 	vinterfaces = append(vinterfaces, tmpVInterfaces...)
@@ -371,7 +399,7 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	// 附属容器集群
 	subDomains, err := q.GetSubDomains()
 	if err != nil {
-		log.Error("get sub_domain data failed")
+		log.Error("get sub_domain data failed", logger.NewORGPrefix(q.orgID))
 		return resource, err
 	}
 
@@ -381,11 +409,8 @@ func (q *QingCloud) GetCloudData() (model.Resource, error) {
 	resource.Networks = networks
 	resource.Subnets = subnets
 	resource.VMs = vms
-	resource.VMSecurityGroups = vmSecurityGroups
 	resource.VInterfaces = vinterfaces
 	resource.IPs = ips
-	resource.SecurityGroups = securityGroups
-	resource.SecurityGroupRules = securityGroupRules
 	resource.VRouters = vrouters
 	resource.RoutingTables = routingTables
 	resource.NATGateways = natGateways

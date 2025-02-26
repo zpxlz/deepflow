@@ -20,16 +20,17 @@ import (
 	vpc "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (a *Aliyun) getAZs(region model.Region) ([]model.AZ, error) {
 	var retAZs []model.AZ
 
-	log.Debug("get azs starting")
+	log.Debug("get azs starting", logger.NewORGPrefix(a.orgID))
 	request := vpc.CreateDescribeZonesRequest()
 	response, err := a.getAZResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(a.orgID))
 		return retAZs, err
 	}
 
@@ -40,14 +41,14 @@ func (a *Aliyun) getAZs(region model.Region) ([]model.AZ, error) {
 
 			zoneId := az.Get("ZoneId").MustString()
 			retAZ := model.AZ{
-				Lcuuid:       common.GenerateUUID(a.uuidGenerate + "_" + zoneId),
+				Lcuuid:       common.GenerateUUIDByOrgID(a.orgID, a.uuidGenerate+"_"+zoneId),
 				Name:         az.Get("LocalName").MustString(),
 				Label:        zoneId,
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid: a.regionLcuuid,
 			}
 			retAZs = append(retAZs, retAZ)
 		}
 	}
-	log.Debug("get azs complete")
+	log.Debug("get azs complete", logger.NewORGPrefix(a.orgID))
 	return retAZs, nil
 }

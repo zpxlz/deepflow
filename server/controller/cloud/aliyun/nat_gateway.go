@@ -17,28 +17,28 @@
 package aliyun
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
 	"strconv"
 	"strings"
+
+	"github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 
 	vpc "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 )
 
-func (a *Aliyun) getNatGateways(region model.Region) (
-	[]model.NATGateway, []model.NATRule, []model.VInterface, []model.IP, error,
-) {
+func (a *Aliyun) getNatGateways(region model.Region) ([]model.NATGateway, []model.NATRule, []model.VInterface, []model.IP) {
 	var retNATGateways []model.NATGateway
 	var retNATRules []model.NATRule
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get nat_gateways starting")
+	log.Debug("get nat_gateways starting", logger.NewORGPrefix(a.orgID))
 	request := vpc.CreateDescribeNatGatewaysRequest()
 	response, err := a.getNatGatewayResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return retNATGateways, retNATRules, retVInterfaces, retIPs, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.NATGateway{}, []model.NATRule{}, []model.VInterface{}, []model.IP{}
 	}
 
 	for _, r := range response {
@@ -47,7 +47,7 @@ func (a *Aliyun) getNatGateways(region model.Region) (
 
 			err := a.checkRequiredAttributes(natGateway, []string{"NatGatewayId", "Name", "VpcId"})
 			if err != nil {
-				log.Info(err)
+				log.Info(err, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 
@@ -67,21 +67,20 @@ func (a *Aliyun) getNatGateways(region model.Region) (
 				}
 			}
 
-			natGatewayLcuuid := common.GenerateUUID(natGatewayId)
-			vpcLcuuid := common.GenerateUUID(vpcId)
+			natGatewayLcuuid := common.GenerateUUIDByOrgID(a.orgID, natGatewayId)
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, vpcId)
 			retNATGateway := model.NATGateway{
 				Lcuuid:       natGatewayLcuuid,
 				Name:         natGatewayName,
 				Label:        natGatewayId,
 				FloatingIPs:  strings.Join(floatingIPs, `,`),
 				VPCLcuuid:    vpcLcuuid,
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid: a.regionLcuuid,
 			}
 			retNATGateways = append(retNATGateways, retNATGateway)
-			a.regionLcuuidToResourceNum[retNATGateway.RegionLcuuid]++
 
 			// 接口
-			vinterfaceLcuuid := common.GenerateUUID(natGatewayLcuuid)
+			vinterfaceLcuuid := common.GenerateUUIDByOrgID(a.orgID, natGatewayLcuuid)
 			retVInterface := model.VInterface{
 				Lcuuid:        vinterfaceLcuuid,
 				Type:          common.VIF_TYPE_WAN,
@@ -90,44 +89,36 @@ func (a *Aliyun) getNatGateways(region model.Region) (
 				DeviceType:    common.VIF_DEVICE_TYPE_NAT_GATEWAY,
 				NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid:  a.regionLcuuid,
 			}
 			retVInterfaces = append(retVInterfaces, retVInterface)
 
 			// IP
 			for _, ip := range floatingIPs {
-				ipLcuuid := common.GenerateUUID(vinterfaceLcuuid + ip)
+				ipLcuuid := common.GenerateUUIDByOrgID(a.orgID, vinterfaceLcuuid+ip)
 				retIP := model.IP{
 					Lcuuid:           ipLcuuid,
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               ip,
-					RegionLcuuid:     a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:     a.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 			}
 
 			// DNAT规则
 			dnatTableIds := natGateway.Get("ForwardTableIds").Get("ForwardTableId").MustStringArray()
-			tmpRules, err := a.getDNATRules(region, natGatewayId, dnatTableIds)
-			if err != nil {
-				return []model.NATGateway{}, []model.NATRule{}, []model.VInterface{}, []model.IP{}, err
-			}
-			retNATRules = append(retNATRules, tmpRules...)
+			retNATRules = append(retNATRules, a.getDNATRules(region, natGatewayId, dnatTableIds)...)
 
 			// SNAT规则
 			snatTableIds := natGateway.Get("SnatTableIds").Get("SnatTableId").MustStringArray()
-			tmpRules, err = a.getSNATRules(region, natGatewayId, snatTableIds)
-			if err != nil {
-				return []model.NATGateway{}, []model.NATRule{}, []model.VInterface{}, []model.IP{}, err
-			}
-			retNATRules = append(retNATRules, tmpRules...)
+			retNATRules = append(retNATRules, a.getSNATRules(region, natGatewayId, snatTableIds)...)
 		}
 	}
-	log.Debug("get nat_gateways complete")
-	return retNATGateways, retNATRules, retVInterfaces, retIPs, nil
+	log.Debug("get nat_gateways complete", logger.NewORGPrefix(a.orgID))
+	return retNATGateways, retNATRules, retVInterfaces, retIPs
 }
 
-func (a *Aliyun) getSNATRules(region model.Region, natGatewayId string, snatTableIds []string) ([]model.NATRule, error) {
+func (a *Aliyun) getSNATRules(region model.Region, natGatewayId string, snatTableIds []string) []model.NATRule {
 	var retNATRules []model.NATRule
 
 	for _, snatTableId := range snatTableIds {
@@ -135,8 +126,8 @@ func (a *Aliyun) getSNATRules(region model.Region, natGatewayId string, snatTabl
 		request.SnatTableId = snatTableId
 		response, err := a.getSNatRuleResponse(region.Label, request)
 		if err != nil {
-			log.Error(err)
-			return []model.NATRule{}, err
+			log.Warning(err, logger.NewORGPrefix(a.orgID))
+			return []model.NATRule{}
 		}
 		for _, s := range response {
 			for j := range s.Get("SnatTableEntry").MustArray() {
@@ -149,8 +140,8 @@ func (a *Aliyun) getSNATRules(region model.Region, natGatewayId string, snatTabl
 				}
 				snatId := snat.Get("SnatEntryId").MustString()
 				retNATRule := model.NATRule{
-					Lcuuid:           common.GenerateUUID(snatId),
-					NATGatewayLcuuid: common.GenerateUUID(natGatewayId),
+					Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, snatId),
+					NATGatewayLcuuid: common.GenerateUUIDByOrgID(a.orgID, natGatewayId),
 					Type:             "SNAT",
 					Protocol:         "ALL",
 					FloatingIP:       snat.Get("SnatIp").MustString(),
@@ -160,10 +151,10 @@ func (a *Aliyun) getSNATRules(region model.Region, natGatewayId string, snatTabl
 			}
 		}
 	}
-	return retNATRules, nil
+	return retNATRules
 }
 
-func (a *Aliyun) getDNATRules(region model.Region, natGatewayId string, dnatTableIds []string) ([]model.NATRule, error) {
+func (a *Aliyun) getDNATRules(region model.Region, natGatewayId string, dnatTableIds []string) []model.NATRule {
 	var retNATRules []model.NATRule
 
 	for _, dnatTableId := range dnatTableIds {
@@ -171,8 +162,8 @@ func (a *Aliyun) getDNATRules(region model.Region, natGatewayId string, dnatTabl
 		request.ForwardTableId = dnatTableId
 		response, err := a.getDNatRuleResponse(region.Label, request)
 		if err != nil {
-			log.Error(err)
-			return []model.NATRule{}, err
+			log.Warning(err, logger.NewORGPrefix(a.orgID))
+			return []model.NATRule{}
 		}
 		for _, f := range response {
 			for j := range f.Get("ForwardTableEntry").MustArray() {
@@ -210,8 +201,8 @@ func (a *Aliyun) getDNATRules(region model.Region, natGatewayId string, dnatTabl
 					key = floatingIP + dnatTableId + floatingIPPortStr + ipProtocol + fixedIP + fixedIPPortStr
 				}
 				retNATRule := model.NATRule{
-					Lcuuid:           common.GenerateUUID(key),
-					NATGatewayLcuuid: common.GenerateUUID(natGatewayId),
+					Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, key),
+					NATGatewayLcuuid: common.GenerateUUIDByOrgID(a.orgID, natGatewayId),
 					Type:             "DNAT",
 					Protocol:         protocol,
 					FloatingIP:       floatingIP,
@@ -223,5 +214,5 @@ func (a *Aliyun) getDNATRules(region model.Region, natGatewayId string, dnatTabl
 			}
 		}
 	}
-	return retNATRules, nil
+	return retNATRules
 }

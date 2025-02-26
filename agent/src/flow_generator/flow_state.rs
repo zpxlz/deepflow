@@ -725,17 +725,17 @@ mod tests {
     use super::*;
 
     use crate::common::endpoint::{
-        EndpointData, EndpointDataPov, EndpointInfo, EPC_FROM_DEEPFLOW, EPC_FROM_INTERNET,
+        EndpointData, EndpointDataPov, EndpointInfo, EPC_DEEPFLOW, EPC_INTERNET,
     };
     use crate::common::flow::{CloseType, PacketDirection};
-    use crate::config::RuntimeConfig;
+    use crate::config::UserConfig;
     use crate::flow_generator::flow_map::{Config, _new_flow_map_and_receiver};
     use crate::flow_generator::flow_node::FlowNode;
     use crate::flow_generator::{FlowTimeout, TcpTimeout};
     use crate::flow_generator::{FLOW_METRICS_PEER_DST, FLOW_METRICS_PEER_SRC, TIME_UNIT};
     use crate::rpc::get_timestamp;
     use crate::utils::test::Capture;
-    use public::proto::common::TridentType;
+    use public::proto::agent::AgentType;
 
     use packet_sequence_block::PacketSequenceBlock;
 
@@ -778,7 +778,7 @@ mod tests {
             (TcpFlags::ACK, PacketDirection::ClientToServer),
         ];
 
-        let (_, mut flow_map, _) = _new_flow_map_and_receiver(TridentType::TtProcess, None, false);
+        let (_, mut flow_map, _) = _new_flow_map_and_receiver(AgentType::TtProcess, None, false);
         let mut flow_node = FlowNode {
             timestamp_key: get_timestamp(0).as_nanos() as u64,
 
@@ -821,16 +821,18 @@ mod tests {
             residual_request: 0,
             next_tcp_seq0: 0,
             next_tcp_seq1: 0,
+            last_cap_seq: 0,
             packet_in_tick: false,
             policy_in_tick: [false; 2],
             packet_sequence_block: Some(Box::new(PacketSequenceBlock::default())), // Enterprise Edition Feature: packet-sequence
+            ..Default::default()
         };
 
         let peers = &mut flow_node.tagged_flow.flow.flow_metrics_peers;
         peers[FLOW_METRICS_PEER_SRC].total_packet_count = 1;
         peers[FLOW_METRICS_PEER_DST].total_packet_count = 1;
 
-        let config = (&RuntimeConfig::default()).into();
+        let config = (&UserConfig::default()).into();
         for (flags, direction) in packets {
             let _ = flow_map.update_flow_state_machine(&config, &mut flow_node, flags, direction);
         }
@@ -846,7 +848,7 @@ mod tests {
 
     #[test]
     fn state_machine() {
-        let (_, mut flow_map, _) = _new_flow_map_and_receiver(TridentType::TtProcess, None, false);
+        let (_, mut flow_map, _) = _new_flow_map_and_receiver(AgentType::TtProcess, None, false);
         let mut flow_node = FlowNode {
             timestamp_key: get_timestamp(0).as_nanos() as u64,
 
@@ -889,16 +891,18 @@ mod tests {
             residual_request: 0,
             next_tcp_seq0: 0,
             next_tcp_seq1: 0,
+            last_cap_seq: 0,
             packet_in_tick: false,
             policy_in_tick: [false; 2],
             packet_sequence_block: Some(Box::new(PacketSequenceBlock::default())), // Enterprise Edition Feature: packet-sequence
+            ..Default::default()
         };
 
         let peers = &mut flow_node.tagged_flow.flow.flow_metrics_peers;
         peers[FLOW_METRICS_PEER_SRC].total_packet_count = 1;
         peers[FLOW_METRICS_PEER_DST].total_packet_count = 1;
 
-        let config = (&RuntimeConfig::default()).into();
+        let config = (&UserConfig::default()).into();
         for data in init_test_case() {
             flow_node.flow_state = data.cur_state;
             let closed = flow_map.update_flow_state_machine(
@@ -922,7 +926,7 @@ mod tests {
 
     fn state_machine_helper<P: AsRef<Path>>(pcap_file: P, expect_close_type: CloseType) {
         let (module_config, mut flow_map, output_queue_receiver) =
-            _new_flow_map_and_receiver(TridentType::TtProcess, None, false);
+            _new_flow_map_and_receiver(AgentType::TtProcess, None, false);
 
         let capture = Capture::load_pcap(pcap_file, None);
         let packets = capture.as_meta_packets();
@@ -931,7 +935,7 @@ mod tests {
         let ep = EndpointDataPov::new(Arc::new(EndpointData {
             src_info: EndpointInfo {
                 real_ip: Ipv4Addr::UNSPECIFIED.into(),
-                l2_epc_id: EPC_FROM_DEEPFLOW,
+                l2_epc_id: EPC_DEEPFLOW,
                 l3_epc_id: 1,
                 l2_end: false,
                 l3_end: false,
@@ -943,8 +947,8 @@ mod tests {
             },
             dst_info: EndpointInfo {
                 real_ip: Ipv4Addr::UNSPECIFIED.into(),
-                l2_epc_id: EPC_FROM_DEEPFLOW,
-                l3_epc_id: EPC_FROM_INTERNET,
+                l2_epc_id: EPC_DEEPFLOW,
+                l3_epc_id: EPC_INTERNET,
                 l2_end: false,
                 l3_end: false,
                 is_device: false,

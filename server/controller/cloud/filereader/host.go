@@ -22,6 +22,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (f *FileReader) getHosts(fileInfo *FileInfo) ([]model.Host, error) {
@@ -35,11 +36,11 @@ func (f *FileReader) getHosts(fileInfo *FileInfo) ([]model.Host, error) {
 		azLcuuid, ok := f.azNameToLcuuid[host.AZ]
 		if !ok {
 			err := errors.New(fmt.Sprintf("az (%s) not in file", host.AZ))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(f.orgID))
 			return nil, err
 		}
 
-		lcuuid := common.GenerateUUID(f.UuidGenerate + "_host_" + host.IP)
+		lcuuid := common.GenerateUUIDByOrgID(f.orgID, f.UuidGenerate+"_host_"+host.IP)
 		retHosts = append(retHosts, model.Host{
 			Lcuuid:       lcuuid,
 			Name:         host.IP,

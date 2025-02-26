@@ -21,28 +21,54 @@ import (
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type WANIP struct {
-	UpdaterBase[cloudmodel.IP, mysql.WANIP, *diffbase.WANIP]
+	UpdaterBase[
+		cloudmodel.IP,
+		*diffbase.WANIP,
+		*metadbmodel.WANIP,
+		metadbmodel.WANIP,
+		*message.WANIPAdd,
+		message.WANIPAdd,
+		*message.WANIPUpdate,
+		message.WANIPUpdate,
+		*message.WANIPFieldsUpdate,
+		message.WANIPFieldsUpdate,
+		*message.WANIPDelete,
+		message.WANIPDelete]
 }
 
 func NewWANIP(wholeCache *cache.Cache, domainToolDataSet *tool.DataSet) *WANIP {
 	updater := &WANIP{
-		UpdaterBase[cloudmodel.IP, mysql.WANIP, *diffbase.WANIP]{
-			resourceType:      ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN,
-			cache:             wholeCache,
-			domainToolDataSet: domainToolDataSet,
-			dbOperator:        db.NewWANIP(),
-			diffBaseData:      wholeCache.DiffBaseDataSet.WANIPs,
-		},
+		newUpdaterBase[
+			cloudmodel.IP,
+			*diffbase.WANIP,
+			*metadbmodel.WANIP,
+			metadbmodel.WANIP,
+			*message.WANIPAdd,
+			message.WANIPAdd,
+			*message.WANIPUpdate,
+			message.WANIPUpdate,
+			*message.WANIPFieldsUpdate,
+			message.WANIPFieldsUpdate,
+			*message.WANIPDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN,
+			wholeCache,
+			db.NewWANIP().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.WANIPs,
+			nil,
+		),
 	}
+	updater.setDomainToolDataSet(domainToolDataSet)
 	updater.dataGenerator = updater
 	return updater
 }
@@ -56,7 +82,7 @@ func (i *WANIP) getDiffBaseByCloudItem(cloudItem *cloudmodel.IP) (diffBase *diff
 	return
 }
 
-func (i *WANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.WANIP, bool) {
+func (i *WANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*metadbmodel.WANIP, bool) {
 	vinterfaceID, exists := i.cache.ToolDataSet.GetVInterfaceIDByLcuuid(cloudItem.VInterfaceLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
@@ -66,12 +92,16 @@ func (i *WANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.WANIP, boo
 		return nil, false
 	}
 	var subnetID int
-	if cloudItem.SubnetLcuuid != "" {
-		subnetID, exists = i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
-		if !exists && i.domainToolDataSet != nil {
-			subnetID, _ = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
-		}
-	}
+
+	// ip subnet id is not used in the current version, so it is commented out to avoid updating the subnet id too frequently,
+	// which may cause recorder performance issues.
+
+	// if cloudItem.SubnetLcuuid != "" {
+	// 	subnetID, exists = i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+	// 	if !exists && i.domainToolDataSet != nil {
+	// 		subnetID, _ = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+	// 	}
+	// }
 	ip := rcommon.FormatIP(cloudItem.IP)
 	if ip == "" {
 		log.Error(ipIsInvalid(
@@ -79,9 +109,9 @@ func (i *WANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.WANIP, boo
 		))
 		return nil, false
 	}
-	dbItem := &mysql.WANIP{
+	dbItem := &metadbmodel.WANIP{
 		IP:           ip,
-		Domain:       i.cache.DomainLcuuid,
+		Domain:       i.metadata.Domain.Lcuuid,
 		SubDomain:    cloudItem.SubDomainLcuuid,
 		VInterfaceID: vinterfaceID,
 		SubnetID:     subnetID,
@@ -99,31 +129,39 @@ func (i *WANIP) generateDBItemToAdd(cloudItem *cloudmodel.IP) (*mysql.WANIP, boo
 	return dbItem, true
 }
 
-func (i *WANIP) generateUpdateInfo(diffBase *diffbase.WANIP, cloudItem *cloudmodel.IP) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (i *WANIP) generateUpdateInfo(diffBase *diffbase.WANIP, cloudItem *cloudmodel.IP) (*message.WANIPFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.WANIPFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
-	}
-	if diffBase.SubnetLcuuid != cloudItem.SubnetLcuuid {
-		if cloudItem.SubnetLcuuid == "" {
-			updateInfo["vl2_net_id"] = 0
-		} else {
-			subnetID, exists := i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
-			if !exists {
-				if i.domainToolDataSet != nil {
-					subnetID, exists = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
-				}
-				if !exists {
-					log.Error(resourceAForResourceBNotFound(
-						ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
-						ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN, cloudItem.Lcuuid,
-					))
-					return nil, false
-				}
-			}
-			updateInfo["vl2_net_id"] = subnetID
-		}
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 
-	return updateInfo, len(updateInfo) > 0
+	// ip subnet id is not used in the current version, so it is commented out to avoid updating the subnet id too frequently,
+	// which may cause recorder performance issues.
+
+	// if diffBase.SubnetLcuuid != cloudItem.SubnetLcuuid {
+	// 	if cloudItem.SubnetLcuuid == "" {
+	// 		mapInfo["vl2_net_id"] = 0
+	// 	} else {
+	// 		subnetID, exists := i.cache.ToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+	// 		if !exists {
+	// 			if i.domainToolDataSet != nil {
+	// 				subnetID, exists = i.domainToolDataSet.GetSubnetIDByLcuuid(cloudItem.SubnetLcuuid)
+	// 			}
+	// 			if !exists {
+	// 				log.Error(resourceAForResourceBNotFound(
+	// 					ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.SubnetLcuuid,
+	// 					ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN, cloudItem.Lcuuid,
+	// 				))
+	// 				return nil, nil, false
+	// 			}
+	// 		}
+	// 		mapInfo["vl2_net_id"] = subnetID
+	// 	}
+	// 	structInfo.SubnetID.SetNew(mapInfo["vl2_net_id"].(int))
+	// 	structInfo.SubnetLcuuid.Set(diffBase.SubnetLcuuid, cloudItem.SubnetLcuuid)
+	// }
+
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

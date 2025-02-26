@@ -19,6 +19,7 @@ package qingcloud
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.FloatingIP, error) {
@@ -26,7 +27,7 @@ func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.Fl
 	var retIPs []model.IP
 	var retFloatingIPs []model.FloatingIP
 
-	log.Info("get floating_ips starting")
+	log.Info("get floating_ips starting", logger.NewORGPrefix(q.orgID))
 
 	for regionId, regionLcuuid := range q.RegionIdToLcuuid {
 		kwargs := []*Param{
@@ -35,7 +36,7 @@ func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.Fl
 		}
 		response, err := q.GetResponse("DescribeEips", "eip_set", kwargs)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, nil, err
 		}
 
@@ -52,13 +53,13 @@ func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.Fl
 				resourceId := eip.Get("resource").Get("resource_id").MustString()
 				vpcLcuuid, ok := q.vmIdToVPCLcuuid[resourceId]
 				if !ok {
-					log.Debugf("eip (%s) vpc not found", ip)
+					log.Debugf("eip (%s) vpc not found", ip, logger.NewORGPrefix(q.orgID))
 					continue
 				}
 				retFloatingIPs = append(retFloatingIPs, model.FloatingIP{
-					Lcuuid:        common.GenerateUUID(eipId),
+					Lcuuid:        common.GenerateUUIDByOrgID(q.orgID, eipId),
 					IP:            ip,
-					VMLcuuid:      common.GenerateUUID(resourceId),
+					VMLcuuid:      common.GenerateUUIDByOrgID(q.orgID, resourceId),
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
 					RegionLcuuid:  regionLcuuid,
@@ -69,19 +70,19 @@ func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.Fl
 					continue
 				}
 				nicId := eip.Get("resource").Get("nic_id").MustString()
-				vinterfaceLcuuid := common.GenerateUUID(nicId + resourceId)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(q.orgID, nicId+resourceId)
 				retVInterfaces = append(retVInterfaces, model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.VIF_TYPE_WAN,
 					Mac:           nicId,
 					DeviceType:    common.VIF_DEVICE_TYPE_VM,
-					DeviceLcuuid:  common.GenerateUUID(resourceId),
+					DeviceLcuuid:  common.GenerateUUIDByOrgID(q.orgID, resourceId),
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
 					RegionLcuuid:  regionLcuuid,
 				})
 				retIPs = append(retIPs, model.IP{
-					Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + ip),
+					Lcuuid:           common.GenerateUUIDByOrgID(q.orgID, vinterfaceLcuuid+ip),
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               ip,
 					RegionLcuuid:     regionLcuuid,
@@ -90,6 +91,6 @@ func (q *QingCloud) GetFloatingIPs() ([]model.VInterface, []model.IP, []model.Fl
 		}
 	}
 
-	log.Info("get floating_ips complete")
+	log.Info("get floating_ips complete", logger.NewORGPrefix(q.orgID))
 	return retVInterfaces, retIPs, retFloatingIPs, nil
 }

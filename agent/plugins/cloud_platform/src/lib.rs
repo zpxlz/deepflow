@@ -14,4 +14,5 @@
  * limitations under the License.
  */
 
+pub mod cloudwise;
 pub mod tingyun;

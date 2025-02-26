@@ -18,7 +18,6 @@ package stats
 
 import (
 	"errors"
-	"unsafe"
 
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/codec"
@@ -105,19 +104,8 @@ func Decode(decoder *codec.SimpleDecoder) (*DFStats, error) {
 	return s, nil
 }
 
-func (s *DFStats) WriteBlock(block *ckdb.Block) error {
-	block.Write(s.Time)
-	for _, tag := range s.Tags {
-		block.Write(tag.Value)
-	}
-	for _, field := range s.Fields {
-		if field.Type == TypeFloat64 {
-			block.Write(*((*float64)(unsafe.Pointer(&field.Value))))
-		} else {
-			block.Write(field.Value)
-		}
-	}
-	return nil
+func (s *DFStats) OrgID() uint16 {
+	return ckdb.DEFAULT_ORG_ID
 }
 
 func (s *DFStats) Release() {
@@ -159,7 +147,7 @@ func (s *DFStats) GenCKTable(ttl int) *ckdb.Table {
 	}
 }
 
-var poolDFStats = pool.NewLockFreePool(func() interface{} {
+var poolDFStats = pool.NewLockFreePool(func() *DFStats {
 	return &DFStats{
 		Tags:   make([]Tag, 0, 4),
 		Fields: make([]Field, 0, 4),
@@ -167,7 +155,7 @@ var poolDFStats = pool.NewLockFreePool(func() interface{} {
 })
 
 func AcquireDFStats() *DFStats {
-	return poolDFStats.Get().(*DFStats)
+	return poolDFStats.Get()
 }
 
 func ReleaseDFStats(s *DFStats) {

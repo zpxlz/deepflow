@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type Process struct {
-	OperatorBase[mysql.Process]
+	OperatorBase[*metadbmodel.Process, metadbmodel.Process]
 }
 
 func NewProcess() *Process {
 	operator := &Process{
-		OperatorBase[mysql.Process]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_PROCESS_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.Process](
+			ctrlrcommon.RESOURCE_TYPE_PROCESS_EN,
+			true,
+			true,
+		),
 	}
-	operator.setter = operator
 	return operator
-}
-
-func (p *Process) setDBItemID(dbItem *mysql.Process, id int) {
-	dbItem.ID = id
 }

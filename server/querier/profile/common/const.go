@@ -30,3 +30,24 @@ const (
 	PROFILE_LOCATION_STR = "profile_location_str"
 	PROFILE_VALUE        = "profile_value"
 )
+
+const (
+	HEADER_KEY_X_ORG_ID            = "X-Org-Id"
+	LANGUAGE_TYPE_EBPF             = "eBPF"
+	MAX_KERNEL_STACK_DEPTH_DEFAULT = -1
+)
+
+const (
+	TAG_AGENT_ID   = "agent_id"
+	TAG_PROCESS_ID = "process_id"
+)
+
+const DATA_FORMAT_GRAFANA = "grafana"
+
+var LOCATION_TYPE_MAP = map[string]string{
+	"[c] ": "C", // cuda functions
+	"[k] ": "K", // kernel function
+	"[l] ": "L", // dynamic link library function
+	"[p] ": "P", // process
+	"[t] ": "T", // thread
+}

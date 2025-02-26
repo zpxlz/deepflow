@@ -19,7 +19,7 @@ use std::io;
 use std::process;
 use std::sync::{
     atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering},
-    Arc, Weak,
+    Arc, Mutex, Weak,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,11 +31,12 @@ use public::{
     sender::{SendMessageType, Sendable},
 };
 
-use super::stats;
+use super::stats::{self, QueueStats};
 use crate::{
     config::handler::{LogAccess, LogConfig, SenderAccess},
     exception::ExceptionHandler,
-    sender::uniform_sender::UniformSenderThread,
+    sender::uniform_sender::{Connection, UniformSenderThread},
+    trident::SenderEncoder,
 };
 
 macro_rules! write_message {
@@ -75,7 +76,7 @@ impl Sendable for LogBuffer {
     }
 
     fn message_type(&self) -> SendMessageType {
-        SendMessageType::Syslog
+        SendMessageType::SyslogDetail
     }
 }
 
@@ -105,16 +106,16 @@ impl RemoteLogWriter {
         stats_collector: Arc<stats::Collector>,
         exception_handler: ExceptionHandler,
         ntp_diff: Arc<AtomicI64>,
+        shared_conn: Arc<Mutex<Connection>>,
     ) -> Self {
         let module = "remote_logger";
         let (sender, receiver, counter) = queue::bounded(Self::INNER_QUEUE_SIZE);
         stats_collector.register_countable(
-            "queue",
+            &QueueStats {
+                module,
+                ..Default::default()
+            },
             stats::Countable::Owned(Box::new(counter)),
-            vec![
-                stats::StatsOption::Tag("module", module.to_owned()),
-                stats::StatsOption::Tag("index", "0".to_owned()),
-            ],
         );
         let mut uniform_sender = UniformSenderThread::new(
             module,
@@ -122,7 +123,8 @@ impl RemoteLogWriter {
             sender_config,
             stats_collector,
             exception_handler,
-            true,
+            Some(shared_conn),
+            SenderEncoder::Raw,
         );
         uniform_sender.start();
         Self {

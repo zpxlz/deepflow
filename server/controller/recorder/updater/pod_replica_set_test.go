@@ -24,7 +24,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
@@ -46,7 +45,7 @@ func (t *SuiteTest) getPodReplicaSetMock(mockDB bool) (*cache.Cache, cloudmodel.
 
 	c := cache.NewCache(domainLcuuid)
 	if mockDB {
-		t.db.Create(&mysql.PodReplicaSet{Name: cloudItem.Name, Base: mysql.Base{Lcuuid: cloudItem.Lcuuid}, Domain: domainLcuuid, Label: cloudItem.Label})
+		t.db.Create(&metadbmodel.PodReplicaSet{Name: cloudItem.Name, Base: metadbmodel.Base{Lcuuid: cloudItem.Lcuuid}, Domain: domainLcuuid, Label: cloudItem.Label})
 		c.DiffBaseDataSet.PodReplicaSets[cloudItem.Lcuuid] = &diffbase.PodReplicaSet{DiffBase: diffbase.DiffBase{Lcuuid: cloudItem.Lcuuid}, Name: cloudItem.Name, Label: cloudItem.Label}
 	}
 
@@ -77,13 +76,13 @@ func (t *SuiteTest) TestHandleAddPodReplicaSetSucess() {
 	updater := NewPodReplicaSet(c, []cloudmodel.PodReplicaSet{cloudItem})
 	updater.HandleAddAndUpdate()
 
-	var addedItem *mysql.PodReplicaSet
+	var addedItem *metadbmodel.PodReplicaSet
 	result := t.db.Where("lcuuid = ?", cloudItem.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 	assert.Equal(t.T(), len(c.DiffBaseDataSet.PodReplicaSets), 1)
 	assert.Equal(t.T(), cloudItem.Label, addedItem.Label)
 
-	test.ClearDBData[mysql.PodReplicaSet](t.db)
+	test.ClearDBData[metadbmodel.PodReplicaSet](t.db)
 }
 
 func (t *SuiteTest) TestHandleUpdatePodReplicaSetSucess() {
@@ -94,11 +93,11 @@ func (t *SuiteTest) TestHandleUpdatePodReplicaSetSucess() {
 	updater := NewPodReplicaSet(cache, []cloudmodel.PodReplicaSet{cloudItem})
 	updater.HandleAddAndUpdate()
 
-	var addedItem *mysql.PodReplicaSet
+	var addedItem *metadbmodel.PodReplicaSet
 	result := t.db.Where("lcuuid = ?", cloudItem.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 	assert.Equal(t.T(), len(cache.DiffBaseDataSet.PodReplicaSets), 1)
 	assert.Equal(t.T(), addedItem.Label, cloudItem.Label)
 
-	test.ClearDBData[mysql.PodReplicaSet](t.db)
+	test.ClearDBData[metadbmodel.PodReplicaSet](t.db)
 }

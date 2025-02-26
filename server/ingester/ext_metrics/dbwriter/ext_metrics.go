@@ -17,11 +17,13 @@
 package dbwriter
 
 import (
+	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/nativetag"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 )
 
 const (
@@ -32,11 +34,16 @@ type ExtMetrics struct {
 	Timestamp uint32 // s
 	MsgType   datatype.MessageType
 
-	UniversalTag zerodoc.UniversalTag
+	UniversalTag flow_metrics.UniversalTag
 
-	// in deepflow_system: table name
-	// in ext_metrids: virtual_table_name
 	VTableName string
+
+	AgentID uint16
+
+	// Not stored, only determines which database to store in.
+	// When Orgid is 0 or 1, it is stored in database '<DatabaseName()>', otherwise stored in '<OrgId>_<DatabaseName()>'.
+	OrgId, RawOrgId uint16 // RawOrgId is read from server-stats message, only used to distinguish which database data is written to
+	TeamID          uint16
 
 	TagNames  []string
 	TagValues []string
@@ -45,18 +52,36 @@ type ExtMetrics struct {
 	MetricsFloatValues []float64
 }
 
+func (m *ExtMetrics) IsValid() bool {
+	return len(m.TagNames) == len(m.TagValues) && len(m.MetricsFloatNames) == len(m.MetricsFloatValues)
+}
+
 func (m *ExtMetrics) DatabaseName() string {
-	if m.MsgType == datatype.MESSAGE_TYPE_DFSTATS {
-		return DEEPFLOW_SYSTEM_DB
-	} else {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return DEEPFLOW_TENANT_DB
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return DEEPFLOW_TENANT_DB
+		} else {
+			return DEEPFLOW_ADMIN_DB
+		}
+	default:
 		return EXT_METRICS_DB
 	}
 }
 
 func (m *ExtMetrics) TableName() string {
-	if m.MsgType == datatype.MESSAGE_TYPE_DFSTATS {
-		return DEEPFLOW_SYSTEM_TABLE
-	} else {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return DEEPFLOW_TENANT_COLLECTOR_TABLE
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return DEEPFLOW_TENANT_COLLECTOR_TABLE
+		} else {
+			return DEEPFLOW_ADMIN_SERVER_TABLE
+		}
+	default:
 		return EXT_METRICS_TABLE
 	}
 }
@@ -65,31 +90,35 @@ func (m *ExtMetrics) VirtualTableName() string {
 	return m.VTableName
 }
 
-// Note: The order of Write() must be consistent with the order of append() in Columns.
-func (m *ExtMetrics) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(m.Timestamp)
-	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS {
-		m.UniversalTag.WriteBlock(block)
+func (m *ExtMetrics) NativeTagVersion() uint32 {
+	switch m.MsgType {
+	case datatype.MESSAGE_TYPE_DFSTATS:
+		return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_TENANT)
+	case datatype.MESSAGE_TYPE_SERVER_DFSTATS:
+		if ckdb.IsValidOrgID(m.RawOrgId) {
+			return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_TENANT)
+		} else {
+			return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.DEEPFLOW_ADMIN)
+		}
+	default:
+		return nativetag.GetTableNativeTagsVersion(m.OrgId, nativetag.EXT_METRICS)
 	}
-	block.Write(
-		m.VTableName,
-		m.TagNames,
-		m.TagValues,
-		m.MetricsFloatNames,
-		m.MetricsFloatValues,
-	)
 }
 
-// Note: The order of append() must be consistent with the order of Write() in WriteBlock.
+func (m *ExtMetrics) OrgID() uint16 {
+	return m.OrgId
+}
+
 func (m *ExtMetrics) Columns() []*ckdb.Column {
 	columns := []*ckdb.Column{}
 
 	columns = append(columns, ckdb.NewColumnWithGroupBy("time", ckdb.DateTime))
-	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS {
-		columns = zerodoc.GenUniversalTagColumns(columns)
+	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS && m.MsgType != datatype.MESSAGE_TYPE_SERVER_DFSTATS {
+		columns = flow_metrics.GenUniversalTagColumns(columns)
 	}
 	columns = append(columns,
 		ckdb.NewColumn("virtual_table_name", ckdb.LowCardinalityString).SetComment("虚拟表名"),
+		ckdb.NewColumn("team_id", ckdb.UInt16).SetComment("团队ID"),
 		ckdb.NewColumn("tag_names", ckdb.ArrayLowCardinalityString).SetComment("额外的tag"),
 		ckdb.NewColumn("tag_values", ckdb.ArrayLowCardinalityString).SetComment("额外的tag对应的值"),
 		ckdb.NewColumn("metrics_float_names", ckdb.ArrayLowCardinalityString).SetComment("额外的float类型metrics"),
@@ -103,13 +132,13 @@ func (m *ExtMetrics) Release() {
 	ReleaseExtMetrics(m)
 }
 
-func (m *ExtMetrics) GenCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
+func (m *ExtMetrics) GenCKTable(cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.MergeTree
 
 	// order key
 	orderKeys := []string{"virtual_table_name", timeKey}
-	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS {
+	if m.MsgType != datatype.MESSAGE_TYPE_DFSTATS && m.MsgType != datatype.MESSAGE_TYPE_SERVER_DFSTATS {
 		// order key in universal tags
 		orderKeys = append(orderKeys, "l3_epc_id")
 		orderKeys = append(orderKeys, "ip4")
@@ -117,7 +146,9 @@ func (m *ExtMetrics) GenCKTable(cluster, storagePolicy string, ttl int, coldStor
 	}
 
 	return &ckdb.Table{
+		Version:         common.CK_VERSION,
 		Database:        m.DatabaseName(),
+		DBType:          ckdbType,
 		LocalName:       m.TableName() + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      m.TableName(),
 		Columns:         m.Columns(),
@@ -146,10 +177,17 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 		Table:   tableName,
 		VpcId:   m.UniversalTag.L3EpcID,
 		PodNsId: m.UniversalTag.PodNSID,
+		VtapId:  m.UniversalTag.VTAPID,
+		OrgId:   m.OrgId,
+		TeamID:  m.TeamID,
 	}
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
 
+	if !m.IsValid() {
+		log.Warningf("ext metrics is invalid. %+v", m)
+		return
+	}
 	// tags
 	flowTagInfo.FieldType = flow_tag.FieldTag
 	for i, name := range m.TagNames {
@@ -166,7 +204,7 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldValueCache.Add(*flowTagInfo, m.Timestamp)
 			}
 		}
-		tagFieldValue := flow_tag.AcquireFlowTag()
+		tagFieldValue := flow_tag.AcquireFlowTag(flow_tag.TagFieldValue)
 		tagFieldValue.Timestamp = m.Timestamp
 		tagFieldValue.FlowTagInfo = *flowTagInfo
 		cache.FieldValues = append(cache.FieldValues, tagFieldValue)
@@ -180,7 +218,7 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldCache.Add(*flowTagInfo, m.Timestamp)
 			}
 		}
-		tagField := flow_tag.AcquireFlowTag()
+		tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 		tagField.Timestamp = m.Timestamp
 		tagField.FlowTagInfo = *flowTagInfo
 		cache.Fields = append(cache.Fields, tagField)
@@ -198,22 +236,22 @@ func (m *ExtMetrics) GenerateNewFlowTags(cache *flow_tag.FlowTagCache) {
 				cache.FieldCache.Add(*flowTagInfo, m.Timestamp)
 			}
 		}
-		tagField := flow_tag.AcquireFlowTag()
+		tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 		tagField.Timestamp = m.Timestamp
 		tagField.FlowTagInfo = *flowTagInfo
 		cache.Fields = append(cache.Fields, tagField)
 	}
 }
 
-var extMetricsPool = pool.NewLockFreePool(func() interface{} {
+var extMetricsPool = pool.NewLockFreePool(func() *ExtMetrics {
 	return &ExtMetrics{}
 })
 
 func AcquireExtMetrics() *ExtMetrics {
-	return extMetricsPool.Get().(*ExtMetrics)
+	return extMetricsPool.Get()
 }
 
-var emptyUniversalTag = zerodoc.UniversalTag{}
+var emptyUniversalTag = flow_metrics.UniversalTag{}
 
 func ReleaseExtMetrics(m *ExtMetrics) {
 	m.UniversalTag = emptyUniversalTag

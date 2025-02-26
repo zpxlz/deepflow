@@ -22,23 +22,22 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/cloud/tencent/expand"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getVMs(region tencentRegion) ([]model.VM, []model.VMSecurityGroup, error) {
-	log.Debug("get vms starting")
+func (t *Tencent) getVMs(region string) ([]model.VM, error) {
+	log.Debug("get vms starting", logger.NewORGPrefix(t.orgID))
 	var vms []model.VM
-	var vmSGs []model.VMSecurityGroup
 	states := map[string]int{
 		"RUNNING": common.VM_STATE_RUNNING,
 		"STOPPED": common.VM_STATE_STOPPED,
 	}
 
 	attrs := []string{"InstanceId", "InstanceName", "InstanceState", "SecurityGroupIds", "VirtualPrivateCloud", "CreatedTime"}
-	resp, err := t.getResponse("cvm", "2017-03-12", "DescribeInstances", region.name, "InstanceSet", true, map[string]interface{}{})
+	resp, err := t.getResponse("cvm", "2017-03-12", "DescribeInstances", region, "InstanceSet", true, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("vm request tencent api error: (%s)", err.Error())
-		return []model.VM{}, []model.VMSecurityGroup{}, err
+		log.Errorf("vm request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
+		return []model.VM{}, err
 	}
 	for _, vData := range resp {
 		if !t.checkRequiredAttributes(vData, attrs) {
@@ -47,12 +46,12 @@ func (t *Tencent) getVMs(region tencentRegion) ([]model.VM, []model.VMSecurityGr
 		vmName := vData.Get("InstanceName").MustString()
 		vpcID := vData.Get("VirtualPrivateCloud").Get("VpcId").MustString()
 		if vpcID == "" {
-			log.Infof("vm (%s) vpc not found", vmName)
+			log.Infof("vm (%s) vpc not found", vmName, logger.NewORGPrefix(t.orgID))
 			continue
 		}
 
 		vmID := vData.Get("InstanceId").MustString()
-		vmLcuuid := common.GetUUID(vmID, uuid.Nil)
+		vmLcuuid := common.GetUUIDByOrgID(t.orgID, vmID)
 
 		vmState := vData.Get("InstanceState").MustString()
 		state, ok := states[vmState]
@@ -63,11 +62,11 @@ func (t *Tencent) getVMs(region tencentRegion) ([]model.VM, []model.VMSecurityGr
 		vmCteateAt := vData.Get("CreatedTime").MustString()
 		createAt, err := time.ParseInLocation(time.RFC3339, vmCteateAt, time.Local)
 		if err != nil {
-			log.Warningf("vm (%s) created time format error: %s", vmName, err.Error())
+			log.Warningf("vm (%s) created time format error: %s", vmName, err.Error(), logger.NewORGPrefix(t.orgID))
 		}
 
 		azID := vData.Get("Placement").Get("Zone").MustString()
-		azLcuuid := common.GetUUID(t.uuidGenerate+"_"+azID, uuid.Nil)
+		azLcuuid := common.GetUUIDByOrgID(t.orgID, t.uuidGenerate+"_"+azID)
 		vms = append(vms, model.VM{
 			Lcuuid:       vmLcuuid,
 			Name:         vmName,
@@ -76,23 +75,12 @@ func (t *Tencent) getVMs(region tencentRegion) ([]model.VM, []model.VMSecurityGr
 			State:        state,
 			CreatedAt:    createAt,
 			CloudTags:    expand.GetVMTags(vData),
-			VPCLcuuid:    common.GetUUID(vpcID, uuid.Nil),
+			VPCLcuuid:    common.GetUUIDByOrgID(t.orgID, vpcID),
 			AZLcuuid:     azLcuuid,
-			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid: t.regionLcuuid,
 		})
 		t.azLcuuidMap[azLcuuid] = 0
-
-		sgIDs := vData.Get("SecurityGroupIds")
-		for s := range sgIDs.MustArray() {
-			sgID := sgIDs.GetIndex(s).MustString()
-			vmSGs = append(vmSGs, model.VMSecurityGroup{
-				Lcuuid:              common.GetUUID(vmLcuuid+sgID, uuid.Nil),
-				SecurityGroupLcuuid: common.GetUUID(sgID, uuid.Nil),
-				VMLcuuid:            vmLcuuid,
-				Priority:            s,
-			})
-		}
 	}
-	log.Debug("get vms complete")
-	return vms, vmSGs, nil
+	log.Debug("get vms complete", logger.NewORGPrefix(t.orgID))
+	return vms, nil
 }

@@ -20,30 +20,24 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getVPCs() ([]model.VPC, error) {
-	log.Debug("get vpcs starting")
+	log.Debug("get vpcs starting", logger.NewORGPrefix(g.orgID))
 	vpcs := []model.VPC{}
 	vpcsData := g.genesisData.VPCs
 
 	g.cloudStatsd.RefreshAPIMoniter("vpcs", len(vpcsData), time.Time{})
 
 	for _, v := range vpcsData {
-		vpcLcuuid := v.Lcuuid
-		if vpcLcuuid == "" {
-			vpcLcuuid = common.GetUUID(v.Name, uuid.Nil)
-		}
 		vpc := model.VPC{
-			Lcuuid:       vpcLcuuid,
+			Lcuuid:       v.Lcuuid,
 			Name:         v.Name,
-			RegionLcuuid: g.regionUuid,
+			RegionLcuuid: g.regionLcuuid,
 		}
 		vpcs = append(vpcs, vpc)
 	}
-	log.Debug("get vpcs complete")
+	log.Debug("get vpcs complete", logger.NewORGPrefix(g.orgID))
 	return vpcs, nil
 }

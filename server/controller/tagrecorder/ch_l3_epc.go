@@ -17,71 +17,73 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChVPC struct {
-	UpdaterBase[mysql.ChVPC, IDKey]
+	SubscriberComponent[*message.VPCFieldsUpdate, message.VPCFieldsUpdate, metadbmodel.VPC, metadbmodel.ChVPC, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChVPC(resourceTypeToIconID map[IconKey]int) *ChVPC {
-	updater := &ChVPC{
-		UpdaterBase[mysql.ChVPC, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_VPC,
-		},
+	mng := &ChVPC{
+		newSubscriberComponent[*message.VPCFieldsUpdate, message.VPCFieldsUpdate, metadbmodel.VPC, metadbmodel.ChVPC, IDKey](
+			common.RESOURCE_TYPE_VPC_EN, RESOURCE_TYPE_CH_VPC,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (v *ChVPC) generateNewData() (map[IDKey]mysql.ChVPC, bool) {
-	var vpcs []mysql.VPC
-	err := mysql.Db.Unscoped().Find(&vpcs).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(v.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChVPC) sourceToTarget(md *message.Metadata, source *metadbmodel.VPC) (keys []IDKey, targets []metadbmodel.ChVPC) {
+	iconID := c.resourceTypeToIconID[IconKey{
+		NodeType: RESOURCE_TYPE_VPC,
+	}]
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChVPC)
-	for _, vpc := range vpcs {
-		if vpc.DeletedAt.Valid {
-			keyToItem[IDKey{ID: vpc.ID}] = mysql.ChVPC{
-				ID:     vpc.ID,
-				Name:   vpc.Name + " (deleted)",
-				UID:    vpc.UID,
-				IconID: v.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_VPC}],
-			}
-		} else {
-			keyToItem[IDKey{ID: vpc.ID}] = mysql.ChVPC{
-				ID:     vpc.ID,
-				Name:   vpc.Name,
-				UID:    vpc.UID,
-				IconID: v.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_VPC}],
-			}
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, metadbmodel.ChVPC{
+		ID:       source.ID,
+		Name:     sourceName,
+		UID:      source.UID,
+		IconID:   iconID,
+		TeamID:   md.TeamID,
+		DomainID: md.DomainID,
+	})
+	return
 }
 
-func (v *ChVPC) generateKey(dbItem mysql.ChVPC) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (v *ChVPC) generateUpdateInfo(oldItem, newItem mysql.ChVPC) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChVPC) onResourceUpdated(sourceID int, fieldsUpdate *message.VPCFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
-	}
-	if oldItem.UID != newItem.UID {
-		updateInfo["uid"] = newItem.UID
+	if fieldsUpdate.UID.IsDifferent() {
+		updateInfo["uid"] = fieldsUpdate.UID.GetNew()
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem metadbmodel.ChVPC
+		db.Where("id = ?", sourceID).First(&chItem)
+		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
 	}
-	return nil, false
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChVPC) softDeletedTargetsUpdated(targets []metadbmodel.ChVPC, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

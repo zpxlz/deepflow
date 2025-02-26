@@ -25,13 +25,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
+	"github.com/deepflowio/deepflow/server/libs/utils"
 	"github.com/gorilla/mux"
 	logging "github.com/op/go-logging"
 )
 
-var log = logging.MustGetLogger("datasource")
+var log = logging.MustGetLogger("data_source")
 
 const (
 	DATASOURCE_PORT      = 20106
@@ -39,35 +41,45 @@ const (
 )
 
 type DatasourceManager struct {
-	ckAddrs          []string // 需要修改数据源的clickhouse地址, 支持多个
+	ckAddrs          *[]string // 需要修改数据源的clickhouse地址, 支持多个
+	currentCkAddrs   []string
 	user             string
 	password         string
 	readTimeout      int
 	replicaEnabled   bool
 	ckdbColdStorages map[string]*ckdb.ColdStorage
-	isModifyingFlags []bool
+	isModifyingFlags [ckdb.MAX_ORG_ID + 1][MAX_DATASOURCE_COUNT]bool
+	cks              common.DBs
 
 	ckdbCluster       string
 	ckdbStoragePolicy string
+	ckdbType          string
 
 	server *http.Server
 }
 
 func NewDatasourceManager(cfg *config.Config, readTimeout int) *DatasourceManager {
-	return &DatasourceManager{
+	m := &DatasourceManager{
 		ckAddrs:           cfg.CKDB.ActualAddrs,
+		currentCkAddrs:    utils.CloneStringSlice(*cfg.CKDB.ActualAddrs),
 		user:              cfg.CKDBAuth.Username,
 		password:          cfg.CKDBAuth.Password,
 		readTimeout:       readTimeout,
 		ckdbCluster:       cfg.CKDB.ClusterName,
 		ckdbStoragePolicy: cfg.CKDB.StoragePolicy,
+		ckdbType:          cfg.CKDB.Type,
 		ckdbColdStorages:  cfg.GetCKDBColdStorages(),
-		isModifyingFlags:  make([]bool, MAX_DATASOURCE_COUNT),
 		server: &http.Server{
 			Addr:    ":" + strconv.Itoa(DATASOURCE_PORT),
 			Handler: mux.NewRouter(),
 		},
 	}
+	cks, err := common.NewCKConnections(m.currentCkAddrs, m.user, m.password)
+	if err != nil {
+		log.Fatalf("create clickhouse connections failed: %s", err)
+	}
+	m.cks = cks
+	return m
 }
 
 type JsonResp struct {
@@ -102,6 +114,7 @@ func respPending(w http.ResponseWriter, desc string) {
 }
 
 type AddBody struct {
+	OrgID        int    `json:"org-id"`
 	BaseRP       string `json:"base-rp"`
 	DB           string `json:"db"`
 	Interval     int    `json:"interval"`
@@ -112,14 +125,16 @@ type AddBody struct {
 }
 
 type ModBody struct {
+	OrgID    int    `json:"org-id"`
 	DB       string `json:"db"`
 	Name     string `json:"name"`
 	Duration int    `json:"retention-time"`
 }
 
 type DelBody struct {
-	DB   string `json:"db"`
-	Name string `json:"name"`
+	OrgID int    `json:"org-id"`
+	DB    string `json:"db"`
+	Name  string `json:"name"`
 }
 
 func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +152,7 @@ func (m *DatasourceManager) rpAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpadd request: %+v", b)
 
-	err = m.Handle(b.DB, "add", b.BaseRP, b.Name, b.SummableOP, b.UnsummableOP, b.Interval, b.Duration)
+	err = m.Handle(b.OrgID, ADD, b.DB, b.BaseRP, b.Name, b.SummableOP, b.UnsummableOP, b.Interval, b.Duration)
 	if err != nil {
 		respFailed(w, err.Error())
 		return
@@ -160,7 +175,7 @@ func (m *DatasourceManager) rpMod(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpmod request: %+v", b)
 
-	err = m.Handle(b.DB, "mod", "", b.Name, "", "", 0, b.Duration)
+	err = m.Handle(b.OrgID, MOD, b.DB, "", b.Name, "", "", 0, b.Duration)
 	if err != nil {
 		if strings.Contains(err.Error(), "try again") {
 			respPending(w, err.Error())
@@ -188,7 +203,7 @@ func (m *DatasourceManager) rpDel(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Infof("receive rpdel request: %+v", b)
 
-	err = m.Handle(b.DB, "del", "", b.Name, "", "", 0, 0)
+	err = m.Handle(b.OrgID, DEL, b.DB, "", b.Name, "", "", 0, 0)
 	if err != nil {
 		respFailed(w, err.Error())
 		return
@@ -211,21 +226,23 @@ func (m *DatasourceManager) Start() {
 			log.Fatalf("ListenAndServe() failed: %v", err)
 		}
 	}()
-	log.Info("datasource manager started")
+	log.Info("data_source manager started")
 }
 
 func (m *DatasourceManager) Close() error {
 	if m.server == nil {
 		return nil
 	}
+	m.cks.Close()
 	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
 
-	if err := m.server.Shutdown(ctx); err != nil {
-		log.Errorf("Shutdown() failed: %v", err)
-		return err
+	err := m.server.Shutdown(ctx)
+	if err != nil {
+		log.Warningf("shutdown failed: %v", err)
+	} else {
+		log.Info("data_source manager stopped")
 	}
 	cancel()
 
-	log.Info("datasource manager stopped")
-	return nil
+	return err
 }

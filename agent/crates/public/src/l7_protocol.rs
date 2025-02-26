@@ -47,6 +47,9 @@ pub enum L7Protocol {
     SofaRPC = 43,
 
     FastCGI = 44,
+    Brpc = 45,
+    Tars = 46,
+    SomeIp = 47,
 
     // SQL
     MySQL = 60,
@@ -56,18 +59,44 @@ pub enum L7Protocol {
     // NoSQL
     Redis = 80,
     MongoDB = 81,
+    Memcached = 82,
 
     // MQ
     Kafka = 100,
     MQTT = 101,
+    AMQP = 102,
+    OpenWire = 103,
+    NATS = 104,
+    Pulsar = 105,
+    ZMTP = 106,
+    RocketMQ = 107,
 
     // INFRA
     DNS = 120,
     TLS = 121,
+    Ping = 122,
 
     Custom = 127,
 
     Max = 255,
+}
+
+impl L7Protocol {
+    pub fn has_session_id(&self) -> bool {
+        match self {
+            Self::DNS
+            | Self::FastCGI
+            | Self::Http2
+            | Self::TLS
+            | Self::Kafka
+            | Self::Dubbo
+            | Self::SofaRPC
+            | Self::SomeIp
+            | Self::Ping
+            | Self::Custom => true,
+            _ => false,
+        }
+    }
 }
 
 // Translate the string value of l7_protocol into a L7Protocol enumeration value used by OTEL.
@@ -80,17 +109,28 @@ impl From<String> for L7Protocol {
             "dubbo" => Self::Dubbo,
             "grpc" => Self::Grpc,
             "fastcgi" => Self::FastCGI,
+            "brpc" => Self::Brpc,
+            "tars" => Self::Tars,
             "custom" => Self::Custom,
             "sofarpc" => Self::SofaRPC,
             "mysql" => Self::MySQL,
             "mongodb" => Self::MongoDB,
             "postgresql" => Self::PostgreSQL,
             "redis" => Self::Redis,
+            "memcached" => Self::Memcached,
             "kafka" => Self::Kafka,
             "mqtt" => Self::MQTT,
+            "amqp" => Self::AMQP,
+            "openwire" => Self::OpenWire,
+            "nats" => Self::NATS,
+            "pulsar" => Self::Pulsar,
+            "zmtp" => Self::ZMTP,
+            "rocketmq" => Self::RocketMQ,
             "dns" => Self::DNS,
             "oracle" => Self::Oracle,
             "tls" => Self::TLS,
+            "ping" => Self::Ping,
+            "some/ip" | "someip" => Self::SomeIp,
             _ => Self::Unknown,
         }
     }
@@ -121,4 +161,9 @@ impl L7ProtocolEnum {
             L7ProtocolEnum::Custom(_) => L7Protocol::Custom,
         }
     }
+}
+
+pub trait L7ProtocolChecker {
+    fn is_disabled(&self, p: L7Protocol) -> bool;
+    fn is_enabled(&self, p: L7Protocol) -> bool;
 }

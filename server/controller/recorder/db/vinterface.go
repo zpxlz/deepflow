@@ -18,20 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type VInterface struct {
-	OperatorBase[mysql.VInterface]
+	OperatorBase[*metadbmodel.VInterface, metadbmodel.VInterface]
 }
 
 func NewVInterface() *VInterface {
 	o := &VInterface{
-		OperatorBase[mysql.VInterface]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.VInterface](
+			ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN,
+			false,
+			false,
+		),
 	}
 	o.setFieldsNeededAfterCreate([]string{"id", "lcuuid", "subnetid", "devicetype", "deviceid", "mac", "ifindex", "iftype", "tap_mac", "region", "sub_domain"})
 	return o

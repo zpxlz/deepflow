@@ -52,7 +52,7 @@ type Counter struct {
 
 type ProfileWriter struct {
 	msgType           datatype.MessageType
-	ckdbAddrs         []string
+	ckdbAddrs         *[]string
 	ckdbUsername      string
 	ckdbPassword      string
 	ckdbCluster       string
@@ -73,13 +73,13 @@ func (p *ProfileWriter) GetCounter() interface{} {
 	return counter
 }
 
-func (p *ProfileWriter) Write(m interface{}) {
-	inProcess := m.(*InProcessProfile)
+func (p *ProfileWriter) Write(m []interface{}) {
+	inProcess := m[0].(*InProcessProfile)
 	inProcess.GenerateFlowTags(p.flowTagWriter.Cache)
 	p.flowTagWriter.WriteFieldsAndFieldValuesInCache()
 
-	atomic.AddInt64(&p.counter.ProfilesCount, 1)
-	p.ckWriter.Put(m)
+	atomic.AddInt64(&p.counter.ProfilesCount, int64(len(m)))
+	p.ckWriter.Put(m...)
 }
 
 func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *config.Config) (*ProfileWriter, error) {
@@ -95,9 +95,9 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		writerConfig:      config.CKWriterConfig,
 		counter:           &Counter{},
 	}
-	table := GenProfileCKTable(writer.ckdbCluster, PROFILE_DB, PROFILE_TABLE, writer.ckdbStoragePolicy, writer.ttl, ckdb.GetColdStorage(writer.ckdbColdStorages, PROFILE_DB, PROFILE_TABLE))
+	table := GenProfileCKTable(writer.ckdbCluster, PROFILE_DB, PROFILE_TABLE, writer.ckdbStoragePolicy, config.Base.CKDB.Type, writer.ttl, ckdb.GetColdStorage(writer.ckdbColdStorages, PROFILE_DB, PROFILE_TABLE))
 	ckwriter, err := ckwriter.NewCKWriter(
-		writer.ckdbAddrs,
+		*writer.ckdbAddrs,
 		writer.ckdbUsername,
 		writer.ckdbPassword,
 		fmt.Sprintf("%s-%s-%d", msgType, PROFILE_TABLE, decoderIndex),
@@ -106,7 +106,8 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		writer.writerConfig.QueueCount,
 		writer.writerConfig.QueueSize,
 		writer.writerConfig.BatchSize,
-		writer.writerConfig.FlushTimeout)
+		writer.writerConfig.FlushTimeout,
+		config.Base.CKDB.Watcher)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -118,7 +119,7 @@ func NewProfileWriter(msgType datatype.MessageType, decoderIndex int, config *co
 		BatchSize:    config.CKWriterConfig.BatchSize,
 		FlushTimeout: config.CKWriterConfig.FlushTimeout,
 	}
-	flowTagWriter, err := flow_tag.NewFlowTagWriter(decoderIndex, msgType.String(), PROFILE_DB, writer.ttl, DefaultPartition, config.Base, &flowTagWriterConfig)
+	flowTagWriter, err := flow_tag.NewFlowTagWriter(decoderIndex, msgType.String(), PROFILE_DB, writer.ttl, ckdb.TimeFuncTwelveHour, config.Base, &flowTagWriterConfig)
 	if err != nil {
 		return nil, err
 	}

@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type Region struct {
-	OperatorBase[mysql.Region]
+	OperatorBase[*metadbmodel.Region, metadbmodel.Region]
 }
 
 func NewRegion() *Region {
 	operater := &Region{
-		OperatorBase[mysql.Region]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_REGION_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.Region](
+			ctrlrcommon.RESOURCE_TYPE_REGION_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *Region) setDBItemID(dbItem *mysql.Region, id int) {
-	dbItem.ID = id
 }

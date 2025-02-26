@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <linux/version.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -34,7 +35,7 @@
 #include <limits.h>		//PATH_MAX(4096)
 #include <arpa/inet.h>
 #include <memory.h>
-#include "common.h"
+#include "utils.h"
 #include <bcc/bcc_proc.h>
 #include <bcc/bcc_elf.h>
 #include <bcc/bcc_syms.h>
@@ -49,20 +50,25 @@
 #include "socket.h"
 #include "elf.h"
 
+/* *INDENT-OFF* */
 // For process execute/exit events.
 struct process_event {
-	struct list_head list;          // list add to proc_events_head
-	struct bpf_tracer *tracer;      // link to struct bpf_tracer
-	uint8_t type;                   // EVENT_TYPE_PROC_EXEC or EVENT_TYPE_PROC_EXIT
-	char *path;                     // Full path "/proc/<pid>/root/..."
-	int pid;                        // Process ID
-	uint32_t expire_time;           // Expiration Date, the number of seconds since the system started.
+	struct list_head list;	// list add to proc_events_head
+	struct bpf_tracer *tracer;	// link to struct bpf_tracer
+	uint32_t type;		// EVENT_TYPE_PROC_EXEC or EVENT_TYPE_PROC_EXIT
+	char *path;		// Full path "/proc/<pid>/root/..."
+	int pid;		// Process ID
+	uint64_t stime;		// The start time of the process
+	uint32_t expire_time;	// Expiration Date, the number of seconds since the system started.
 };
+/* *INDENT-ON* */
 
+extern uint32_t k_version;
 static char build_info_magic[] = "\xff Go buildinf:";
 static struct list_head proc_info_head;	// For pid-offsets correspondence lists.
-static struct list_head proc_events_head;     // For process execute/exit events list.
+static struct list_head proc_events_head;	// For process execute/exit events list.
 static pthread_mutex_t mutex_proc_events_lock;
+static bool golang_trace_enabled;
 
 /* *INDENT-OFF* */
 /* ------------- offsets info -------------- */
@@ -177,43 +183,43 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "runtime.execute",
-		.probe_func = "runtime_execute",
+		.probe_func = UPROBE_FUNC_NAME(runtime_execute),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "runtime.newproc1",
-		.probe_func = "enter_runtime_newproc1",
+		.probe_func = UPROBE_FUNC_NAME(enter_runtime_newproc1),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "runtime.newproc1",
-		.probe_func = "exit_runtime_newproc1",
+		.probe_func = UPROBE_FUNC_NAME(exit_runtime_newproc1),
 		.is_probe_ret = true,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "crypto/tls.(*Conn).Write",
-		.probe_func = "uprobe_go_tls_write_enter",
+		.probe_func = UPROBE_FUNC_NAME(go_tls_write_enter),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "crypto/tls.(*Conn).Write",
-		.probe_func = "uprobe_go_tls_write_exit",
+		.probe_func = UPROBE_FUNC_NAME(go_tls_write_exit),
 		.is_probe_ret = true,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "crypto/tls.(*Conn).Read",
-		.probe_func = "uprobe_go_tls_read_enter",
+		.probe_func = UPROBE_FUNC_NAME(go_tls_read_enter),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "crypto/tls.(*Conn).Read",
-		.probe_func = "uprobe_go_tls_read_exit",
+		.probe_func = UPROBE_FUNC_NAME(go_tls_read_exit),
 		.is_probe_ret = true,
 	},
 	// HTTP2，symbols select an interface based on the GO version.
@@ -222,13 +228,13 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "net/http.(*http2serverConn).writeHeaders",
-		.probe_func = "uprobe_go_http2serverConn_writeHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2serverConn_writeHeaders),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*serverConn).writeHeaders",
-		.probe_func = "uprobe_go_http2serverConn_writeHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2serverConn_writeHeaders),
 		.is_probe_ret = false,
 	},
 	// http2 server, fetch request headers
@@ -236,13 +242,13 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "net/http.(*http2serverConn).processHeaders",
-		.probe_func = "uprobe_go_http2serverConn_processHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2serverConn_processHeaders),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*serverConn).processHeaders",
-		.probe_func = "uprobe_go_http2serverConn_processHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2serverConn_processHeaders),
 		.is_probe_ret = false,
 	},
 	// http2 client, fetch response headers
@@ -250,13 +256,13 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "net/http.(*http2clientConnReadLoop).handleResponse",
-		.probe_func = "uprobe_go_http2clientConnReadLoop_handleResponse",
+		.probe_func = UPROBE_FUNC_NAME(go_http2clientConnReadLoop_handleResponse),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*clientConnReadLoop).handleResponse",
-		.probe_func = "uprobe_go_http2clientConnReadLoop_handleResponse",
+		.probe_func = UPROBE_FUNC_NAME(go_http2clientConnReadLoop_handleResponse),
 		.is_probe_ret = false,
 	},
 	// http2 client, fetch request headers
@@ -264,13 +270,13 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "net/http.(*http2ClientConn).writeHeader",
-		.probe_func = "uprobe_go_http2ClientConn_writeHeader",
+		.probe_func = UPROBE_FUNC_NAME(go_http2ClientConn_writeHeader),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*ClientConn).writeHeader",
-		.probe_func = "uprobe_go_http2ClientConn_writeHeader",
+		.probe_func = UPROBE_FUNC_NAME(go_http2ClientConn_writeHeader),
 		.is_probe_ret = false,
 	},
 	// http2 client, fetch request headers
@@ -278,13 +284,13 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "net/http.(*http2ClientConn).writeHeaders",
-		.probe_func = "uprobe_go_http2ClientConn_writeHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2ClientConn_writeHeaders),
 		.is_probe_ret = false,
 	},
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*ClientConn).writeHeaders",
-		.probe_func = "uprobe_go_http2ClientConn_writeHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2ClientConn_writeHeaders),
 		.is_probe_ret = false,
 	},
 	// gRPC
@@ -293,7 +299,7 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "google.golang.org/grpc/internal/transport.(*loopyWriter).writeHeader",
-		.probe_func = "uprobe_go_loopyWriter_writeHeader",
+		.probe_func = UPROBE_FUNC_NAME(go_loopyWriter_writeHeader),
 		.is_probe_ret = false,
 	},
 	// grpc client fetch response headers
@@ -301,7 +307,7 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders",
-		.probe_func = "uprobe_go_http2Client_operateHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2Client_operateHeaders),
 		.is_probe_ret = false,
 	},
 	// grpc server fetch request headers
@@ -309,21 +315,21 @@ static struct symbol syms[] = {
 	{
 		.type = GO_UPROBE,
 		.symbol = "google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders",
-		.probe_func = "uprobe_go_http2Server_operateHeaders",
+		.probe_func = UPROBE_FUNC_NAME(go_http2Server_operateHeaders),
 		.is_probe_ret = false,
 	},
 	// grpc datafram read
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*Framer).checkFrameOrder",
-		.probe_func = "uprobe_golang_org_x_net_http2_Framer_checkFrameOrder",
+		.probe_func = UPROBE_FUNC_NAME(golang_org_x_net_http2_Framer_checkFrameOrder),
 		.is_probe_ret = false,
 	},
 	// grpc datafram write
 	{
 		.type = GO_UPROBE,
 		.symbol = "golang.org/x/net/http2.(*Framer).WriteDataPadded",
-		.probe_func = "uprobe_golang_org_x_net_http2_Framer_WriteDataPadded",
+		.probe_func = UPROBE_FUNC_NAME(golang_org_x_net_http2_Framer_WriteDataPadded),
 		.is_probe_ret = false,
 	},
 };
@@ -476,8 +482,7 @@ static struct proc_info *alloc_proc_info_by_pid(void)
 	struct proc_info *info;
 	info = calloc(1, sizeof(struct proc_info));
 	if (info == NULL) {
-		ebpf_warning
-		    ("calloc() size:sizeof(struct proc_info) error.\n");
+		ebpf_warning("calloc() size:sizeof(struct proc_info) error.\n");
 		return NULL;
 	}
 
@@ -502,7 +507,7 @@ static int resolve_bin_file(const char *path, int pid,
 			continue;
 		}
 
-		if (!binary_path){
+		if (!binary_path) {
 			binary_path = strdup(probe_sym->binary_path);
 			if (binary_path == NULL) {
 				goto failed;
@@ -518,7 +523,7 @@ static int resolve_bin_file(const char *path, int pid,
 			for (j = 0; j < probe_sym->rets_count; j++) {
 				addr = probe_sym->rets[j];
 				sub_probe_sym =
-					malloc(sizeof(struct symbol_uprobe));
+				    malloc(sizeof(struct symbol_uprobe));
 				if (sub_probe_sym == NULL) {
 					ebpf_warning("malloc() error.\n");
 					ret = ETR_NOMEM;
@@ -539,13 +544,13 @@ static int resolve_bin_file(const char *path, int pid,
 		} else
 			add_uprobe_symbol(pid, probe_sym, conf);
 
-		ebpf_info(
-			"Uprobe [%s] pid:%d go%d.%d.%d entry:0x%lx size:%ld symname:%s probe_func:%s rets_count:%d\n",
-			probe_sym->binary_path, probe_sym->pid,
-			probe_sym->ver.major, probe_sym->ver.minor,
-			probe_sym->ver.revision, probe_sym->entry,
-			probe_sym->size, probe_sym->name, probe_sym->probe_func,
-			probe_sym->rets_count);
+		ebpf_info
+		    ("Uprobe [%s] pid:%d go%d.%d.%d entry:0x%lx size:%ld symname:%s probe_func:%s rets_count:%d\n",
+		     probe_sym->binary_path, probe_sym->pid,
+		     probe_sym->ver.major, probe_sym->ver.minor,
+		     probe_sym->ver.revision, probe_sym->entry, probe_sym->size,
+		     probe_sym->name, probe_sym->probe_func,
+		     probe_sym->rets_count);
 
 		if (probe_sym->isret)
 			free_uprobe_symbol(probe_sym, NULL);
@@ -555,14 +560,17 @@ static int resolve_bin_file(const char *path, int pid,
 
 	if (syms_count == 0) {
 		ret = ETR_NOSYMBOL;
-		ebpf_warning(
-			"Go process pid %d [path: %s] (version: go%d.%d). Not find any symbols!\n",
-			pid, path, go_ver->major, go_ver->minor);
+		ebpf_warning
+		    ("Go process pid %d [path: %s] (version: go%d.%d). Not find any symbols!"
+		     " You can try setting the configuration option 'golang-symbol' to see "
+		     "if it resolves the issue, if the issue persists, please attempt to "
+		     "resolve it using the Golang executable with symbol table included.\n",
+		     pid, path, go_ver->major, go_ver->minor);
 		goto failed;
 	}
 
 	struct proc_info *p_info = NULL;
-	if (binary_path){
+	if (binary_path) {
 		bool is_new_info = false;
 		p_info = find_proc_info_by_pid(pid);
 		if (p_info == NULL) {
@@ -588,33 +596,49 @@ static int resolve_bin_file(const char *path, int pid,
 		// resolve all offsets.
 		for (int k = 0; k < NELEMS(offsets); k++) {
 			off = &offsets[k];
-			int offset =
-			    struct_member_offset_analyze(binary_path,
-							 off->structure,
-							 off->field_name);
+			int offset = struct_member_offset_analyze(binary_path,
+								  off->
+								  structure,
+								  off->
+								  field_name);
 			if (offset == ETR_INVAL)
 				offset = off->default_offset;
 
 			p_info->info.offsets[off->idx] = offset;
 		}
 
+		const char *tcp_conn_sym, *tls_conn_sym, *syscall_conn_sym;
 		if (p_info->info.version < GO_VERSION(1, 20, 0)) {
-			p_info->info.net_TCPConn_itab =
-				get_symbol_addr_from_binary(binary_path, "go.itab.*net.TCPConn,net.Conn");
-			p_info->info.crypto_tls_Conn_itab =
-				get_symbol_addr_from_binary(binary_path, "go.itab.*crypto/tls.Conn,net.Conn");
-			p_info->info.credentials_syscallConn_itab = get_symbol_addr_from_binary(
-				binary_path,
-				"go.itab.*google.golang.org/grpc/internal/credentials.syscallConn,net.Conn");
+			tcp_conn_sym = "go.itab.*net.TCPConn,net.Conn";
+			tls_conn_sym = "go.itab.*crypto/tls.Conn,net.Conn";
+			syscall_conn_sym =
+			    "go.itab.*google.golang.org/grpc/internal/credentials.syscallConn,net.Conn";
 		} else {
-			p_info->info.net_TCPConn_itab =
-				get_symbol_addr_from_binary(binary_path, "go:itab.*net.TCPConn,net.Conn");
-			p_info->info.crypto_tls_Conn_itab =
-				get_symbol_addr_from_binary(binary_path, "go:itab.*crypto/tls.Conn,net.Conn");
-			p_info->info.credentials_syscallConn_itab = get_symbol_addr_from_binary(
-				binary_path,
-				"go:itab.*google.golang.org/grpc/internal/credentials.syscallConn,net.Conn");
+			tcp_conn_sym = "go:itab.*net.TCPConn,net.Conn";
+			tls_conn_sym = "go:itab.*crypto/tls.Conn,net.Conn";
+			syscall_conn_sym =
+			    "go:itab.*google.golang.org/grpc/internal/credentials.syscallConn,net.Conn";
 		}
+
+		p_info->info.net_TCPConn_itab =
+		    get_symbol_addr_from_binary(pid, binary_path, tcp_conn_sym);
+		if (p_info->info.net_TCPConn_itab == 0)
+			ebpf_warning
+			    ("'%s' does not exist. Since eBPF uprobe relies on it to retrieve "
+			     "connection information, if it is empty, eBPF will not retrieve any"
+			     " data. This situation may be due to the lack of symbol table in "
+			     "the golang executable (confirm by executing 'nm %s'). If it shows "
+			     "'no symbols', you can try setting the configuration option "
+			     "'golang-symbol' to see if it resolves the issue, if the issue "
+			     "persists, please attempt to resolve it using the Golang executable "
+			     "with symbol table included.\n", tcp_conn_sym,
+			     binary_path);
+
+		p_info->info.crypto_tls_Conn_itab =
+		    get_symbol_addr_from_binary(pid, binary_path, tls_conn_sym);
+
+		p_info->info.credentials_syscallConn_itab =
+		    get_symbol_addr_from_binary(pid, binary_path, syscall_conn_sym);
 
 		p_info->has_updated = false;
 
@@ -658,7 +682,7 @@ static int proc_parse_and_register(int pid, struct tracer_probes_conf *conf)
 	if (path == NULL)
 		return syms_count;
 
-	if (!is_feature_matched(FEATURE_UPROBE_GOLANG, path))
+	if (!is_feature_matched(FEATURE_UPROBE_GOLANG, pid, path))
 		goto out;
 
 	struct version_info go_version;
@@ -692,6 +716,23 @@ bool is_go_process(int pid)
 	return ret;
 }
 
+// Lower version kernels do not support hooking so files in containers
+static inline bool golang_kern_check(void)
+{
+	return ((k_version == KERNEL_VERSION(3, 10, 0))
+		|| (k_version >= KERNEL_VERSION(4, 14, 0)));
+}
+
+static inline bool golang_process_check(int pid)
+{
+	char c_id[65];
+	memset(c_id, 0, sizeof(c_id));
+	if ((k_version < KERNEL_VERSION(4, 16, 0)) &&
+	    (fetch_container_id(pid, c_id, sizeof(c_id)) == 0))
+		return false;
+
+	return true;
+}
 
 /**
  * collect_go_uprobe_syms_from_procfs -- Find all golang binary executables from Procfs,
@@ -705,12 +746,14 @@ int collect_go_uprobe_syms_from_procfs(struct tracer_probes_conf *conf)
 	struct dirent *entry = NULL;
 	DIR *fddir = NULL;
 
-	init_list_head(&proc_events_head);
-	init_list_head(&proc_info_head);
-	pthread_mutex_init(&mutex_proc_events_lock, NULL);
-
 	if (!is_feature_enabled(FEATURE_UPROBE_GOLANG))
 		return ETR_OK;
+
+	if (!golang_kern_check()) {
+		ebpf_warning
+		    ("Uprobe golang requires Linux version 4.14+ or linux 3.10.0\n");
+		return ETR_OK;
+	}
 
 	fddir = opendir("/proc/");
 	if (fddir == NULL) {
@@ -721,6 +764,8 @@ int collect_go_uprobe_syms_from_procfs(struct tracer_probes_conf *conf)
 	int pid;
 	while ((entry = readdir(fddir)) != NULL) {
 		pid = atoi(entry->d_name);
+		if (!golang_process_check(pid))
+			continue;
 		if (entry->d_type == DT_DIR && pid > 1 && is_user_process(pid))
 			proc_parse_and_register(pid, conf);
 	}
@@ -763,8 +808,10 @@ static bool __attribute__ ((unused)) probe_exist_in_procfs(struct probe *p)
 	return pid_exist_in_procfs(sym_uprobe->pid, sym_uprobe->starttime);
 }
 
-static bool __attribute__ ((unused)) pid_exist_in_probes(struct bpf_tracer *tracer, int pid,
-				unsigned long long starttime)
+static bool
+    __attribute__ ((unused)) pid_exist_in_probes(struct bpf_tracer *tracer,
+						 int pid,
+						 unsigned long long starttime)
 {
 	struct probe *p;
 	struct symbol_uprobe *sym;
@@ -854,7 +901,7 @@ static void clear_probes_by_pid(struct bpf_tracer *tracer, int pid,
 				ebpf_info("Clear process PID %d\n", pid);
 				info_print = true;
 			}
-				
+
 			free_probe_from_tracer(probe);
 		}
 	}
@@ -877,7 +924,8 @@ void update_proc_info_to_map(struct bpf_tracer *tracer)
 			continue;
 		len =
 		    snprintf(buff, sizeof(buff), "go%d.%d offsets:",
-			     info->version >> 16, ((info->version >> 8) & 0xff));
+			     info->version >> 16,
+			     ((info->version >> 8) & 0xff));
 		for (i = 0; i < OFFSET_IDX_MAX; i++) {
 			len +=
 			    snprintf(buff + len, sizeof(buff) - len, "%d:%d ",
@@ -916,8 +964,27 @@ static void process_execute_handle(int pid, struct bpf_tracer *tracer)
 	pthread_mutex_unlock(&tracer->mutex_probes_lock);
 }
 
+// The caller needs 'mutex_proc_events_lock' for protection
+static inline void find_and_clear_event_from_list(int pid)
+{
+	struct process_event *pe;
+	struct list_head *p, *n;
+	list_for_each_safe(p, n, &proc_events_head) {
+		pe = container_of(p, struct process_event, list);
+		if (pe->pid == pid) {
+			list_head_del(&pe->list);
+			free(pe->path);
+			free(pe);
+		}
+	}
+}
+
 static void process_exit_handle(int pid, struct bpf_tracer *tracer)
 {
+	pthread_mutex_lock(&mutex_proc_events_lock);
+	find_and_clear_event_from_list(pid);
+	pthread_mutex_unlock(&mutex_proc_events_lock);
+
 	// Protect the probes operation in multiple threads, similar to process_execute_handle()
 	pthread_mutex_lock(&tracer->mutex_probes_lock);
 	struct tracer_probes_conf *conf = tracer->tps;
@@ -925,14 +992,15 @@ static void process_exit_handle(int pid, struct bpf_tracer *tracer)
 	pthread_mutex_unlock(&tracer->mutex_probes_lock);
 }
 
-static void add_event_to_proc_header(struct bpf_tracer *tracer, int pid, uint8_t type)
+static void add_event_to_proc_header(struct bpf_tracer *tracer, int pid,
+				     uint32_t type)
 {
 	char *path = get_elf_path_by_pid(pid);
 	if (path == NULL) {
 		return;
 	}
 
-	if (!is_feature_matched(FEATURE_UPROBE_GOLANG, path)) {
+	if (!is_feature_matched(FEATURE_UPROBE_GOLANG, pid, path)) {
 		free(path);
 		return;
 	}
@@ -948,11 +1016,13 @@ static void add_event_to_proc_header(struct bpf_tracer *tracer, int pid, uint8_t
 	pe->path = path;
 	pe->pid = pid;
 	pe->type = type;
-	pe->expire_time = get_sys_uptime() + PROC_EVENT_DELAY_HANDLE_DEF; 
+	pe->stime = get_process_starttime(pid);
+	pe->expire_time = get_sys_uptime() + PROC_EVENT_DELAY_HANDLE_DEF;
 
 	pthread_mutex_lock(&mutex_proc_events_lock);
+	find_and_clear_event_from_list(pid);
 	list_add_tail(&pe->list, &proc_events_head);
-	pthread_mutex_unlock(&mutex_proc_events_lock);	
+	pthread_mutex_unlock(&mutex_proc_events_lock);
 }
 
 /**
@@ -963,9 +1033,6 @@ void go_process_exec(int pid)
 {
 	struct bpf_tracer *tracer = find_bpf_tracer(SK_TRACER_NAME);
 	if (tracer == NULL)
-		return;
-
-	if (tracer->state != TRACER_RUNNING)
 		return;
 
 	if (tracer->probes_count > OPEN_FILES_MAX) {
@@ -991,9 +1058,6 @@ void go_process_exit(int pid)
 	if (tracer == NULL)
 		return;
 
-	if (tracer->state != TRACER_RUNNING)
-		return;
-
 	process_exit_handle(pid, tracer);
 }
 
@@ -1012,32 +1076,63 @@ void go_process_events_handle(void)
 		} else {
 			pe = NULL;
 		}
-		pthread_mutex_unlock(&mutex_proc_events_lock);
 
-		if (pe == NULL)
+		if (pe == NULL) {
+			pthread_mutex_unlock(&mutex_proc_events_lock);
 			break;
+		}
 
 		if (get_sys_uptime() >= pe->expire_time) {
-			pthread_mutex_lock(&mutex_proc_events_lock);
+			char *path = strdup(pe->path);
+			int pid = pe->pid;
+			struct bpf_tracer *tracer = pe->tracer;
+			uint32_t type = pe->type;
 			list_head_del(&pe->list);
-			pthread_mutex_unlock(&mutex_proc_events_lock);
-
-			if (pe->type == EVENT_TYPE_PROC_EXEC) {
-				/*
-				 * Threads and processes share the code section,
-				 * here only processes are concerned.
-				 */
-				if (is_user_process(pe->pid)
-				    && access(pe->path, F_OK) == 0) {
-					process_execute_handle(pe->pid,
-							       pe->tracer);
-				}
-			}
-
 			free(pe->path);
 			free(pe);
+			pthread_mutex_unlock(&mutex_proc_events_lock);
+			// Confirm whether the process has changed?
+			if (pe->stime != get_process_starttime(pid)) {
+				free(path);
+				continue;
+			}
+
+			if (type == EVENT_TYPE_PROC_EXEC) {
+				if (access(path, F_OK) == 0) {
+					process_execute_handle(pid, tracer);
+				}
+			}
+			free(path);
+
 		} else {
+			pthread_mutex_unlock(&mutex_proc_events_lock);
 			break;
 		}
 	} while (true);
+}
+
+void golang_trace_handle(int pid, enum match_pids_act act)
+{
+	if (act == MATCH_PID_ADD) {
+		go_process_exec(pid);
+	} else {
+		go_process_exit(pid);
+	}
+}
+
+void golang_trace_init(void)
+{
+	init_list_head(&proc_events_head);
+	init_list_head(&proc_info_head);
+	pthread_mutex_init(&mutex_proc_events_lock, NULL);
+}
+
+void set_uprobe_golang_enabled(bool enabled)
+{
+	golang_trace_enabled = enabled;
+}
+
+bool is_golang_trace_enabled(void)
+{
+	return golang_trace_enabled;
 }

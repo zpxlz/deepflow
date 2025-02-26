@@ -19,26 +19,51 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type Subnet struct {
-	UpdaterBase[cloudmodel.Subnet, mysql.Subnet, *diffbase.Subnet]
+	UpdaterBase[
+		cloudmodel.Subnet,
+		*diffbase.Subnet,
+		*metadbmodel.Subnet,
+		metadbmodel.Subnet,
+		*message.SubnetAdd,
+		message.SubnetAdd,
+		*message.SubnetUpdate,
+		message.SubnetUpdate,
+		*message.SubnetFieldsUpdate,
+		message.SubnetFieldsUpdate,
+		*message.SubnetDelete,
+		message.SubnetDelete]
 }
 
 func NewSubnet(wholeCache *cache.Cache, cloudData []cloudmodel.Subnet) *Subnet {
 	updater := &Subnet{
-		UpdaterBase[cloudmodel.Subnet, mysql.Subnet, *diffbase.Subnet]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_SUBNET_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewSubnet(),
-			diffBaseData: wholeCache.DiffBaseDataSet.Subnets,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.Subnet,
+			*diffbase.Subnet,
+			*metadbmodel.Subnet,
+			metadbmodel.Subnet,
+			*message.SubnetAdd,
+			message.SubnetAdd,
+			*message.SubnetUpdate,
+			message.SubnetUpdate,
+			*message.SubnetFieldsUpdate,
+			message.SubnetFieldsUpdate,
+			*message.SubnetDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_SUBNET_EN,
+			wholeCache,
+			db.NewSubnet().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.Subnets,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -49,44 +74,45 @@ func (s *Subnet) getDiffBaseByCloudItem(cloudItem *cloudmodel.Subnet) (diffBase 
 	return
 }
 
-func (s *Subnet) generateDBItemToAdd(cloudItem *cloudmodel.Subnet) (*mysql.Subnet, bool) {
+func (s *Subnet) generateDBItemToAdd(cloudItem *cloudmodel.Subnet) (*metadbmodel.Subnet, bool) {
 	networkID, exists := s.cache.ToolDataSet.GetNetworkIDByLcuuid(cloudItem.NetworkLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, cloudItem.NetworkLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.Lcuuid,
-		))
+		), s.metadata.LogPrefixes)
 		return nil, false
 	}
 	prefix, netmask, err := rcommon.CIDRToPreNetMask(cloudItem.CIDR)
 	if err != nil {
-		log.Errorf("convert %s cidr: %s failed: %v", ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.CIDR, err)
+		log.Errorf("convert %s cidr: %s failed: %v", ctrlrcommon.RESOURCE_TYPE_SUBNET_EN, cloudItem.CIDR, err.Error(), s.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.Subnet{
+	dbItem := &metadbmodel.Subnet{
 		Name:      cloudItem.Name,
 		Label:     cloudItem.Label,
 		Prefix:    prefix,
 		Netmask:   netmask,
 		SubDomain: cloudItem.SubDomainLcuuid,
 		NetworkID: networkID,
+		Domain:    s.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (s *Subnet) generateUpdateInfo(diffBase *diffbase.Subnet, cloudItem *cloudmodel.Subnet) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (s *Subnet) generateUpdateInfo(diffBase *diffbase.Subnet, cloudItem *cloudmodel.Subnet) (*message.SubnetFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.SubnetFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

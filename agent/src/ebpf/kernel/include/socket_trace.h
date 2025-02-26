@@ -34,6 +34,8 @@
 #define INFER_CONTINUE	1
 #define INFER_TERMINATE	2
 
+#define MAX_PUSH_DELAY_TIME_NS 100000000ULL // 100ms
+
 typedef long unsigned int __kernel_size_t;
 
 enum {
@@ -86,31 +88,6 @@ struct mmsghdr {
 
 #include "socket_trace_common.h"
 
-struct member_fields_offset {
-	__u8 ready;
-	__u32 task__files_offset;
-	__u32 sock__flags_offset;
-	__u32 tcp_sock__copied_seq_offset;
-	__u32 tcp_sock__write_seq_offset;
-
-	__u32 struct_files_struct_fdt_offset;	// offsetof(struct files_struct, fdt)
-	__u32 struct_files_private_data_offset;	// offsetof(struct file, private_data)
-	__u32 struct_file_f_inode_offset;	// offsetof(struct file, f_inode)
-	__u32 struct_inode_i_mode_offset;	// offsetof(struct inode, i_mode)
-	__u32 struct_file_dentry_offset;	// offsetof(struct file, f_path) + offsetof(struct path, dentry)
-	__u32 struct_dentry_name_offset;	// offsetof(struct dentry, d_name) + offsetof(struct qstr, name)
-	__u32 struct_sock_family_offset;	// offsetof(struct sock_common, skc_family)
-	__u32 struct_sock_saddr_offset;	// offsetof(struct sock_common, skc_rcv_saddr)
-	__u32 struct_sock_daddr_offset;	// offsetof(struct sock_common, skc_daddr)
-	__u32 struct_sock_ip6saddr_offset;	// offsetof(struct sock_common, skc_v6_rcv_saddr)
-	__u32 struct_sock_ip6daddr_offset;	// offsetof(struct sock_common, skc_v6_daddr)
-	__u32 struct_sock_dport_offset;	// offsetof(struct sock_common, skc_dport)
-	__u32 struct_sock_sport_offset;	// offsetof(struct sock_common, skc_num)
-	__u32 struct_sock_skc_state_offset;	// offsetof(struct sock_common, skc_state)
-	__u32 struct_sock_common_ipv6only_offset;	// offsetof(struct sock_common, skc_flags)
-
-};
-
 /********************************************************/
 // socket trace struct
 /********************************************************/
@@ -122,7 +99,7 @@ union sockaddr_t {
 	struct sockaddr_in6 in6;
 };
 
-struct conn_info_t {
+struct conn_info_s {
 #ifdef PROBE_CONN
 	__u64 id;
 #endif
@@ -130,17 +107,20 @@ struct conn_info_t {
 	__u16 skc_family;	/* PF_INET, PF_INET6... */
 	__u16 sk_type;		/* socket type (SOCK_STREAM, etc) */
 	__u8 skc_ipv6only:1;
-	__u8 infer_reliable:1;	// Is protocol inference reliable?
+	__u8 enable_reasm:1;	/* Is data restructuring allowed? */
+
 	/*
 	 * Whether the socket l7 protocol type needs
 	 * to be confirmed again.
 	 */
 	__u8 need_reconfirm:1;
 	/*
-	 * True to keep the sequence number of the
-	 * captured data unchanged, otherwise false.
+	 * Retain tracing information without deletion, primarily
+	 * addressing scenarios where MySQL kComStmtClose/kComStmtQuit
+	 * single-sided transmissions (client requests without responses)
+	 * tracing gets interrupted.
 	 */
-	__u8 keep_data_seq:1;
+	__u8 keep_trace:1;
 	__u8 direction:1;	// current T_INGRESS or T_EGRESS
 	__u8 prev_direction:1;	// The direction of the last saved data
 	__u8 role:2;
@@ -178,16 +158,24 @@ struct conn_info_t {
 	// The protocol of traffic on the connection (HTTP, MySQL, etc.).
 	enum traffic_protocol protocol;
 	// MSG_UNKNOWN, MSG_REQUEST, MSG_RESPONSE
-	enum message_type message_type;
-	__s32 correlation_id;	// Currently used for Kafka determination
+	__u32 message_type:4;
+	// Is this segment of data reassembled?
+	__u32 is_reasm_seg:1;
+	__u32 no_trace:1;	/* When set to 1 (or true), tracing will not be performed. */
+	__u32 reserved:26;
+
+	union {
+		__u8 encoding_type;	// Currently used for OpenWire encoding inference
+		__s32 correlation_id;	// Currently used for Kafka determination
+	};
 	__u32 prev_count;	// Prestored data length
 	__u32 syscall_infer_len;
 	__u64 count:40;
-	__u64 tcpseq_offset:24;
+	__u64 unused_bits:24;
 	char prev_buf[EBPF_CACHE_SIZE];
 	char *syscall_infer_addr;
 	void *sk;
-	struct socket_info_t *socket_info_ptr;	/* lookup __socket_info_map */
+	struct socket_info_s *socket_info_ptr;	/* lookup __socket_info_map */
 };
 
 struct process_data_extra {
@@ -200,14 +188,14 @@ struct process_data_extra {
 	enum message_type message_type;
 } __attribute__ ((packed));
 
-#define DATA_BUF_MAX  32
+#define INFER_BUF_MAX  32
 
 /*
  * BPF Tail Calls context
  */
 struct infer_data_s {
 	__u32 len;
-	char data[DATA_BUF_MAX * 2];
+	char data[INFER_BUF_MAX * 2];
 };
 
 struct tail_calls_context {
@@ -219,9 +207,12 @@ struct tail_calls_context {
 	 */
 	char private_data[sizeof(struct infer_data_s)];
 	int max_size_limit;	// The maximum size of the socket data that can be transferred.
+	__u32 push_reassembly_bytes;	// The number of bytes pushed after enabling data reassembly.
 	enum traffic_direction dir;	// Data flow direction.
-	bool vecs;		// Whether a memory vector is used ? (for specific syscall)
-	struct conn_info_t conn_info;
+	__u8 vecs:1;		// Whether a memory vector is used ? (for specific syscall)
+	__u8 is_close:1;	// Is it a close() systemcall ?
+	__u8 reserve:6;
+	struct conn_info_s conn_info;
 	struct process_data_extra extra;
 	__u32 bytes_count;
 	struct member_fields_offset *offset;
@@ -259,6 +250,7 @@ struct data_args_t {
 	const char *buf;
 	// For sendmsg()/recvmsg()/writev()/readv().
 	const struct iovec *iov;
+	void *sk;
 	size_t iovlen;
 	union {
 		// For sendmmsg()
@@ -266,13 +258,43 @@ struct data_args_t {
 		// For clock_gettime()
 		struct timespec *timestamp_ptr;
 	};
-	// Timestamp for enter syscall function.
-	__u64 enter_ts;
+
+	union {
+		__u64 socket_id;	// Use for socket close
+		__u64 enter_ts;	// Timestamp for enter syscall function.
+	};
+
 	__u32 tcp_seq;		// Used to record the entry of syscalls
-	ssize_t bytes_count;	// io event
+	union {
+		ssize_t bytes_count;	// io event
+		ssize_t data_seq;	// Use for socket close
+	};
+	// Scenario for using sendto() with a specified address
+	__u16 port;
+	__u8 addr[16];
 } __attribute__ ((packed));
 
 struct syscall_comm_enter_ctx {
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*  9     1 */
+	int __syscall_nr;	/*    offset:12     4 */
+	union {
+		struct {
+			__u64 fd;	/*  offset:16   8  */
+			char *buf;	/*  offset:24   8  */
+		};
+
+		// For clock_gettime()
+		struct {
+			clockid_t which_clock;	/*   offset:16   4  */
+			struct timespec *tp;	/*   offset:24   8  */
+		};
+	};
+	size_t count;		/*    32     8 */
+	unsigned int flags;
+#else
 	__u64 __pad_0;		/*     0     8 */
 	int __syscall_nr;	/*    offset:8     4 */
 	__u32 __pad_1;		/*    12     4 */
@@ -284,41 +306,110 @@ struct syscall_comm_enter_ctx {
 
 		// For clock_gettime()
 		struct {
-			clockid_t which_clock;	/*   offset:16   8  */
+			clockid_t which_clock;	/*   offset:16   4  */
 			struct timespec *tp;	/*   offset:24   8  */
 		};
 	};
 	size_t count;		/*    32     8 */
 	unsigned int flags;
+#endif
 };
 
 struct sched_comm_exit_ctx {
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*     9     1 */
+	unsigned short padding;
+	char comm[16];		/*    12    16 */
+
+	pid_t pid;		/*    28     4 */
+	int prio;		/*    32     4 */
+#else
 	__u64 __pad_0;		/*     0     8 */
 	char comm[16];		/*     offset:8;       size:16 */
 	pid_t pid;		/*     offset:24;      size:4  */
 	int prio;		/*     offset:28;      size:4  */
+#endif
+};
+
+struct syscall_sendto_enter_ctx {
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*     9     1 */
+
+	int __syscall_nr;	/*    12     4 */
+	int fd;			/*    16     4 */
+
+	void *buff;		/*    24     8 */
+	size_t len;		/*    32     8 */
+	unsigned int flags;	/*    40     4 */
+
+	struct sockaddr *addr;	/*    48     8 */
+	int addr_len;		/*    56     4 */
+#else
+	__u64 __pad_0;
+	int __syscall_nr;	// offset:8     size:4 
+	__u32 __pad_1;		// offset:12    size:4
+	int fd;			//offset:16;      size:8; signed:0;
+	void *buff;		//offset:24;      size:8; signed:0;
+	size_t len;		//offset:32;      size:8; signed:0;
+	unsigned int flags;	//offset:40;      size:8; signed:0;
+	struct sockaddr *addr;	//offset:48;      size:8; signed:0;
+	int addr_len;		//offset:56;      size:8; signed:0;
+#endif
 };
 
 struct sched_comm_fork_ctx {
-	__u64 __pad_0;
-	char parent_comm[16];
-	__u32 parent_pid;
-	char child_comm[16];
-	__u32 child_pid;
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*     9     1 */
+	unsigned short padding;
+	char parent_comm[16];	/*    12    16 */
+
+	__u32 parent_pid;	/*    28     4 */
+	char child_comm[16];	/*    32    16 */
+	__u32 child_pid;	/*    48     4 */
+#else
+	__u64 __pad_0;		/*     0     8 */
+	char parent_comm[16];	/*     8    16 */
+	__u32 parent_pid;	/*    24     4 */
+	char child_comm[16];	/*    28    16 */
+	__u32 child_pid;	/*    44     4 */
+#endif
 };
 
 struct sched_comm_exec_ctx {
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*  9     1 */
+	int __data_loc;		/*    offset:12    4 */
+	__u32 pid;		/*    offset:16    4 */
+	__u32 old_pid;		/*    offset:20    4 */
+#else
 	__u64 __pad_0;		/*     0     8 */
 	int __data_loc;		/*    offset:8     4 */
 	__u32 pid;		/*    offset:12    4 */
 	__u32 old_pid;		/*    offset:16    4 */
+#endif
 };
 
 struct syscall_comm_exit_ctx {
+#ifdef LINUX_VER_RT
+	__u64 __pad_0;		/*     0     8 */
+	unsigned char common_migrate_disable;	/*     8     1 */
+	unsigned char common_preempt_lazy_count;	/*  9     1 */
+	int __syscall_nr;	/*    offset:12     4 */
+	__u64 ret;		/*    offset:16    8 */
+#else
 	__u64 __pad_0;		/*     0     8 */
 	int __syscall_nr;	/*    offset:8     4 */
 	__u32 __pad_1;		/*    12     4 */
 	__u64 ret;		/*    offset:16    8 */
+#endif
 };
 
 static __inline __u64 gen_conn_key_id(__u64 param_1, __u64 param_2)

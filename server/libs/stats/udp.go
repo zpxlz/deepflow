@@ -19,6 +19,7 @@ package stats
 import (
 	"io"
 	"net"
+	"sync"
 
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 )
@@ -61,9 +62,11 @@ func NewUDPClient(conf UDPConfig) (*UDPClient, error) {
 
 	h := datatype.BaseHeader{
 		FrameSize: datatype.MESSAGE_HEADER_LEN + datatype.FLOW_HEADER_LEN,
-		Type:      datatype.MESSAGE_TYPE_DFSTATS,
+		Type:      datatype.MESSAGE_TYPE_SERVER_DFSTATS,
 	}
-	flowHeader := datatype.FlowHeader{}
+	flowHeader := datatype.FlowHeader{
+		Version: datatype.LATEST_VERSION,
+	}
 	header := make([]byte, datatype.MESSAGE_HEADER_LEN+datatype.FLOW_HEADER_LEN)
 	h.Encode(header)
 	flowHeader.Encode(header[datatype.MESSAGE_HEADER_LEN:])
@@ -86,9 +89,11 @@ type UDPClient struct {
 	payloadSize int
 	buffer      []byte
 	header      []byte // 需要封装消息类型头
+	lock        sync.Mutex
 }
 
 func (uc *UDPClient) Write(bs []byte) error {
+	uc.lock.Lock()
 	var err error
 	n := len(bs)
 
@@ -103,5 +108,6 @@ func (uc *UDPClient) Write(bs []byte) error {
 	}
 	uc.buffer = append(uc.buffer, bs...)
 
+	uc.lock.Unlock()
 	return err
 }

@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodGroupPort(dbItem *mysql.PodGroupPort, seq int) {
+func (b *DataSet) AddPodGroupPort(dbItem *metadbmodel.PodGroupPort, seq int) {
 	b.PodGroupPorts[dbItem.Lcuuid] = &PodGroupPort{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -31,12 +31,12 @@ func (b *DataSet) AddPodGroupPort(dbItem *mysql.PodGroupPort, seq int) {
 		Name:            dbItem.Name,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, b.PodGroupPorts[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, b.PodGroupPorts[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodGroupPort(lcuuid string) {
 	delete(b.PodGroupPorts, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodGroupPort struct {

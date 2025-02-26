@@ -17,23 +17,26 @@
 package trans_prometheus
 
 import (
+	"fmt"
 	"time"
 
 	logging "github.com/op/go-logging"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
 )
 
 var log = logging.MustGetLogger("clickhouse.trans_prometheus")
 
-var Prometheus = &PrometheusMap{}
+// var Prometheus = &PrometheusMap{}
+var ORGPrometheus = make(map[string]PrometheusMap)
 
 type PrometheusMap struct {
-	MetricNameToID       map[string]int
+	MetricNameToID       map[string]uint64
 	MetricAppLabelLayout map[string][]AppLabel
-	LabelNameToID        map[string]int
-	LabelIDToName        map[int]string
+	LabelNameToID        map[string]uint64
+	LabelIDToName        map[uint64]string
 }
 
 type Label struct {
@@ -46,11 +49,28 @@ type AppLabel struct {
 	AppLabelColumnIndex int
 }
 
-func GenerateMap() {
-	METRIC_NAME_TO_ID := map[string]int{}
+func GenerateOrgMap() {
+	getOrgUrl := fmt.Sprintf("http://localhost:%d/v1/orgs/", config.ControllerCfg.ListenPort)
+	resp, err := common.CURLPerform("GET", getOrgUrl, nil)
+	if err != nil {
+		log.Warningf("request controller failed: %s, URL: %s", resp, getOrgUrl)
+		return
+	}
+	orgPrometheus := map[string]PrometheusMap{}
+	for i := range resp.Get("DATA").MustArray() {
+		orgIDInt := resp.Get("DATA").GetIndex(i).Get("ORG_ID").MustInt()
+		orgIDStr := fmt.Sprintf("%d", orgIDInt)
+		prometheusMap := GenerateMap(orgIDStr)
+		orgPrometheus[orgIDStr] = prometheusMap
+	}
+	ORGPrometheus = orgPrometheus
+}
+
+func GenerateMap(orgID string) (prometheusMap PrometheusMap) {
+	METRIC_NAME_TO_ID := map[string]uint64{}
 	METRIC_APP_LABEL_LAYOUT := map[string][]AppLabel{}
-	LABEL_NAME_TO_ID := map[string]int{}
-	LABEL_ID_TO_NAME := map[int]string{}
+	LABEL_NAME_TO_ID := map[string]uint64{}
+	LABEL_ID_TO_NAME := map[uint64]string{}
 	chClient := client.Client{
 		Host:     config.Cfg.Clickhouse.Host,
 		Port:     config.Cfg.Clickhouse.Port,
@@ -59,7 +79,7 @@ func GenerateMap() {
 		DB:       "flow_tag",
 	}
 	metricNameToIDSql := "SELECT name,id FROM flow_tag.prometheus_metric_name_map"
-	metricNameToIDSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: metricNameToIDSql})
+	metricNameToIDSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: metricNameToIDSql, ORGID: orgID})
 	if err != nil {
 		log.Warning(err)
 		return
@@ -70,13 +90,13 @@ func GenerateMap() {
 		metricNameKey := _key.([]interface{})[0]
 		metricIDKey := _key.([]interface{})[1]
 		metricName := metricNameKey.(string)
-		metricID := metricIDKey.(int)
+		metricID := metricIDKey.(uint64)
 		METRIC_NAME_TO_ID[metricName] = metricID
 	}
-	Prometheus.MetricNameToID = METRIC_NAME_TO_ID
+	prometheusMap.MetricNameToID = METRIC_NAME_TO_ID
 
 	labelNameToIDSql := "SELECT name,id FROM flow_tag.prometheus_label_name_map"
-	labelNameToIDSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: labelNameToIDSql})
+	labelNameToIDSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: labelNameToIDSql, ORGID: orgID})
 	if err != nil {
 		log.Warning(err)
 		return
@@ -87,15 +107,15 @@ func GenerateMap() {
 		labelNameKey := _key.([]interface{})[0]
 		labelNameIDKey := _key.([]interface{})[1]
 		labelName := labelNameKey.(string)
-		labelNameID := labelNameIDKey.(int)
+		labelNameID := labelNameIDKey.(uint64)
 		LABEL_NAME_TO_ID[labelName] = labelNameID
 		LABEL_ID_TO_NAME[labelNameID] = labelName
 	}
-	Prometheus.LabelIDToName = LABEL_ID_TO_NAME
-	Prometheus.LabelNameToID = LABEL_NAME_TO_ID
+	prometheusMap.LabelIDToName = LABEL_ID_TO_NAME
+	prometheusMap.LabelNameToID = LABEL_NAME_TO_ID
 
 	metricAppLabelLayoutSql := "SELECT metric_name,app_label_name,app_label_column_index FROM flow_tag.prometheus_metric_app_label_layout_map ORDER BY app_label_column_index"
-	metricAppLabelLayoutSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: metricAppLabelLayoutSql})
+	metricAppLabelLayoutSqlRst, err := chClient.DoQuery(&client.QueryParams{Sql: metricAppLabelLayoutSql, ORGID: orgID})
 	if err != nil {
 		log.Warning(err)
 		return
@@ -108,17 +128,18 @@ func GenerateMap() {
 		appLabelColumnIndexKey := _key.([]interface{})[2]
 		metricName := metricNameKey.(string)
 		appLabelName := appLabelNameKey.(string)
-		appLabelColumnIndex := appLabelColumnIndexKey.(int)
+		appLabelColumnIndex := int(appLabelColumnIndexKey.(uint64))
 		appLabel := AppLabel{AppLabelName: appLabelName, AppLabelColumnIndex: appLabelColumnIndex}
 		METRIC_APP_LABEL_LAYOUT[metricName] = append(METRIC_APP_LABEL_LAYOUT[metricName], appLabel)
 	}
-	Prometheus.MetricAppLabelLayout = METRIC_APP_LABEL_LAYOUT
+	prometheusMap.MetricAppLabelLayout = METRIC_APP_LABEL_LAYOUT
+	return
 }
 
 func GeneratePrometheusMap() {
-	GenerateMap()
+	GenerateOrgMap()
 	interval := time.Duration(config.Cfg.PrometheusCacheUpdateInterval) * time.Second
 	for range time.Tick(interval) {
-		GenerateMap()
+		GenerateOrgMap()
 	}
 }

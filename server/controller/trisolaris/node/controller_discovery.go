@@ -20,8 +20,10 @@ import (
 	"github.com/google/uuid"
 
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
+	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
@@ -29,10 +31,11 @@ type ControllerDiscovery struct {
 	ctrlIP             string
 	nodeType           int
 	regionDomainPrefix string
+	ORGID
 }
 
-func newControllerDiscovery(masterIP string, nodeType string, regionDomainPrefix string) *ControllerDiscovery {
-	log.Info("node info: ", masterIP, nodeType, regionDomainPrefix)
+func newControllerDiscovery(masterIP string, nodeType string, regionDomainPrefix string, orgID ORGID) *ControllerDiscovery {
+	log.Infof("node info: ip=%s, nodeType=%s, regionDomainPrefix=%s", masterIP, nodeType, regionDomainPrefix, logger.NewORGPrefix(int(orgID)))
 	nodeTypeInt := CONTROLLER_NODE_TYPE_MASTER
 	if nodeType == "slave" {
 		nodeTypeInt = CONTROLLER_NODE_TYPE_SLAVE
@@ -41,38 +44,39 @@ func newControllerDiscovery(masterIP string, nodeType string, regionDomainPrefix
 		ctrlIP:             masterIP,
 		nodeType:           nodeTypeInt,
 		regionDomainPrefix: regionDomainPrefix,
+		ORGID:              orgID,
 	}
 }
 
-func (c *ControllerDiscovery) GetControllerData() *models.Controller {
+func (c *ControllerDiscovery) GetControllerData() *metadbmodel.Controller {
 	if c.ctrlIP == "" {
-		log.Errorf("get env(%s) data failed", NODE_IP_KEY)
+		log.Errorf(c.Logf("get env(%s) data failed", NODE_IP_KEY))
 		return nil
 	}
 	envData := utils.GetRuntimeEnv()
 	name := GetNodeName()
 	if name == "" {
-		log.Errorf("get env(%s) data failed", NODE_NAME_KEY)
+		log.Errorf(c.Logf("get env(%s) data failed", NODE_NAME_KEY))
 		return nil
 	}
 	nodeName := GetNodeName()
 	if nodeName == "" {
-		log.Errorf("get env(%s) data failed", NODE_NAME_KEY)
+		log.Errorf(c.Logf("get env(%s) data failed", NODE_NAME_KEY))
 		return nil
 	}
 	podIP := GetPodIP()
 	if podIP == "" {
-		log.Errorf("get env(%s) data failed", POD_IP_KEY)
+		log.Errorf(c.Logf("get env(%s) data failed", POD_IP_KEY))
 		return nil
 	}
 	podName := GetPodName()
 	if podName == "" {
-		log.Errorf("get env(%s) data failed", POD_NAME_KEY)
+		log.Errorf(c.Logf("get env(%s) data failed", POD_NAME_KEY))
 		return nil
 	}
 
-	log.Infof("controller name (%s), node_name (%s)", name, nodeName)
-	return &models.Controller{
+	log.Infof(c.Logf("controller name (%s), node_name (%s)", name, nodeName))
+	return &metadbmodel.Controller{
 		Name:               name,
 		CPUNum:             int(envData.CpuNum),
 		MemorySize:         int64(envData.MemorySize),

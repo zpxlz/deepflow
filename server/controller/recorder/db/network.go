@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type Network struct {
-	OperatorBase[mysql.Network]
+	OperatorBase[*metadbmodel.Network, metadbmodel.Network]
 }
 
 func NewNetwork() *Network {
 	operater := &Network{
-		OperatorBase[mysql.Network]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_NETWORK_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.Network](
+			ctrlrcommon.RESOURCE_TYPE_NETWORK_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *Network) setDBItemID(dbItem *mysql.Network, id int) {
-	dbItem.ID = id
 }

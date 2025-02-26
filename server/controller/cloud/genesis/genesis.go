@@ -19,44 +19,44 @@ package genesis
 import (
 	"errors"
 
-	"inet.af/netaddr"
-
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
+	"inet.af/netaddr"
+
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
+	gcommon "github.com/deepflowio/deepflow/server/controller/genesis/common"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
-	"github.com/op/go-logging"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.genesis")
+var log = logger.MustGetLogger("cloud.genesis")
 
 type Genesis struct {
-	defaultVpc      bool
+	orgID           int
+	teamID          int
 	ipV4CIDRMaxMask int
 	ipV6CIDRMaxMask int
 	Name            string
 	Lcuuid          string
 	UuidGenerate    string
-	regionUuid      string
+	regionLcuuid    string
 	azLcuuid        string
-	defaultVpcName  string
 	ips             []cloudmodel.IP
 	subnets         []cloudmodel.Subnet
-	genesisData     genesis.GenesisSyncData
+	genesisData     gcommon.GenesisSyncDataResponse
 	cloudStatsd     statsd.CloudStatsd
 }
 
-func NewGenesis(domain mysql.Domain, cfg config.CloudConfig) (*Genesis, error) {
+func NewGenesis(orgID int, domain metadbmodel.Domain, cfg config.CloudConfig) (*Genesis, error) {
 	config, err := simplejson.NewJson([]byte(domain.Config))
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 	ipV4MaxMask := config.Get("ipv4_cidr_max_mask").MustInt()
@@ -67,15 +67,20 @@ func NewGenesis(domain mysql.Domain, cfg config.CloudConfig) (*Genesis, error) {
 	if ipV6MaxMask == 0 {
 		ipV6MaxMask = 64
 	}
+	regionLcuuid := config.Get("region_uuid").MustString()
+	if regionLcuuid == "" {
+		regionLcuuid = common.DEFAULT_REGION
+	}
 	return &Genesis{
+		orgID:           orgID,
+		teamID:          domain.TeamID,
 		ipV4CIDRMaxMask: ipV4MaxMask,
 		ipV6CIDRMaxMask: ipV6MaxMask,
 		Name:            domain.Name,
 		Lcuuid:          domain.Lcuuid,
 		UuidGenerate:    domain.DisplayName,
-		defaultVpcName:  cfg.GenesisDefaultVpcName,
-		regionUuid:      config.Get("region_uuid").MustString(),
-		genesisData:     genesis.GenesisSyncData{},
+		regionLcuuid:    regionLcuuid,
+		genesisData:     gcommon.GenesisSyncDataResponse{},
 		cloudStatsd:     statsd.NewCloudStatsd(),
 	}, nil
 }
@@ -94,13 +99,15 @@ func (g *Genesis) GetStatter() statsd.StatsdStatter {
 	}
 
 	return statsd.StatsdStatter{
+		OrgID:      g.orgID,
+		TeamID:     g.teamID,
 		GlobalTags: globalTags,
 		Element:    statsd.GetCloudStatsd(g.cloudStatsd),
 	}
 }
 
-func (g *Genesis) getGenesisData() (genesis.GenesisSyncData, error) {
-	return genesis.GenesisService.GetGenesisSyncResponse()
+func (g *Genesis) getGenesisData() (gcommon.GenesisSyncDataResponse, error) {
+	return genesis.GenesisService.GetGenesisSyncResponse(g.orgID)
 }
 
 func (g *Genesis) generateIPsAndSubnets() {
@@ -162,7 +169,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 			var cidr netaddr.IPPrefix
 			ipNet, err := netaddr.ParseIP(ip.IP)
 			if err != nil {
-				log.Error(err.Error())
+				log.Error(err.Error(), logger.NewORGPrefix(g.orgID))
 				continue
 			}
 			if ipNet.Is4() {
@@ -175,7 +182,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 			knownCIDRs.Add(cidr.Masked())
 			if _, ok := subnetMap[cidr.Masked().String()]; !ok {
 				subnet := cloudmodel.Subnet{
-					Lcuuid:        common.GetUUID(networkID+cidr.Masked().String(), uuid.Nil),
+					Lcuuid:        common.GetUUIDByOrgID(g.orgID, networkID+cidr.Masked().String()),
 					CIDR:          cidr.Masked().String(),
 					NetworkLcuuid: networkID,
 					VPCLcuuid:     NetworkIDToVpcID[networkID],
@@ -198,7 +205,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 		for _, ip := range ipsWithoutMasklen {
 			ipNet, err := netaddr.ParseIP(ip.IP)
 			if err != nil {
-				log.Warning(err.Error())
+				log.Warning(err.Error(), logger.NewORGPrefix(g.orgID))
 				continue
 			}
 			if ipNet.Is4() {
@@ -206,7 +213,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 			} else if ipNet.Is6() {
 				prefixV6 = append(prefixV6, netaddr.IPPrefixFrom(ipNet, 128))
 			} else {
-				log.Warningf("parse ip error: ip is (%s)", ipNet.String())
+				log.Warningf("parse ip error: ip is (%s)", ipNet.String(), logger.NewORGPrefix(g.orgID))
 				continue
 			}
 		}
@@ -217,7 +224,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 		for _, ip := range ipsWithoutMasklen {
 			ipNet, err := netaddr.ParseIP(ip.IP)
 			if err != nil {
-				log.Warning(err.Error())
+				log.Warning(err.Error(), logger.NewORGPrefix(g.orgID))
 				continue
 			}
 			for _, cidr := range knownCIDRs.ToSlice() {
@@ -235,7 +242,7 @@ func (g *Genesis) generateIPsAndSubnets() {
 				if cidr.Contains(ipNet) {
 					if _, ok := subnetMap[cidr.String()]; !ok {
 						subnet := cloudmodel.Subnet{
-							Lcuuid:        common.GetUUID(networkID+cidr.String(), uuid.Nil),
+							Lcuuid:        common.GetUUIDByOrgID(g.orgID, networkID+cidr.String()),
 							NetworkLcuuid: networkID,
 							CIDR:          cidr.String(),
 							VPCLcuuid:     NetworkIDToVpcID[networkID],
@@ -258,7 +265,6 @@ func (g *Genesis) generateIPsAndSubnets() {
 
 func (g *Genesis) GetCloudData() (cloudmodel.Resource, error) {
 	g.azLcuuid = ""
-	g.defaultVpc = false
 	g.cloudStatsd = statsd.NewCloudStatsd()
 
 	if genesis.GenesisService == nil {
@@ -311,14 +317,6 @@ func (g *Genesis) GetCloudData() (cloudmodel.Resource, error) {
 	ips, err := g.getIPs()
 	if err != nil {
 		return cloudmodel.Resource{}, err
-	}
-	if g.defaultVpc {
-		vpc := cloudmodel.VPC{
-			Lcuuid:       common.GetUUID(g.defaultVpcName, uuid.Nil),
-			Name:         g.defaultVpcName,
-			RegionLcuuid: g.regionUuid,
-		}
-		vpcs = append(vpcs, vpc)
 	}
 
 	resource := cloudmodel.Resource{

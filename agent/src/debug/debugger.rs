@@ -22,6 +22,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use arc_swap::access::Access;
@@ -41,7 +42,7 @@ use super::{
 use super::{
     policy::{PolicyDebugger, PolicyMessage},
     rpc::{RpcDebugger, RpcMessage},
-    Beacon, Message, Module, BEACON_INTERVAL, DEEPFLOW_AGENT_BEACON,
+    Beacon, Message, Module, BEACON_INTERVAL, BEACON_INTERVAL_MIN, DEEPFLOW_AGENT_BEACON,
 };
 #[cfg(target_os = "linux")]
 use crate::platform::{ApiWatcher, GenericPoller};
@@ -52,7 +53,10 @@ use crate::{
     trident::AgentId,
     utils::command::get_hostname,
 };
-use public::debug::{send_to, Error, QueueDebugger, QueueMessage, Result, MAX_BUF_SIZE};
+use public::{
+    consts::DEFAULT_CONTROLLER_PORT,
+    debug::{send_to, Error, QueueDebugger, QueueMessage, Result, MAX_BUF_SIZE},
+};
 
 struct ModuleDebuggers {
     #[cfg(target_os = "linux")]
@@ -87,6 +91,8 @@ pub struct ConstructDebugCtx {
 }
 
 impl Debugger {
+    const TIMEOUT: Duration = Duration::from_millis(500);
+
     pub fn start(&self) {
         if self.running.swap(true, Ordering::Relaxed) {
             return;
@@ -121,18 +127,32 @@ impl Debugger {
                     }
                 };
                 info!("debugger listening on: {:?}", sock.local_addr().unwrap());
-
+                if let Err(e) = sock.set_read_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger set read timeout error: {:?}", e);
+                }
+                if let Err(e) = sock.set_write_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger set write timeout error: {:?}", e);
+                }
                 let sock_clone = sock.clone();
                 let running_clone = running.clone();
                 let serialize_conf = config::standard();
                 #[cfg(target_os = "linux")]
                 let agent_mode = conf.load().agent_mode;
                 let beacon_port = conf.load().controller_port;
-                thread::Builder::new()
+                let beacon_thread = thread::Builder::new()
                     .name("debugger-beacon".to_owned())
                     .spawn(move || {
+                        let interval_counter_max =
+                            BEACON_INTERVAL.as_secs() / BEACON_INTERVAL_MIN.as_secs();
+                        let mut interval_counter = 0;
                         while running_clone.load(Ordering::Relaxed) {
-                            thread::sleep(BEACON_INTERVAL);
+                            thread::sleep(BEACON_INTERVAL_MIN);
+                            interval_counter += 1;
+                            if interval_counter < interval_counter_max {
+                                continue;
+                            }
+                            interval_counter = 0;
+
                             let Some(hostname) = override_os_hostname.as_ref().clone().or_else(
                                 || match get_hostname() {
                                     Ok(hostname) => Some(hostname),
@@ -146,7 +166,7 @@ impl Debugger {
                             };
 
                             let beacon = Beacon {
-                                vtap_id: conf.load().vtap_id,
+                                agent_id: conf.load().agent_id,
                                 hostname,
                             };
 
@@ -193,15 +213,21 @@ impl Debugger {
                             .unwrap_or_else(|e| warn!("handle client request error: {}", e));
                         }
                         Err(e) => {
-                            warn!(
-                                "receive udp packet error: kind=({:?}) detail={}",
-                                e.kind(),
-                                e
-                            );
+                            match e.kind() {
+                                ErrorKind::WouldBlock => {}
+                                _ => {
+                                    warn!(
+                                        "receive udp packet error: kind=({:?}) detail={}",
+                                        e.kind(),
+                                        e
+                                    );
+                                }
+                            }
                             continue;
                         }
                     }
                 }
+                let _ = beacon_thread.join();
             })
             .unwrap();
 
@@ -251,17 +277,37 @@ impl Debugger {
                     sock_v4.local_addr().unwrap(),
                     sock_v6.local_addr().unwrap()
                 );
-
+                if let Err(e) = sock_v4.set_read_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger ipv4 set read timeout error: {:?}", e);
+                }
+                if let Err(e) = sock_v4.set_write_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger ipv4 set write timeout error: {:?}", e);
+                }
+                if let Err(e) = sock_v6.set_read_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger ipv6 set read timeout error: {:?}", e);
+                }
+                if let Err(e) = sock_v6.set_write_timeout(Some(Self::TIMEOUT)) {
+                    warn!("debugger ipv6 set write timeout error: {:?}", e);
+                }
                 let sock_v4_clone = sock_v4.clone();
                 let sock_v6_clone = sock_v6.clone();
                 let running_clone = running.clone();
                 let serialize_conf = config::standard();
                 let beacon_port = conf.load().controller_port;
-                thread::Builder::new()
+                let beacon_thread = thread::Builder::new()
                     .name("debugger-beacon".to_owned())
                     .spawn(move || {
+                        let interval_counter_max =
+                            BEACON_INTERVAL.as_secs() / BEACON_INTERVAL_MIN.as_secs();
+                        let mut interval_counter = 0;
                         while running_clone.load(Ordering::Relaxed) {
-                            thread::sleep(BEACON_INTERVAL);
+                            thread::sleep(BEACON_INTERVAL_MIN);
+                            interval_counter += 1;
+                            if interval_counter < interval_counter_max {
+                                continue;
+                            }
+                            interval_counter = 0;
+
                             let Some(hostname) = override_os_hostname.as_ref().clone().or_else(
                                 || match get_hostname() {
                                     Ok(hostname) => Some(hostname),
@@ -275,7 +321,7 @@ impl Debugger {
                             };
 
                             let beacon = Beacon {
-                                vtap_id: conf.load().vtap_id,
+                                agent_id: conf.load().agent_id,
                                 hostname,
                             };
 
@@ -337,6 +383,8 @@ impl Debugger {
                             Err(e) => {
                                 match e.kind() {
                                     ErrorKind::ConnectionReset => {} // It's a bug of Windows, https://stackoverflow.com/questions/34242622/windows-udp-sockets-recvfrom-fails-with-error-10054
+                                    ErrorKind::WouldBlock => {}
+                                    ErrorKind::TimedOut => {}
                                     _ => {
                                         warn!(
                                             "receive udp packet error: kind=({:?}) detail={}",
@@ -371,6 +419,8 @@ impl Debugger {
                             Err(e) => {
                                 match e.kind() {
                                     ErrorKind::ConnectionReset => {} // It's a bug of Windows, https://stackoverflow.com/questions/34242622/windows-udp-sockets-recvfrom-fails-with-error-10054
+                                    ErrorKind::WouldBlock => {}
+                                    ErrorKind::TimedOut => {}
                                     _ => {
                                         warn!(
                                             "receive udp packet error: kind=({:?}) detail={}",
@@ -384,6 +434,7 @@ impl Debugger {
                         }
                     }
                 }
+                let _ = beacon_thread.join();
             })
             .unwrap();
         self.thread.lock().unwrap().replace(thread);
@@ -428,7 +479,7 @@ impl Debugger {
                     RpcMessage::Config(_) => debugger.basic_config(),
                     RpcMessage::Groups(_) => debugger.ip_groups(),
                     RpcMessage::Segments(_) => debugger.local_segments(),
-                    RpcMessage::TapTypes(_) => debugger.tap_types(),
+                    RpcMessage::CaptureNetworkTypes(_) => debugger.tap_types(),
                     RpcMessage::Version(_) => debugger.current_version(),
                     RpcMessage::PlatformData(_) => debugger.platform_data(),
                     _ => unreachable!(),
@@ -566,9 +617,9 @@ pub struct Client {
 impl Client {
     pub fn new(addr: SocketAddr) -> Result<Self> {
         let sock = if addr.is_ipv4() {
-            UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), 0))?
+            UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), DEFAULT_CONTROLLER_PORT))?
         } else {
-            UdpSocket::bind((IpAddr::from(Ipv6Addr::UNSPECIFIED), 0))?
+            UdpSocket::bind((IpAddr::from(Ipv6Addr::UNSPECIFIED), DEFAULT_CONTROLLER_PORT))?
         };
         Ok(Self {
             sock,

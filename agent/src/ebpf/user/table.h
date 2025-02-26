@@ -18,6 +18,9 @@
 #define DF_BPF_TABLE_H
 #include "tracer.h"
 
+bool bpf_table_get(struct bpf_tracer *tracer,
+			 const char *tb_name, void *key, void *val);
+
 bool bpf_table_get_value(struct bpf_tracer *tracer,
 			 const char *tb_name,
 			 uint64_t key,
@@ -28,4 +31,9 @@ uint32_t bpf_table_elems_count(struct bpf_tracer * tracer,
 			       const char *tb_name);
 bool bpf_table_delete_key(struct bpf_tracer * tracer,
 			  const char *tb_name, uint64_t key);
+
+void insert_prog_to_map(struct bpf_tracer *tracer, const char *map_name,
+					const char *prog_name, int key);
+
+int bpf_table_get_fd(struct bpf_tracer *tracer, const char *tb_name);
 #endif /* DF_BPF_TABLE_H */

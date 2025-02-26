@@ -17,19 +17,23 @@
 package metadata
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
-	"github.com/op/go-logging"
 	"gorm.io/gorm"
 
 	"github.com/deepflowio/deepflow/message/trident"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/config"
+	. "github.com/deepflowio/deepflow/server/controller/trisolaris/dbcache"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata/agentmetadata"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/pushmanager"
+	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/metadata")
+var log = logger.MustGetLogger("trisolaris.metadata")
 
 type MetaData struct {
 	dbDataCache    *atomic.Value // *DBDataCache 数据库缓存
@@ -37,17 +41,23 @@ type MetaData struct {
 	groupDataOP    *GroupDataOP
 	tapType        *TapType
 	policyDataOP   *PolicyDataOP
+	startTime      int64
 	chPlatformData chan struct{}
 	chTapType      chan struct{}
 	chPolicy       chan struct{}
 	chGroup        chan struct{}
 	config         *config.Config
 	db             *gorm.DB
+	ctx            context.Context
+	cancel         context.CancelFunc
+	agentMetaData  *agentmetadata.MetaData
+	ORGID
 }
 
-func NewMetaData(db *gorm.DB, cfg *config.Config) *MetaData {
+func NewMetaData(db *gorm.DB, cfg *config.Config, orgID int, pctx context.Context) *MetaData {
+	ctx, cancel := context.WithCancel(pctx)
 	dbDataCache := &atomic.Value{}
-	dbDataCache.Store(newDBDataCache())
+	dbDataCache.Store(NewDBDataCache(ORGID(orgID), cfg))
 	metaData := &MetaData{
 		dbDataCache:    dbDataCache,
 		tapType:        newTapType(db),
@@ -57,17 +67,27 @@ func NewMetaData(db *gorm.DB, cfg *config.Config) *MetaData {
 		chGroup:        make(chan struct{}, 1),
 		config:         cfg,
 		db:             db,
+		ctx:            ctx,
+		cancel:         cancel,
+		ORGID:          ORGID(orgID),
 	}
 	metaData.platformDataOP = newPlatformDataOP(db, metaData)
 	metaData.groupDataOP = newGroupDataOP(metaData)
 	metaData.policyDataOP = newPolicyDaTaOP(metaData, cfg.BillingMethod)
+	metaData.agentMetaData = agentmetadata.NewMetaData(db, cfg, orgID)
+	metaData.agentMetaData.UpdateDBDataCache(metaData.GetDBDataCache())
 	return metaData
 }
 
+func (m *MetaData) GetAgentMetaData() *agentmetadata.MetaData {
+	return m.agentMetaData
+}
+
 func (m *MetaData) generateDbDataCache() {
-	dbDataCache := newDBDataCache()
+	dbDataCache := NewDBDataCache(m.ORGID, m.config)
 	dbDataCache.GetDataCacheFromDB(m.db)
 	m.updateDBDataCache(dbDataCache)
+	m.agentMetaData.UpdateDBDataCache(dbDataCache)
 }
 
 func (m *MetaData) GetDBDataCache() *DBDataCache {
@@ -108,6 +128,10 @@ func (m *MetaData) PutChTapType() {
 
 func (m *MetaData) GetPlatformDataOP() *PlatformDataOP {
 	return m.platformDataOP
+}
+
+func (m *MetaData) GetPolicyDataOP() *PolicyDataOP {
+	return m.policyDataOP
 }
 
 func (m *MetaData) GetGroupDataOP() *GroupDataOP {
@@ -154,12 +178,19 @@ func (m *MetaData) GetPlatformVips() []string {
 	return m.config.PlatformVips
 }
 
-func (m *MetaData) InitData() {
+func (m *MetaData) GetStartTime() int64 {
+	return m.startTime
+}
+
+func (m *MetaData) InitData(startTime int64) {
+	m.startTime = startTime
 	m.generateDbDataCache()
 	m.platformDataOP.initData()
+	m.groupDataOP.SetStartTime(startTime)
 	m.groupDataOP.generateGroupData()
 	m.tapType.generateTapTypes()
 	m.policyDataOP.generatePolicyData()
+	m.agentMetaData.InitData(startTime)
 }
 
 func (m *MetaData) timedRefreshMetaData() {
@@ -168,53 +199,49 @@ func (m *MetaData) timedRefreshMetaData() {
 	for {
 		select {
 		case <-ticker:
-			log.Info("start generate metaData from timed")
+			log.Info(m.Log("start generate metaData from timed"))
 			m.generateDbDataCache()
+			m.agentMetaData.TickerTrigger()
 			m.platformDataOP.GeneratePlatformData()
 			m.groupDataOP.generateGroupData()
 			m.policyDataOP.generatePolicyData()
-			log.Info("end generate metaData from timed")
+			m.tapType.generateTapTypes()
+			log.Info(m.Log("end generate metaData from timed"))
 		case <-m.chPlatformData:
-			log.Info("start generate platform data from rpc")
+			log.Info(m.Log("start generate platform data from rpc"))
+			time.Sleep(time.Duration(m.config.PlatformDataRefreshDelayTime) * time.Second)
+			log.Info("processing generate platform data from rpc")
 			m.generateDbDataCache()
+			m.agentMetaData.ChPlatformDataTrigger()
 			m.platformDataOP.GeneratePlatformData()
-			log.Info("end generate platform data from rpc")
+			log.Info(m.Log("end generate platform data from rpc"))
 		case <-m.chPolicy:
-			log.Info("start generate policy from rpc")
+			log.Info(m.Log("start generate policy from rpc"))
 			m.generateDbDataCache()
+			m.agentMetaData.ChPolicyTrigger()
 			m.groupDataOP.generateGroupData()
 			m.policyDataOP.generatePolicyData()
-			log.Info("end generate policy from rpc")
-			pushmanager.Broadcast()
+			log.Info(m.Log("end generate policy from rpc"))
+			pushmanager.Broadcast(m.GetORGID())
 		case <-m.chGroup:
-			log.Info("start generate group from rpc")
+			log.Info(m.Log("start generate group from rpc"))
 			m.generateDbDataCache()
+			m.agentMetaData.ChGroupTrigger()
 			m.groupDataOP.generateGroupData()
-			log.Info("end generate group from rpc")
-			pushmanager.Broadcast()
-		}
-	}
-}
-
-func (m *MetaData) timedRefreshTapType() {
-	interval := time.Duration(m.config.MetaDataRefreshInterval)
-	ticker := time.NewTicker(interval * time.Second).C
-	for {
-		select {
-		case <-ticker:
-			log.Info("start generate tap type from timed")
-			m.tapType.generateTapTypes()
-			log.Info("end generate tap type from timed")
+			log.Info(m.Log("end generate group from rpc"))
+			pushmanager.Broadcast(m.GetORGID())
 		case <-m.chTapType:
-			log.Info("start generate tap type from rpc")
+			log.Info(m.Log("start generate tap type from rpc"))
+			m.agentMetaData.ChCaptureNetworkTypeTrigger()
 			m.tapType.generateTapTypes()
-			log.Info("end generate tap type from rpc")
-			pushmanager.Broadcast()
+			log.Info(m.Log("end generate tap type from rpc"))
+		case <-m.ctx.Done():
+			log.Info(m.Log("exit generate metaData"))
+			return
 		}
 	}
 }
 
 func (m *MetaData) TimedRefreshMetaData() {
 	go m.timedRefreshMetaData()
-	go m.timedRefreshTapType()
 }

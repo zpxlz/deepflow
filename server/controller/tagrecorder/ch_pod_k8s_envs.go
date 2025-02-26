@@ -17,81 +17,65 @@
 package tagrecorder
 
 import (
-	"encoding/json"
-	"strings"
-
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodK8sEnvs struct {
-	UpdaterBase[mysql.ChPodK8sEnvs, K8sEnvsKey]
+	SubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, metadbmodel.Pod, metadbmodel.ChPodK8sEnvs, K8sEnvsKey]
 }
 
 func NewChPodK8sEnvs() *ChPodK8sEnvs {
-	updater := &ChPodK8sEnvs{
-		UpdaterBase[mysql.ChPodK8sEnvs, K8sEnvsKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_K8S_ENVS,
-		},
+	mng := &ChPodK8sEnvs{
+		newSubscriberComponent[*message.PodFieldsUpdate, message.PodFieldsUpdate, metadbmodel.Pod, metadbmodel.ChPodK8sEnvs, K8sEnvsKey](
+			common.RESOURCE_TYPE_POD_EN, RESOURCE_TYPE_CH_K8S_ENVS,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (k *ChPodK8sEnvs) generateNewData() (map[K8sEnvsKey]mysql.ChPodK8sEnvs, bool) {
-	var pods []mysql.Pod
-	err := mysql.Db.Unscoped().Find(&pods).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(k.resourceTypeName, err))
-		return nil, false
-	}
-
-	keyToItem := make(map[K8sEnvsKey]mysql.ChPodK8sEnvs)
-	for _, pod := range pods {
-		envsMap := map[string]string{}
-		envs := strings.Split(pod.ENV, ", ")
-		for _, singleEnv := range envs {
-			envInfo := strings.Split(singleEnv, ":")
-			if len(envInfo) == 2 {
-				envsMap[envInfo[0]] = envInfo[1]
-			}
-		}
-		if len(envsMap) > 0 {
-			envStr, err := json.Marshal(envsMap)
-			if err != nil {
-				log.Error(err)
-				return nil, false
-			}
-			key := K8sEnvsKey{
-				ID: pod.ID,
-			}
-			keyToItem[key] = mysql.ChPodK8sEnvs{
-				ID:      pod.ID,
-				Envs:    string(envStr),
-				L3EPCID: pod.VPCID,
-				PodNsID: pod.PodNamespaceID,
-			}
-		}
-	}
-	return keyToItem, true
-}
-
-func (k *ChPodK8sEnvs) generateKey(dbItem mysql.ChPodK8sEnvs) K8sEnvsKey {
-	return K8sEnvsKey{ID: dbItem.ID}
-}
-
-func (k *ChPodK8sEnvs) generateUpdateInfo(oldItem, newItem mysql.ChPodK8sEnvs) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodK8sEnvs) onResourceUpdated(sourceID int, fieldsUpdate *message.PodFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Envs != newItem.Envs {
-		updateInfo["envs"] = newItem.Envs
-	}
-	if oldItem.L3EPCID != newItem.L3EPCID {
-		updateInfo["l3_epc_id"] = newItem.L3EPCID
-	}
-	if oldItem.PodNsID != newItem.PodNsID {
-		updateInfo["pod_ns_id"] = newItem.PodNsID
+
+	if fieldsUpdate.ENV.IsDifferent() {
+		envs, _ := common.StrToJsonAndMap(fieldsUpdate.ENV.GetNew())
+		updateInfo["envs"] = envs
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem metadbmodel.ChPodK8sEnvs
+		db.Where("id = ?", sourceID).First(&chItem)
+		if chItem.ID == 0 {
+			c.SubscriberComponent.dbOperator.add(
+				[]K8sEnvsKey{{ID: sourceID}},
+				[]metadbmodel.ChPodK8sEnvs{{ID: sourceID, Envs: updateInfo["envs"].(string)}},
+				db,
+			)
+		} else {
+			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, K8sEnvsKey{ID: sourceID}, db)
+		}
 	}
-	return nil, false
+}
+
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodK8sEnvs) sourceToTarget(md *message.Metadata, item *metadbmodel.Pod) (keys []K8sEnvsKey, targets []metadbmodel.ChPodK8sEnvs) {
+	if item.ENV == "" {
+		return
+	}
+	envs, _ := common.StrToJsonAndMap(item.ENV)
+	return []K8sEnvsKey{{ID: item.ID}}, []metadbmodel.ChPodK8sEnvs{{
+		ID:          item.ID,
+		Envs:        envs,
+		TeamID:      md.TeamID,
+		DomainID:    md.DomainID,
+		SubDomainID: md.SubDomainID,
+	}}
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPodK8sEnvs) softDeletedTargetsUpdated(targets []metadbmodel.ChPodK8sEnvs, db *metadb.DB) {
+
 }

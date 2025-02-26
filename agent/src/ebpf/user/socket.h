@@ -22,12 +22,34 @@
 #define CACHE_LINE_SIZE 64
 #endif
 
+#define SYSCALL_FORK_TP_PATH "/sys/kernel/debug/tracing/events/syscalls/sys_exit_fork"
+#define SYSCALL_CLONE_TP_PATH "/sys/kernel/debug/tracing/events/syscalls/sys_exit_clone"
+#define FTRACE_SYSCALLS_PATH "/sys/kernel/debug/tracing/events/syscalls"
+/*
+ * The `__sys_recvmmsg` interface underwent a change in its parameter list starting
+ * from Linux kernel version 5.0. If earlier kernel versions support the `fentry/fexit`
+ * feature, attempting to load BPF programs on this interface may fail. Therefore, we
+ * use this interface to check whether to load a version of the BPF bytecode binary
+ * that supports `fentry/fexit`.
+ */
+#define TEST_KFUNC_NAME "__sys_recvmmsg"
+#define TEST_KFUNC_PARAMS_NUM 6
+
 // use for inference struct offset.
 #define OFFSET_INFER_SERVER_ADDR "127.0.0.1"
 #define OFFSET_INFER_SERVER_PORT 54583
 
 #define CACHE_LINE_ROUNDUP(size) \
   (CACHE_LINE_SIZE * ((size + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE))
+
+enum linux_kernel_type {
+	K_TYPE_COMM,
+	K_TYPE_KYLIN,
+	K_TYPE_VER_5_2_PLUS,
+	K_TYPE_VER_3_10,
+	K_TYPE_KFUNC,
+	K_TYPE_RT,
+};
 
 enum probes_act_type {
 	ACT_NONE,
@@ -49,7 +71,7 @@ struct socket_bpf_data {
 	uint16_t l7_protocal_hint;	// 应用数据（cap_data）的协议类型，枚举如下：1 SOCK_DATA_HTTP1, 2 SOCK_DATA_DNS, 3 ...
 	// 存在一定误判性（例如标识为A协议但实际上是未知协议，或标识为多种协议），上层应用应继续深入判断
 	uint8_t msg_type;	// 信息类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
-	bool need_reconfirm;	// 是否需要上层再确认 
+	bool need_reconfirm;	// 是否需要上层再确认
 	bool is_tls;
 
 	/* trace info */
@@ -96,8 +118,16 @@ struct socket_bpf_data {
  * @tracer_state: 追踪器当前状态
  *
  * @boot_time_update_diff 这里用于记录相邻两次更新后，系统启动时间之间的差异（单位为纳秒）。
- * @probes_count How many probes now 
+ * @probes_count How many probes now
  * @data_limit_max Maximum data length limit
+ *
+ * @period_push_conflict_count When the periodic push event detects that the
+ *    buffer is being modified by another eBPF program, a conflict will occur.
+ *    This is used to record the number of conflicts.
+ * @period_push_max_delay The maximum latency time for periodic push events, in microseconds.
+ * @period_push_avg_delay The average latency time for periodic push events, in microseconds.
+ * @proc_exec_event_count The number of events for process execute.
+ * @proc_exit_event_count The number of events for process exits.
  */
 struct socket_trace_stats {
 
@@ -135,35 +165,35 @@ struct socket_trace_stats {
 	int64_t boot_time_update_diff;
 	uint32_t probes_count;
 	uint32_t data_limit_max;
-};
 
-struct bpf_offset_param {
-	uint8_t ready;
-	uint32_t task__files_offset;
-	uint32_t sock__flags_offset;
-	uint32_t tcp_sock__copied_seq_offset;
-	uint32_t tcp_sock__write_seq_offset;
+	/*
+	 * Period push events statistics.
+	 */
+	uint64_t period_push_conflict_count;
+	uint64_t period_push_max_delay;
+	uint64_t period_push_avg_delay;
 
-	uint32_t struct_files_struct_fdt_offset;	// offsetof(struct files_struct, fdt)
-	uint32_t struct_files_private_data_offset;	// offsetof(struct file, private_data)
-	uint32_t struct_file_f_inode_offset;	// offsetof(struct file, f_inode)
-	uint32_t struct_inode_i_mode_offset;	// offsetof(struct inode, i_mode)
-	uint32_t struct_file_dentry_offset;	// offsetof(struct file, f_path) + offsetof(struct path, dentry)
-	uint32_t struct_dentry_name_offset;	// offsetof(struct dentry, d_name) + offsetof(struct qstr, name)
-	uint32_t struct_sock_family_offset;	// offsetof(struct sock_common, skc_family)
-	uint32_t struct_sock_saddr_offset;	// offsetof(struct sock_common, skc_rcv_saddr)
-	uint32_t struct_sock_daddr_offset;	// offsetof(struct sock_common, skc_daddr)
-	uint32_t struct_sock_ip6saddr_offset;	// offsetof(struct sock_common, skc_v6_rcv_saddr)
-	uint32_t struct_sock_ip6daddr_offset;	// offsetof(struct sock_common, skc_v6_daddr)
-	uint32_t struct_sock_dport_offset;	// offsetof(struct sock_common, skc_dport)
-	uint32_t struct_sock_sport_offset;	// offsetof(struct sock_common, skc_num)
-	uint32_t struct_sock_skc_state_offset;	// offsetof(struct sock_common, skc_state)
-	uint32_t struct_sock_common_ipv6only_offset;	// offsetof(struct sock_common, skc_flags)
+	/*
+	 * Process start and exit events.
+	 */
+	uint64_t proc_exec_event_count;
+	uint64_t proc_exit_event_count;
+
+	/*
+	 * Captured packet statistics
+	 */
+	uint64_t rx_packets;
+	uint64_t tx_packets;
+	uint64_t rx_bytes;
+	uint64_t tx_bytes;
+	uint64_t dropped_packets;
+	uint64_t kern_missed_packets;
+	uint64_t invalid_packets;
 };
 
 struct bpf_offset_param_array {
 	int count;
-	struct bpf_offset_param offsets[0];
+	bpf_offset_param_t offsets[0];
 };
 
 struct bpf_socktrace_params {
@@ -172,6 +202,8 @@ struct bpf_socktrace_params {
 	uint32_t kern_socket_map_used;
 	uint32_t kern_trace_map_max;
 	uint32_t kern_trace_map_used;
+	uint64_t proc_exec_event_count;
+	uint64_t proc_exit_event_count;
 	bool datadump_enable;
 	int datadump_pid;
 	uint8_t datadump_proto;
@@ -181,7 +213,7 @@ struct bpf_socktrace_params {
 };
 
 /*
- * This structure is used for registration of additional events. 
+ * This structure is used for registration of additional events.
  */
 struct extra_event {
 	struct list_head list;
@@ -206,20 +238,42 @@ static inline char *get_proto_name(uint16_t proto_id)
 		return "Kafka";
 	case PROTO_MQTT:
 		return "MQTT";
+	case PROTO_AMQP:
+		return "AMQP";
+	case PROTO_OPENWIRE:
+		return "OpenWire";
+	case PROTO_ZMTP:
+		return "ZMTP";
+	case PROTO_ROCKETMQ:
+		return "RocketMQ";
+	case PROTO_NATS:
+		return "NATS";
+	case PROTO_PULSAR:
+		return "Pulsar";
 	case PROTO_DUBBO:
 		return "Dubbo";
 	case PROTO_SOFARPC:
 		return "SofaRPC";
+	case PROTO_SOME_IP:
+		return "Some/IP";
 	case PROTO_POSTGRESQL:
 		return "PgSQL";
 	case PROTO_ORACLE:
 		return "Oracle";
 	case PROTO_FASTCGI:
 		return "FastCGI";
+	case PROTO_BRPC:
+		return "bRPC";
+	case PROTO_TARS:
+		return "Tars";
 	case PROTO_MONGO:
 		return "MongoDB";
+	case PROTO_MEMCACHED:
+		return "Memcached";
 	case PROTO_TLS:
 		return "TLS";
+	case PROTO_DPDK_PKT:
+		return "Pkt";
 	case PROTO_CUSTOM:
 		return "Custom";
 	default:
@@ -299,10 +353,15 @@ prefetch_and_process_data(struct bpf_tracer *t, int nb_rx, void **datas_burst)
 		if (block_head->fn != NULL) {
 			block_head->fn(sd);
 		} else {
+			int64_t boot_time = get_sysboot_time_ns();
 			if (t->datadump)
-				t->datadump((void *)sd);
-
-			callback(sd);
+				t->datadump((void *)sd, boot_time);
+			/*
+			 * Modify socket data time to real time,
+			 * time precision is in nanosecond.
+			 */
+			sd->timestamp = sd->timestamp + boot_time;
+			callback(NULL, sd);
 		}
 
 		if (block_head->is_last == 1)
@@ -327,4 +386,30 @@ int socket_tracer_stop(void);
 int socket_tracer_start(void);
 enum tracer_state get_socket_tracer_state(void);
 int set_protocol_ports_bitmap(int proto_type, const char *ports);
+int disable_syscall_trace_id(void);
+
+/**
+ * eBPF Probe Point Configuration
+ *
+ * Configure probe points. The types of probe points may include:
+ * (1) kprobe/kretprobe
+ * (2) tracepoint
+ * During the configuration process, the kernel is automatically checked
+ * to determine if it supports 'fentry/fexit'. If supported, this type
+ * of probe point is preferred to improve performance. Otherwise,
+ * 'kprobe/kretprobe' or 'tracepoint' types are used.
+ *
+ * @param tps Pointer to the structure that stores the configuration of
+ * 	      all probe points.
+ * @param type eBPF program type.
+ * @param fn Name of the kernel probe interface.
+ * @param tp_name Name of the tracepoint type probe point.
+ * @param is_eixt Used to specify the position of the kernel probe
+ * 		  interface. If probing at the exit of the kernel interface,
+ * 		  it is set to true. Otherwise, it is set to false. This
+ * 		  is not applicable for handling tracepoint type interfaces.
+ */
+void config_probe(struct tracer_probes_conf *tps, int type, const char *fn,
+		  const char *tp_name, bool is_exit);
+void uprobe_match_pid_handle(int feat, int pid, enum match_pids_act act);
 #endif /* DF_USER_SOCKET_H */

@@ -22,15 +22,14 @@ import (
 	"github.com/baidubce/bce-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getRouterAndTables(
-	region model.Region, vpcIdToLcuuid map[string]string, vpcIdToName map[string]string,
-) ([]model.VRouter, []model.RoutingTable, error) {
+func (b *BaiduBce) getRouterAndTables(vpcIdToLcuuid map[string]string, vpcIdToName map[string]string) ([]model.VRouter, []model.RoutingTable, error) {
 	var retVRouters []model.VRouter
 	var retRoutingTables []model.RoutingTable
 
-	log.Debug("get routers starting")
+	log.Debug("get routers starting", logger.NewORGPrefix(b.orgID))
 
 	// 每个VPC下一个路由表，抽象为路由器
 	vpcClient, _ := vpc.NewClient(b.secretID, b.secretKey, "bcc."+b.endpoint)
@@ -39,22 +38,21 @@ func (b *BaiduBce) getRouterAndTables(
 		startTime := time.Now()
 		result, err := vpcClient.GetRouteTableDetail("", vpcId)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, err
 		}
 
 		b.cloudStatsd.RefreshAPIMoniter("GetRouteTableDetail", len(result.RouteRules), startTime)
 		b.debugger.WriteJson("GetRouteTableDetail", " ", structToJson([]*vpc.GetRouteTableResult{result}))
-		vrouterLcuuid := common.GenerateUUID(result.RouteTableId)
+		vrouterLcuuid := common.GenerateUUIDByOrgID(b.orgID, result.RouteTableId)
 		vrouterName, _ := vpcIdToName[vpcId]
 		retVRouter := model.VRouter{
 			Lcuuid:       vrouterLcuuid,
 			Name:         vrouterName,
 			VPCLcuuid:    vpcLcuuid,
-			RegionLcuuid: region.Lcuuid,
+			RegionLcuuid: b.regionLcuuid,
 		}
 		retVRouters = append(retVRouters, retVRouter)
-		b.regionLcuuidToResourceNum[retVRouter.RegionLcuuid]++
 
 		// 暂不支持对接连接专线网关的路由表(无法创建可用的专线网关)
 		nexthop_types := map[string]string{
@@ -68,7 +66,7 @@ func (b *BaiduBce) getRouterAndTables(
 		for _, rule := range result.RouteRules {
 			destination := rule.DestinationAddress
 			if destination == "" {
-				log.Debugf("no destination_address in rule (%d)", rule.RouteRuleId)
+				log.Debugf("no destination_address in rule (%d)", rule.RouteRuleId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			nexthop := rule.NexthopId
@@ -79,7 +77,7 @@ func (b *BaiduBce) getRouterAndTables(
 			if nType, ok := nexthop_types[string(rule.NexthopType)]; ok {
 				nexthopType = nType
 			}
-			tableLcuuid := common.GenerateUUID(vrouterLcuuid + destination + nexthop)
+			tableLcuuid := common.GenerateUUIDByOrgID(b.orgID, vrouterLcuuid+destination+nexthop)
 			retRoutingTable := model.RoutingTable{
 				Lcuuid:        tableLcuuid,
 				VRouterLcuuid: vrouterLcuuid,
@@ -90,6 +88,6 @@ func (b *BaiduBce) getRouterAndTables(
 			retRoutingTables = append(retRoutingTables, retRoutingTable)
 		}
 	}
-	log.Debug("get routers complete")
+	log.Debug("get routers complete", logger.NewORGPrefix(b.orgID))
 	return retVRouters, retRoutingTables, nil
 }

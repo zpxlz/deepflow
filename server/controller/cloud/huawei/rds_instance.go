@@ -24,6 +24,7 @@ import (
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []model.IP, error) {
@@ -61,11 +62,11 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 			if !cloudcommon.CheckJsonAttributes(jRDS, []string{"id", "name", "status", "type", "nodes", "datastore", "vpc_id", "subnet_id"}) {
 				continue
 			}
-			id := jRDS.Get("id").MustString()
+			id := common.IDGenerateUUID(h.orgID, jRDS.Get("id").MustString())
 			name := jRDS.Get("name").MustString()
 			state, ok := stateStrToInt[jRDS.Get("status").MustString()]
 			if !ok {
-				log.Infof("exclude rds_instance: %s, state: %s", id, jRDS.Get("status").MustString())
+				log.Infof("exclude rds_instance: %s, state: %s", id, jRDS.Get("status").MustString(), logger.NewORGPrefix(h.orgID))
 				continue
 			}
 
@@ -77,14 +78,14 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 			if azNames.Cardinality() == 1 && azNames.ToSlice()[0] != "" {
 				azLcuuid, ok = h.toolDataSet.azNameToAZLcuuid[azNames.ToSlice()[0]]
 				if !ok {
-					log.Infof("exclude rds_instance: %s, az: %s not found", id, azNames.ToSlice()[0])
+					log.Infof("exclude rds_instance: %s, az: %s not found", id, azNames.ToSlice()[0], logger.NewORGPrefix(h.orgID))
 					continue
 				}
 			}
 
-			networkLcuuid := jRDS.Get("subnet_id").MustString()
+			networkLcuuid := common.IDGenerateUUID(h.orgID, jRDS.Get("subnet_id").MustString())
 			if networkLcuuid == "" {
-				log.Infof("exclude rds_instance: %s, no subnet_id", id)
+				log.Infof("exclude rds_instance: %s, no subnet_id", id, logger.NewORGPrefix(h.orgID))
 				continue
 			}
 
@@ -97,7 +98,7 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 				Version:      jRDS.Get("datastore").Get("version").MustString(),
 				Series:       seriesStrToInt[jRDS.Get("type").MustString()],
 				Model:        common.RDS_MODEL_PRIMARY,
-				VPCLcuuid:    jRDS.Get("vpc_id").MustString(),
+				VPCLcuuid:    common.IDGenerateUUID(h.orgID, jRDS.Get("vpc_id").MustString()),
 				AZLcuuid:     azLcuuid,
 				RegionLcuuid: regionLcuuid,
 			}
@@ -107,7 +108,7 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 
 			for _, ip := range jRDS.Get("private_ips").MustStringArray() {
 				vif := model.VInterface{
-					Lcuuid:        common.GenerateUUID(rds.Lcuuid + ip),
+					Lcuuid:        common.GenerateUUIDByOrgID(h.orgID, rds.Lcuuid+ip),
 					Type:          common.VIF_TYPE_LAN,
 					Mac:           common.VIF_DEFAULT_MAC,
 					DeviceLcuuid:  rds.Lcuuid,
@@ -126,7 +127,7 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 					}
 				}
 				ip := model.IP{
-					Lcuuid:           common.GenerateUUID(vif.Lcuuid + ip),
+					Lcuuid:           common.GenerateUUIDByOrgID(h.orgID, vif.Lcuuid+ip),
 					VInterfaceLcuuid: vif.Lcuuid,
 					IP:               ip,
 					SubnetLcuuid:     subnetLcuuid,
@@ -137,7 +138,7 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 
 			for _, ip := range jRDS.Get("public_ips").MustStringArray() {
 				vif := model.VInterface{
-					Lcuuid:        common.GenerateUUID(rds.Lcuuid + ip),
+					Lcuuid:        common.GenerateUUIDByOrgID(h.orgID, rds.Lcuuid+ip),
 					Type:          common.VIF_TYPE_WAN,
 					Mac:           common.VIF_DEFAULT_MAC,
 					DeviceLcuuid:  rds.Lcuuid,
@@ -149,7 +150,7 @@ func (h *HuaWei) getRDSInstances() ([]model.RDSInstance, []model.VInterface, []m
 				vifs = append(vifs, vif)
 
 				ip := model.IP{
-					Lcuuid:           common.GenerateUUID(vif.Lcuuid + ip),
+					Lcuuid:           common.GenerateUUIDByOrgID(h.orgID, vif.Lcuuid+ip),
 					VInterfaceLcuuid: vif.Lcuuid,
 					IP:               ip,
 					RegionLcuuid:     regionLcuuid,

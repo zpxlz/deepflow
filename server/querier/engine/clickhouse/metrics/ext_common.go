@@ -19,23 +19,21 @@ package metrics
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
+	"golang.org/x/exp/slices"
+
+	ctlcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/config"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
+	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/common"
 )
 
 var EXT_METRICS = map[string]*Metrics{}
 
-func GetExtMetrics(db, table, where string, ctx context.Context) (map[string]*Metrics, error) {
+func GetExtMetrics(db, table, where, queryCacheTTL, orgID string, useQueryCache bool, ctx context.Context) (map[string]*Metrics, error) {
 	loadMetrics := make(map[string]*Metrics)
-	var err error
-	if db == "ext_metrics" || db == "deepflow_system" || (db == "flow_log" && table == "l7_flow_log") {
-		// Avoid UT failures
-		if config.Cfg == nil {
-			return nil, nil
-		}
+	if slices.Contains([]string{common.DB_NAME_APPLICATION_LOG, common.DB_NAME_EXT_METRICS, common.DB_NAME_DEEPFLOW_ADMIN, common.DB_NAME_DEEPFLOW_TENANT}, db) || (db == "flow_log" && table == "l7_flow_log") {
 		externalChClient := client.Client{
 			Host:     config.Cfg.Clickhouse.Host,
 			Port:     config.Cfg.Clickhouse.Port,
@@ -54,9 +52,10 @@ func GetExtMetrics(db, table, where string, ctx context.Context) (map[string]*Me
 		if where != "" {
 			whereSql = fmt.Sprintf("AND (%s)", where)
 		}
+		whereSql = strings.ReplaceAll(whereSql, " name ", " field_name ")
 		externalMetricSql = fmt.Sprintf(externalMetricSql, db, tableFilter, whereSql)
 
-		externalMetricFloatRst, err := externalChClient.DoQuery(&client.QueryParams{Sql: externalMetricSql})
+		externalMetricFloatRst, err := externalChClient.DoQuery(&client.QueryParams{Sql: externalMetricSql, UseQueryCache: useQueryCache, QueryCacheTTL: queryCacheTTL, ORGID: orgID})
 		if err != nil {
 			log.Error(err)
 			return nil, err
@@ -69,68 +68,35 @@ func GetExtMetrics(db, table, where string, ctx context.Context) (map[string]*Me
 			dbField := fmt.Sprintf("if(indexOf(%s, '%s')=0, null, %s[indexOf(%s, '%s')])", metrics_names_field, externalTag, metrics_values_field, metrics_names_field, externalTag)
 			metricName := fmt.Sprintf("metrics.%s", externalTag)
 			lm := NewMetrics(
-				i, dbField, metricName, "", METRICS_TYPE_COUNTER,
-				"metrics", []bool{true, true, true}, "", tableName, "",
+				i, dbField, metricName, metricName, metricName, "", "", "", METRICS_TYPE_COUNTER,
+				"metrics", []bool{true, true, true}, "", tableName, "", "", "", "", "",
 			)
 			loadMetrics[fmt.Sprintf("%s-%s", metricName, tableName)] = lm
 		}
-	}
-	return loadMetrics, err
-}
 
-func GetPrometheusMetrics(db, table, where string, ctx context.Context) (map[string]*Metrics, error) {
-	loadMetrics := make(map[string]*Metrics)
-	allMetrics := GetSamplesMetrics()
-	var err error
-	if config.Cfg == nil {
-		return nil, nil
-	}
-	externalChClient := client.Client{
-		Host:     config.Cfg.Clickhouse.Host,
-		Port:     config.Cfg.Clickhouse.Port,
-		UserName: config.Cfg.Clickhouse.User,
-		Password: config.Cfg.Clickhouse.Password,
-		DB:       "flow_tag",
-		Context:  ctx,
-	}
-	var prometheusTableSql string
-	var tableFilter string
-	var whereSql string
-	prometheusTableSql = "SELECT table FROM flow_tag.%s_custom_field WHERE %s field_type!='' %s GROUP BY table ORDER BY table ASC"
-	if table != "" {
-		tableFilter = fmt.Sprintf("table='%s' AND", table)
-	}
-	if where != "" {
-		whereSql = fmt.Sprintf("AND (%s)", where)
-	}
-	prometheusTableSql = fmt.Sprintf(prometheusTableSql, db, tableFilter, whereSql)
-
-	prometheusTableRst, err := externalChClient.DoQuery(&client.QueryParams{Sql: prometheusTableSql})
-	if err != nil {
-		log.Error(err)
-		return nil, err
-	}
-	index := 0
-	for field, metric := range allMetrics {
-		metricType := METRICS_TYPE_COUNTER
-		isAgg := false
-		if field == COUNT_METRICS_NAME {
-			metricType = METRICS_TYPE_OTHER
-			isAgg = true
-		}
-		for _, value := range prometheusTableRst.Values {
-			tableName := value.([]interface{})[0].(string)
-			if tableName == "" {
-				continue
+		// native metrics
+		if config.ControllerCfg.DFWebService.Enabled {
+			getNativeUrl := fmt.Sprintf("http://localhost:%d/v1/native-fields/?db=%s&table_name=%s", config.ControllerCfg.ListenPort, db, table)
+			resp, err := ctlcommon.CURLPerform("GET", getNativeUrl, nil, ctlcommon.WithHeader(ctlcommon.HEADER_KEY_X_ORG_ID, orgID))
+			if err != nil {
+				log.Errorf("request controller failed: %s, URL: %s", resp, getNativeUrl)
+			} else {
+				resultArray := resp.Get("DATA").MustArray()
+				for i := range resultArray {
+					nativeMetric := resp.Get("DATA").GetIndex(i).Get("NAME").MustString()
+					displayName := resp.Get("DATA").GetIndex(i).Get("DISPLAY_NAME").MustString()
+					fieldType := resp.Get("DATA").GetIndex(i).Get("FIELD_TYPE").MustInt()
+					if fieldType != common.NATIVE_FIELD_TYPE_METRIC {
+						continue
+					}
+					lm := NewMetrics(
+						len(loadMetrics), nativeMetric, displayName, displayName, displayName, "", "", "", METRICS_TYPE_COUNTER,
+						common.NATIVE_FIELD_CATEGORY, []bool{true, true, true}, "", table, "", "", "", "", "",
+					)
+					loadMetrics[fmt.Sprintf("%s-%s", nativeMetric, table)] = lm
+				}
 			}
-			lm := NewMetrics(
-				index, metric.DBField, metric.DisplayName, "", metricType,
-				"metrics", []bool{true, true, true}, "", tableName, "",
-			)
-			lm.IsAgg = isAgg
-			loadMetrics[strings.Join([]string{field, strconv.Itoa(index)}, "-")] = lm
-			index++
 		}
 	}
-	return loadMetrics, err
+	return loadMetrics, nil
 }

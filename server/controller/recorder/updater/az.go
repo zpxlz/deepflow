@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type AZ struct {
-	UpdaterBase[cloudmodel.AZ, mysql.AZ, *diffbase.AZ]
+	UpdaterBase[
+		cloudmodel.AZ,
+		*diffbase.AZ,
+		*metadbmodel.AZ,
+		metadbmodel.AZ,
+		*message.AZAdd,
+		message.AZAdd,
+		*message.AZUpdate,
+		message.AZUpdate,
+		*message.AZFieldsUpdate,
+		message.AZFieldsUpdate,
+		*message.AZDelete,
+		message.AZDelete]
 }
 
 func NewAZ(wholeCache *cache.Cache, cloudData []cloudmodel.AZ) *AZ {
 	updater := &AZ{
-		UpdaterBase[cloudmodel.AZ, mysql.AZ, *diffbase.AZ]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_AZ_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewAZ(),
-			diffBaseData: wholeCache.DiffBaseDataSet.AZs,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.AZ,
+			*diffbase.AZ,
+			*metadbmodel.AZ,
+			metadbmodel.AZ,
+			*message.AZAdd,
+			message.AZAdd,
+			*message.AZUpdate,
+			message.AZUpdate,
+			*message.AZFieldsUpdate,
+			message.AZFieldsUpdate,
+			*message.AZDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_AZ_EN,
+			wholeCache,
+			db.NewAZ().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.AZs,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,30 +73,32 @@ func (z *AZ) getDiffBaseByCloudItem(cloudItem *cloudmodel.AZ) (diffBase *diffbas
 	return
 }
 
-func (z *AZ) generateDBItemToAdd(cloudItem *cloudmodel.AZ) (*mysql.AZ, bool) {
-	dbItem := &mysql.AZ{
+func (z *AZ) generateDBItemToAdd(cloudItem *cloudmodel.AZ) (*metadbmodel.AZ, bool) {
+	dbItem := &metadbmodel.AZ{
 		Name:   cloudItem.Name,
 		Label:  cloudItem.Label,
 		Region: cloudItem.RegionLcuuid,
-		Domain: z.cache.DomainLcuuid,
+		Domain: z.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (z *AZ) generateUpdateInfo(diffBase *diffbase.AZ, cloudItem *cloudmodel.AZ) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (z *AZ) generateUpdateInfo(diffBase *diffbase.AZ, cloudItem *cloudmodel.AZ) (*message.AZFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.AZFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

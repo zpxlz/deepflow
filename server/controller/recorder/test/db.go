@@ -25,7 +25,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 )
 
@@ -48,17 +48,17 @@ func GetDB(dbFile string) *gorm.DB {
 
 func GetModels() []interface{} {
 	return []interface{}{
-		&mysql.Domain{}, &mysql.Region{}, &mysql.AZ{}, &mysql.SubDomain{}, &mysql.Host{}, &mysql.VM{},
-		&mysql.VPC{}, &mysql.Network{}, &mysql.Subnet{}, &mysql.VRouter{}, &mysql.RoutingTable{},
-		&mysql.DHCPPort{}, &mysql.VInterface{}, &mysql.WANIP{}, &mysql.LANIP{}, &mysql.FloatingIP{},
-		&mysql.SecurityGroup{}, &mysql.SecurityGroupRule{}, &mysql.VMSecurityGroup{}, &mysql.LB{},
-		&mysql.LBListener{}, &mysql.LBTargetServer{}, &mysql.NATGateway{}, &mysql.NATRule{},
-		&mysql.NATVMConnection{}, &mysql.LBVMConnection{}, &mysql.CEN{}, &mysql.PeerConnection{},
-		&mysql.RDSInstance{}, &mysql.RedisInstance{},
-		&mysql.PodCluster{}, &mysql.PodNode{}, &mysql.PodNamespace{}, &mysql.VMPodNodeConnection{},
-		&mysql.PodIngress{}, &mysql.PodIngressRule{}, &mysql.PodIngressRuleBackend{},
-		&mysql.PodService{}, &mysql.PodServicePort{}, &mysql.PodGroup{}, &mysql.PodGroupPort{},
-		&mysql.PodReplicaSet{}, &mysql.Pod{},
+		&metadbmodel.Domain{}, &metadbmodel.Region{}, &metadbmodel.AZ{}, &metadbmodel.SubDomain{}, &metadbmodel.Host{}, &metadbmodel.VM{},
+		&metadbmodel.VPC{}, &metadbmodel.Network{}, &metadbmodel.Subnet{}, &metadbmodel.VRouter{}, &metadbmodel.RoutingTable{},
+		&metadbmodel.DHCPPort{}, &metadbmodel.VInterface{}, &metadbmodel.WANIP{}, &metadbmodel.LANIP{}, &metadbmodel.FloatingIP{},
+		&metadbmodel.LB{},
+		&metadbmodel.LBListener{}, &metadbmodel.LBTargetServer{}, &metadbmodel.NATGateway{}, &metadbmodel.NATRule{},
+		&metadbmodel.NATVMConnection{}, &metadbmodel.LBVMConnection{}, &metadbmodel.CEN{}, &metadbmodel.PeerConnection{},
+		&metadbmodel.RDSInstance{}, &metadbmodel.RedisInstance{},
+		&metadbmodel.PodCluster{}, &metadbmodel.PodNode{}, &metadbmodel.PodNamespace{}, &metadbmodel.VMPodNodeConnection{},
+		&metadbmodel.PodIngress{}, &metadbmodel.PodIngressRule{}, &metadbmodel.PodIngressRuleBackend{},
+		&metadbmodel.PodService{}, &metadbmodel.PodServicePort{}, &metadbmodel.PodGroup{}, &metadbmodel.PodGroupPort{},
+		&metadbmodel.PodReplicaSet{}, &metadbmodel.Pod{},
 	}
 }
 

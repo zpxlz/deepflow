@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddNetwork(dbItem *mysql.Network, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddNetwork(dbItem *metadbmodel.Network, seq int, toolDataSet *tool.DataSet) {
 	vpcLcuuid, _ := toolDataSet.GetVPCLcuuidByID(dbItem.VPCID)
 	b.Networks[dbItem.Lcuuid] = &Network{
 		DiffBase: DiffBase{
@@ -40,12 +40,12 @@ func (b *DataSet) AddNetwork(dbItem *mysql.Network, seq int, toolDataSet *tool.D
 		AZLcuuid:        dbItem.AZ,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, b.Networks[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, b.Networks[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteNetwork(lcuuid string) {
 	delete(b.Networks, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NETWORK_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type Network struct {

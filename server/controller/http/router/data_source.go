@@ -17,14 +17,18 @@
 package router
 
 import (
+	"fmt"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/router/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	"github.com/deepflowio/deepflow/server/controller/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 type DataSource struct {
@@ -35,22 +39,26 @@ func NewDataSource(cfg *config.ControllerConfig) *DataSource {
 	return &DataSource{cfg: cfg}
 }
 
-func (ds *DataSource) RegisterTo(e *gin.Engine) {
-	e.GET("/v1/data-sources/:lcuuid/", getDataSource)
-	e.GET("/v1/data-sources/", getDataSources(ds.cfg))
-	e.POST("/v1/data-sources/", createDataSource(ds.cfg))
-	e.PATCH("/v1/data-sources/:lcuuid/", updateDataSource(ds.cfg))
-	e.DELETE("/v1/data-sources/:lcuuid/", deleteDataSource(ds.cfg))
+func (d *DataSource) RegisterTo(e *gin.Engine) {
+	e.GET("/v1/data-sources/:lcuuid/", d.getDataSource())
+	e.GET("/v1/data-sources/", d.getDataSources())
+	e.POST("/v1/data-sources/", d.createDataSource())
+	e.PATCH("/v1/data-sources/:lcuuid/", d.updateDataSource())
+	e.DELETE("/v1/data-sources/:lcuuid/", d.deleteDataSource())
 }
 
-func getDataSource(c *gin.Context) {
-	args := make(map[string]interface{})
-	args["lcuuid"] = c.Param("lcuuid")
-	data, err := service.GetDataSources(args, nil)
-	JsonResponse(c, data, err)
+func (d *DataSource) getDataSource() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		args := make(map[string]interface{})
+		args["lcuuid"] = c.Param("lcuuid")
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		dataSourceService := service.NewDataSource(httpcommon.GetUserInfo(c), d.cfg)
+		data, err := dataSourceService.GetDataSources(orgID.(int), args, nil)
+		response.JSON(c, response.SetData(data), response.SetError(err))
+	}
 }
 
-func getDataSources(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (d *DataSource) getDataSources() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		args := make(map[string]interface{})
 		if value, ok := c.GetQuery("type"); ok {
@@ -59,12 +67,17 @@ func getDataSources(cfg *config.ControllerConfig) gin.HandlerFunc {
 		if value, ok := c.GetQuery("name"); ok {
 			args["name"] = value
 		}
-		data, err := service.GetDataSources(args, &cfg.Spec)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		dataSourceService := service.NewDataSource(httpcommon.GetUserInfo(c), d.cfg)
+		data, err := dataSourceService.GetDataSources(orgID.(int), args, &d.cfg.Spec)
+		if err != nil {
+			log.Error("get data source error: %s", err, logger.NewORGPrefix(orgID.(int)))
+		}
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
-func createDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (d *DataSource) createDataSource() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		var err error
 		var dataSourceCreate *model.DataSourceCreate
@@ -72,21 +85,23 @@ func createDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 		// 参数校验
 		err = c.ShouldBindBodyWith(&dataSourceCreate, binding.JSON)
 		if dataSourceCreate != nil &&
-			!(dataSourceCreate.DataTableCollection == "flow_metrics.vtap_app*" || dataSourceCreate.DataTableCollection == "flow_metrics.vtap_flow*") {
-			BadRequestResponse(c, httpcommon.PARAMETER_ILLEGAL, "tsdb type only supports flow_metrics.vtap_app* and flow_metrics.vtap_flow*")
+			!(dataSourceCreate.DataTableCollection == "flow_metrics.application*" || dataSourceCreate.DataTableCollection == "flow_metrics.network*") {
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(fmt.Errorf("tsdb type only supports flow_metrics.application* and flow_metrics.network*")))
 			return
 		}
 		if err != nil {
-			BadRequestResponse(c, httpcommon.PARAMETER_ILLEGAL, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(err))
 			return
 		}
 
-		data, err := service.CreateDataSource(dataSourceCreate, cfg)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		dataSourceService := service.NewDataSource(httpcommon.GetUserInfo(c), d.cfg)
+		data, err := dataSourceService.CreateDataSource(orgID.(int), dataSourceCreate)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
-func updateDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (d *DataSource) updateDataSource() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		var err error
 		var dataSourceUpdate model.DataSourceUpdate
@@ -94,22 +109,26 @@ func updateDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
 		// 参数校验
 		err = c.ShouldBindBodyWith(&dataSourceUpdate, binding.JSON)
 		if err != nil {
-			BadRequestResponse(c, httpcommon.INVALID_POST_DATA, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_POST_DATA), response.SetError(err))
 			return
 		}
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.UpdateDataSource(lcuuid, dataSourceUpdate, cfg)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		dataSourceService := service.NewDataSource(httpcommon.GetUserInfo(c), d.cfg)
+		data, err := dataSourceService.UpdateDataSource(orgID.(int), lcuuid, dataSourceUpdate)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
-func deleteDataSource(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (d *DataSource) deleteDataSource() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		var err error
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.DeleteDataSource(lcuuid, cfg)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		dataSourceService := service.NewDataSource(httpcommon.GetUserInfo(c), d.cfg)
+		data, err := dataSourceService.DeleteDataSource(orgID.(int), lcuuid)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }

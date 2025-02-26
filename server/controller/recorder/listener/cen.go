@@ -18,7 +18,7 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
@@ -34,7 +34,7 @@ func NewCEN(c *cache.Cache) *CEN {
 	return listener
 }
 
-func (c *CEN) OnUpdaterAdded(addedDBItems []*mysql.CEN) {
+func (c *CEN) OnUpdaterAdded(addedDBItems []*metadbmodel.CEN) {
 	c.cache.AddCENs(addedDBItems)
 }
 

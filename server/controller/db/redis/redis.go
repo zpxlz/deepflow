@@ -34,8 +34,8 @@ var (
 
 type Config struct {
 	ResourceAPIDatabase       int      `default:"1" yaml:"resource_api_database"`
+	GenesisSyncDatabase       int      `default:"4" yaml:"genesis_sync_database"`
 	ResourceAPIExpireInterval int      `default:"3600" yaml:"resource_api_expire_interval"`
-	DimensionResourceDatabase int      `default:"2" yaml:"dimension_resource_database"`
 	Host                      []string `default:"" yaml:"host"` // TODO add default value
 	Port                      uint32   `default:"6379" yaml:"port"`
 	Password                  string   `default:"deepflow" yaml:"password"`
@@ -53,9 +53,9 @@ func GetConfig() *Config { // TODO use this function
 }
 
 type Client struct {
-	ResourceAPI       redis.UniversalClient
-	DimensionResource redis.UniversalClient
-	Config            *Config
+	ResourceAPI redis.UniversalClient
+	GenesisSync redis.UniversalClient
+	Config      *Config
 }
 
 func generateAddrs(cfg Config) []string {
@@ -106,15 +106,13 @@ func createUniversalClient(cfg Config, database int) redis.UniversalClient {
 func Init(ctx context.Context, cfg Config) (err error) {
 	clientOnce.Do(func() {
 		client = &Client{
-			ResourceAPI:       createUniversalClient(cfg, cfg.ResourceAPIDatabase),
-			DimensionResource: createUniversalClient(cfg, cfg.DimensionResourceDatabase),
+			ResourceAPI: createUniversalClient(cfg, cfg.ResourceAPIDatabase),
+			GenesisSync: createUniversalClient(cfg, cfg.GenesisSyncDatabase),
 		}
 		_, err = client.ResourceAPI.Ping(ctx).Result()
 		if err != nil {
 			return
 		}
-		_, err = client.DimensionResource.Ping(ctx).Result()
-		return
 	})
 	return
 }

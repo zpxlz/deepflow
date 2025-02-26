@@ -24,7 +24,7 @@ use serde::Serialize;
 use super::meter::Meter;
 
 use crate::common::{
-    enums::{IpProtocol, TapType},
+    enums::{CaptureNetworkType, IpProtocol},
     flow::{L7Protocol, SignalSource},
     tap_port::TapPort,
 };
@@ -34,8 +34,7 @@ use public::{
     utils::net::MacAddr,
 };
 
-const METRICS_VERSION: u32 = 20220117;
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
 pub struct Document {
     pub timestamp: u32,
     pub tagger: Tagger,
@@ -69,8 +68,14 @@ impl Document {
 
 impl From<Document> for metric::Document {
     fn from(d: Document) -> Self {
+        let timestamp = if d.flags.contains(DocumentFlag::PER_SECOND_METRICS) {
+            d.timestamp - d.tagger.time_span
+        } else {
+            d.timestamp - d.tagger.time_span * 60
+        };
+
         metric::Document {
-            timestamp: d.timestamp,
+            timestamp,
             tag: Some(d.tagger.into()),
             meter: Some(d.meter.into()),
             flags: d.flags.bits(),
@@ -91,12 +96,19 @@ impl Sendable for BoxedDocument {
         SendMessageType::Metrics
     }
 
-    fn version(&self) -> u32 {
-        METRICS_VERSION
+    fn to_kv_string(&self, dst: &mut String) {
+        let json = serde_json::to_string(&(*self.0)).unwrap();
+        dst.push_str(&json);
+        dst.push('\n');
+    }
+
+    fn file_name(&self) -> &str {
+        "flow_metrics"
     }
 }
 
 bitflags! {
+    #[derive(Serialize)]
     pub struct DocumentFlag: u32 {
         const NONE = 0; // PER_MINUTE_METRICS
         const PER_SECOND_METRICS = 1<<0;
@@ -110,6 +122,7 @@ impl Default for DocumentFlag {
 }
 
 bitflags! {
+    #[derive(Serialize)]
     pub struct Code:u64 {
         const NONE = 0;
 
@@ -133,8 +146,7 @@ bitflags! {
         const TAP_PORT = 1<<49;
         const L7_PROTOCOL = 1<<51;
 
-        const TAG_TYPE = 1<<62;
-        const TAG_VALUE = 1<<63;
+        const TUNNEL_IP_ID = 1<<62;
     }
 }
 
@@ -150,7 +162,7 @@ impl Default for Code {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Direction {
     None,
@@ -271,19 +283,7 @@ impl From<SpanKind> for TapSide {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum TagType {
-    TunnelIpId = 4,
-}
-
-impl Default for TagType {
-    fn default() -> Self {
-        TagType::TunnelIpId
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Tagger {
     pub code: Code,
 
@@ -304,22 +304,23 @@ pub struct Tagger {
     pub tap_side: TapSide,
     pub protocol: IpProtocol,
     pub acl_gid: u16,
-    pub server_port: u16,
-    pub vtap_id: u16,
+    pub server_port: u16, // tunnel_ip_id also uses this field
+    pub agent_id: u16,
     pub tap_port: TapPort,
-    pub tap_type: TapType,
+    pub tap_type: CaptureNetworkType,
     pub l7_protocol: L7Protocol,
 
     pub gpid: u32,
     pub gpid_1: u32,
 
-    pub tag_type: TagType,
-    pub tag_value: u16,
     pub otel_service: Option<String>,
     pub otel_instance: Option<String>,
     pub endpoint: Option<String>,
+    pub biz_type: u8,
     pub signal_source: SignalSource,
     pub pod_id: u32,
+    // request-reponse time span
+    pub time_span: u32,
 }
 
 impl Default for Tagger {
@@ -340,21 +341,21 @@ impl Default for Tagger {
             protocol: IpProtocol::default(),
             acl_gid: 0,
             server_port: 0,
-            vtap_id: 0,
+            agent_id: 0,
             tap_port: TapPort::default(),
-            tap_type: TapType::default(),
+            tap_type: CaptureNetworkType::default(),
             l7_protocol: L7Protocol::default(),
 
             gpid: 0,
             gpid_1: 0,
 
-            tag_type: TagType::default(),
-            tag_value: 0,
             otel_service: None,
             otel_instance: None,
             endpoint: None,
             signal_source: SignalSource::default(),
             pod_id: 0,
+            biz_type: 0,
+            time_span: 0,
         }
     }
 }
@@ -399,12 +400,10 @@ impl From<Tagger> for metric::MiniTag {
                 protocol: u8::from(t.protocol) as u32,
                 acl_gid: t.acl_gid as u32,
                 server_port: t.server_port as u32,
-                vtap_id: t.vtap_id as u32,
+                vtap_id: t.agent_id as u32,
                 tap_port: t.tap_port.0,
                 tap_type: u16::from(t.tap_type) as u32,
                 l7_protocol: t.l7_protocol as u32,
-                tag_type: t.tag_type as u32,
-                tag_value: t.tag_value as u32,
                 gpid: t.gpid,
                 gpid1: t.gpid_1,
                 signal_source: t.signal_source as u32,
@@ -412,6 +411,7 @@ impl From<Tagger> for metric::MiniTag {
                 app_instance: t.otel_instance.unwrap_or_default(),
                 endpoint: t.endpoint.unwrap_or_default(),
                 pod_id: t.pod_id,
+                biz_type: t.biz_type as u32,
             }),
         }
     }

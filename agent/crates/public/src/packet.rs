@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::any::Any;
 use std::fmt;
 use std::io::{Result, Write};
 use std::time::Duration;
@@ -21,6 +22,11 @@ use std::time::Duration;
 use crate::consts::RECORD_HEADER_LEN;
 
 pub const SECONDS_IN_MINUTE: u64 = 60;
+
+pub trait Downcast {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
 
 #[derive(Debug, Default)]
 pub struct Packet<'a> {
@@ -60,7 +66,7 @@ impl fmt::Debug for MiniPacket {
             .field("timestamp", &self.timestamp)
             .field("second_in_minute", &self.second_in_minute)
             .field("flow_id", &self.flow_id)
-            .field("acl_gids", &self.flow_id)
+            .field("acl_gids", &self.acl_gids)
             .finish()
     }
 }

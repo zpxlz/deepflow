@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodGroupPort struct {
-	UpdaterBase[cloudmodel.PodGroupPort, mysql.PodGroupPort, *diffbase.PodGroupPort]
+	UpdaterBase[
+		cloudmodel.PodGroupPort,
+		*diffbase.PodGroupPort,
+		*metadbmodel.PodGroupPort,
+		metadbmodel.PodGroupPort,
+		*message.PodGroupPortAdd,
+		message.PodGroupPortAdd,
+		*message.PodGroupPortUpdate,
+		message.PodGroupPortUpdate,
+		*message.PodGroupPortFieldsUpdate,
+		message.PodGroupPortFieldsUpdate,
+		*message.PodGroupPortDelete,
+		message.PodGroupPortDelete]
 }
 
 func NewPodGroupPort(wholeCache *cache.Cache, cloudData []cloudmodel.PodGroupPort) *PodGroupPort {
 	updater := &PodGroupPort{
-		UpdaterBase[cloudmodel.PodGroupPort, mysql.PodGroupPort, *diffbase.PodGroupPort]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPodGroupPort(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PodGroupPorts,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodGroupPort,
+			*diffbase.PodGroupPort,
+			*metadbmodel.PodGroupPort,
+			metadbmodel.PodGroupPort,
+			*message.PodGroupPortAdd,
+			message.PodGroupPortAdd,
+			*message.PodGroupPortUpdate,
+			message.PodGroupPortUpdate,
+			*message.PodGroupPortFieldsUpdate,
+			message.PodGroupPortFieldsUpdate,
+			*message.PodGroupPortDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN,
+			wholeCache,
+			db.NewPodGroupPort().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PodGroupPorts,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,40 +73,43 @@ func (p *PodGroupPort) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodGroupPort
 	return
 }
 
-func (p *PodGroupPort) generateDBItemToAdd(cloudItem *cloudmodel.PodGroupPort) (*mysql.PodGroupPort, bool) {
+func (p *PodGroupPort) generateDBItemToAdd(cloudItem *cloudmodel.PodGroupPort) (*metadbmodel.PodGroupPort, bool) {
 	podGroupID, exists := p.cache.ToolDataSet.GetPodGroupIDByLcuuid(cloudItem.PodGroupLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.PodGroupLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, cloudItem.Lcuuid,
-		))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
 	podServiceID, exists := p.cache.ToolDataSet.GetPodServiceIDByLcuuid(cloudItem.PodServiceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_PORT_EN, cloudItem.Lcuuid,
-		))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.PodGroupPort{
+	dbItem := &metadbmodel.PodGroupPort{
 		Name:         cloudItem.Name,
 		Protocol:     cloudItem.Protocol,
 		Port:         cloudItem.Port,
 		PodServiceID: podServiceID,
 		PodGroupID:   podGroupID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
+		Domain:       p.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (p *PodGroupPort) generateUpdateInfo(diffBase *diffbase.PodGroupPort, cloudItem *cloudmodel.PodGroupPort) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *PodGroupPort) generateUpdateInfo(diffBase *diffbase.PodGroupPort, cloudItem *cloudmodel.PodGroupPort) (*message.PodGroupPortFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodGroupPortFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
-	return updateInfo, len(updateInfo) > 0
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

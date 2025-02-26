@@ -21,26 +21,39 @@ pub(crate) mod http;
 pub(crate) mod mq;
 mod parser;
 pub mod pb_adapter;
+pub(crate) mod ping;
 pub(crate) mod plugin;
 pub(crate) mod rpc;
 pub(crate) mod sql;
-pub(crate) mod tls;
 pub use self::http::{check_http_method, parse_v1_headers, HttpInfo, HttpLog};
 use self::pb_adapter::L7ProtocolSendLog;
 
 pub use dns::{DnsInfo, DnsLog};
-pub use mq::{KafkaInfo, KafkaLog, MqttInfo, MqttLog};
+pub use mq::{
+    AmqpInfo, AmqpLog, KafkaInfo, KafkaLog, MqttInfo, MqttLog, NatsInfo, NatsLog, OpenWireInfo,
+    OpenWireLog, PulsarInfo, PulsarLog, RocketmqInfo, RocketmqLog, ZmtpInfo, ZmtpLog,
+};
 use num_enum::TryFromPrimitive;
-pub use parser::{MetaAppProto, SessionAggregator, SLOT_WIDTH};
+pub use parser::{AppProto, MetaAppProto, PseudoAppProto, SessionAggregator};
+pub use ping::{PingInfo, PingLog};
 pub use rpc::{
-    decode_new_rpc_trace_context_with_type, DubboInfo, DubboLog, SofaRpcInfo, SofaRpcLog,
-    SOFA_NEW_RPC_TRACE_CTX_KEY,
+    decode_new_rpc_trace_context_with_type, BrpcInfo, BrpcLog, DubboInfo, DubboLog, SofaRpcInfo,
+    SofaRpcLog, TarsInfo, TarsLog, SOFA_NEW_RPC_TRACE_CTX_KEY,
 };
 pub use sql::{
-    MongoDBInfo, MongoDBLog, MysqlInfo, MysqlLog, OracleInfo, OracleLog, PostgreInfo,
+    MemcachedInfo, MemcachedLog, MongoDBInfo, MongoDBLog, MysqlInfo, MysqlLog, PostgreInfo,
     PostgresqlLog, RedisInfo, RedisLog,
 };
-pub use tls::{TlsInfo, TlsLog};
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        pub(crate) mod tls;
+
+        pub use sql::{OracleInfo, OracleLog};
+        pub use rpc::{SomeIpInfo, SomeIpLog};
+        pub use tls::{TlsInfo, TlsLog};
+    }
+}
 
 #[cfg(test)]
 pub use self::plugin::wasm::{get_wasm_parser, WasmLog};
@@ -51,13 +64,14 @@ use std::{
     str,
 };
 
+use base64::{prelude::BASE64_STANDARD, Engine};
 use prost::Message;
 use serde::{Serialize, Serializer};
 
 use crate::{
     common::{
         ebpf::EbpfType,
-        enums::{IpProtocol, TapType},
+        enums::{CaptureNetworkType, IpProtocol},
         flow::{L7Protocol, PacketDirection, SignalSource},
         tap_port::TapPort,
         Timestamp,
@@ -69,16 +83,14 @@ use public::sender::{SendMessageType, Sendable};
 use public::utils::net::MacAddr;
 
 const NANOS_PER_MICRO: u64 = 1000;
-const FLOW_LOG_VERSION: u32 = 20220128;
 
 #[derive(Serialize, Debug, PartialEq, Copy, Clone, Eq, TryFromPrimitive)]
 #[repr(u8)]
 pub enum L7ResponseStatus {
-    Ok,
-    Error, // deprecate
-    NotExist,
-    ServerError,
-    ClientError,
+    Ok = 0,
+    NotExist = 2,
+    ServerError = 3,
+    ClientError = 4,
 }
 
 impl Default for L7ResponseStatus {
@@ -158,9 +170,10 @@ pub struct AppProtoLogsBaseInfo {
     #[serde(serialize_with = "to_string_format")]
     pub tap_port: TapPort,
     pub signal_source: SignalSource,
-    pub vtap_id: u16,
-    pub tap_type: TapType,
+    pub agent_id: u16,
+    pub tap_type: CaptureNetworkType,
     pub tap_side: TapSide,
+    pub biz_type: u8,
     #[serde(flatten)]
     pub head: AppProtoHead,
 
@@ -275,7 +288,7 @@ impl From<AppProtoLogsBaseInfo> for flow_log::AppProtoLogsBaseInfo {
             end_time: f.end_time.as_nanos() as u64,
             flow_id: f.flow_id,
             tap_port: f.tap_port.0,
-            vtap_id: f.vtap_id as u32,
+            vtap_id: f.agent_id as u32,
             tap_type: u16::from(f.tap_type) as u32,
             is_ipv6: f.ip_src.is_ipv6() as u32,
             tap_side: f.tap_side as u32,
@@ -311,6 +324,7 @@ impl From<AppProtoLogsBaseInfo> for flow_log::AppProtoLogsBaseInfo {
             gpid_1: f.gpid_1,
             pod_id_0: f.pod_id_0,
             pod_id_1: f.pod_id_1,
+            biz_type: f.biz_type as u32,
         }
     }
 }
@@ -358,14 +372,12 @@ impl AppProtoLogsBaseInfo {
 
         self.start_time = log.start_time.min(self.start_time);
         self.end_time = log.end_time.max(self.end_time);
-        match log.head.msg_type {
-            LogMessageType::Request if self.req_tcp_seq == 0 && log.req_tcp_seq != 0 => {
-                self.req_tcp_seq = log.req_tcp_seq;
-            }
-            LogMessageType::Response if self.resp_tcp_seq == 0 && log.resp_tcp_seq != 0 => {
-                self.resp_tcp_seq = log.resp_tcp_seq;
-            }
-            _ => {}
+
+        if self.req_tcp_seq == 0 {
+            self.req_tcp_seq = log.req_tcp_seq;
+        }
+        if self.resp_tcp_seq == 0 {
+            self.resp_tcp_seq = log.resp_tcp_seq;
         }
 
         // go http2 uprobe  may merge multi times, if not req and resp merge can not set to session
@@ -412,22 +424,18 @@ impl Sendable for BoxAppProtoLogsData {
         kv_string.push_str(&json);
         kv_string.push('\n');
     }
-
-    fn version(&self) -> u32 {
-        FLOW_LOG_VERSION
-    }
 }
 
 impl fmt::Display for AppProtoLogsBaseInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Timestamp: {:?} Vtap_id: {} Flow_id: {} TapType: {} TapPort: {} TapSide: {:?}\n \
+            "Timestamp: {:?} Vtap_id: {} Flow_id: {} CaptureNetworkType: {} TapPort: {} TapSide: {:?}\n \
                 \t{}_{}_{} -> {}_{}_{} Proto: {:?} Seq: {} -> {} VIP: {} -> {} EPC: {} -> {}\n \
                 \tProcess: {}:{} -> {}:{} Trace-id: {} -> {} Thread: {} -> {} cap_seq: {} -> {}\n \
                 \tL7Protocol: {:?} MsgType: {:?} Rrt: {}",
             self.start_time,
-            self.vtap_id,
+            self.agent_id,
             self.flow_id,
             self.tap_type,
             self.tap_port,
@@ -463,7 +471,7 @@ impl fmt::Display for AppProtoLogsBaseInfo {
 }
 
 fn decode_base64_to_string(value: &str) -> String {
-    let bytes = match base64::decode(value) {
+    let bytes = match BASE64_STANDARD.decode(value) {
         Ok(v) => v,
         Err(_) => return value.to_string(),
     };
@@ -486,4 +494,38 @@ macro_rules! swap_if {
     };
 }
 
+macro_rules! set_captured_byte {
+    ($this:expr, $param:expr) => {
+        match $this.msg_type {
+            LogMessageType::Request => $this.captured_request_byte = $param.captured_byte as u32,
+            LogMessageType::Response => $this.captured_response_byte = $param.captured_byte as u32,
+            _ => {
+                match LogMessageType::from($param.direction) {
+                    LogMessageType::Request => {
+                        $this.captured_request_byte = $param.captured_byte as u32
+                    }
+                    LogMessageType::Response => {
+                        $this.captured_response_byte = $param.captured_byte as u32
+                    }
+                    _ => unimplemented!(),
+                };
+            }
+        }
+    };
+}
+
+pub(crate) use set_captured_byte;
 pub(crate) use swap_if;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_l7_response_status_as_uint() {
+        assert_eq!(L7ResponseStatus::Ok as u32, 0);
+        assert_eq!(L7ResponseStatus::NotExist as u32, 2);
+        assert_eq!(L7ResponseStatus::ServerError as u32, 3);
+        assert_eq!(L7ResponseStatus::ClientError as u32, 4);
+    }
+}

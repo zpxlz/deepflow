@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,12 @@ import (
 
 var log = logging.MustGetLogger("stats")
 
-var remoteType = REMOTE_TYPE_INFLUXDB
+var remoteType = REMOTE_TYPE_DFSTATSD
+
+const (
+	TENANT_ORG_ID  = "tenant_org_id"
+	TENANT_TEAM_ID = "tenant_team_id"
+)
 
 type StatSource struct {
 	modulePrefix string
@@ -151,8 +157,7 @@ func counterToFields(counter interface{}) models.Fields {
 	return fields
 }
 
-func collectBatchPoints() client.BatchPoints {
-	timestamp := time.Now()
+func collectBatchPoints(timestamp time.Time) client.BatchPoints {
 	bp, _ := client.NewBatchPoints(client.BatchPointsConfig{Precision: "s"})
 	lock.Lock()
 	statSources.Remove(func(x interface{}) bool {
@@ -246,7 +251,15 @@ func sendStatsd(bp client.BatchPoints) {
 			dfStats.Timestamp = uint64(point.Time().Unix())
 			dfStats.Name = strings.ReplaceAll(module, "-", "_")
 			for k := range point.Tags() {
-				dfStats.TagNames = append(dfStats.TagNames, k)
+				if k == TENANT_ORG_ID {
+					v, _ := strconv.Atoi(point.Tags()[k])
+					dfStats.OrgId = uint32(v)
+				} else if k == TENANT_TEAM_ID {
+					v, _ := strconv.Atoi(point.Tags()[k])
+					dfStats.TeamId = uint32(v)
+				} else {
+					dfStats.TagNames = append(dfStats.TagNames, k)
+				}
 			}
 			sort.Slice(dfStats.TagNames, func(i, j int) bool {
 				return dfStats.TagNames[i] < dfStats.TagNames[j]
@@ -255,8 +268,14 @@ func sendStatsd(bp client.BatchPoints) {
 				dfStats.TagValues = append(dfStats.TagValues, point.Tags()[v])
 			}
 
-			for k := range fields {
-				dfStats.MetricsFloatNames = append(dfStats.MetricsFloatNames, k)
+			for k, v := range fields {
+				switch v.(type) {
+				case string:
+					dfStats.TagNames = append(dfStats.TagNames, k)
+					dfStats.TagValues = append(dfStats.TagValues, v.(string))
+				default:
+					dfStats.MetricsFloatNames = append(dfStats.MetricsFloatNames, k)
+				}
 			}
 			sort.Slice(dfStats.MetricsFloatNames, func(i, j int) bool {
 				return dfStats.MetricsFloatNames[i] < dfStats.MetricsFloatNames[j]
@@ -300,8 +319,8 @@ func nextRemote() error {
 	return nil
 }
 
-func runOnce() {
-	bp := collectBatchPoints()
+func runOnce(timestamp time.Time) {
+	bp := collectBatchPoints(timestamp)
 
 	if len(remotes) == 0 && len(dfRemote) == 0 {
 		return
@@ -333,6 +352,7 @@ func runOnce() {
 func run() {
 	time.Sleep(time.Second) // wait logger init
 
+	var lastTick int64
 	for range time.NewTicker(TICK_CYCLE).C {
 		lock.Lock()
 		hooks := preHooks
@@ -342,7 +362,16 @@ func run() {
 		}
 
 		if statSources.Len() > 0 {
-			runOnce()
+			now := time.Now()
+			nowTick := now.Unix() / TICK_COUNT
+			// Prevent the time interval between two executions from being too small, causing two pieces of data to appear in one time period, and causing abnormal query aggregation results.
+			if nowTick == lastTick {
+				log.Warningf("the running interval is too short, cancel this execution. now time: %s", now)
+				continue
+			}
+
+			runOnce(now)
+			lastTick = nowTick
 		}
 	}
 }

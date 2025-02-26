@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type LB struct {
-	OperatorBase[mysql.LB]
+	OperatorBase[*metadbmodel.LB, metadbmodel.LB]
 }
 
 func NewLB() *LB {
 	operater := &LB{
-		OperatorBase[mysql.LB]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_LB_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.LB](
+			ctrlrcommon.RESOURCE_TYPE_LB_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *LB) setDBItemID(dbItem *mysql.LB, id int) {
-	dbItem.ID = id
 }

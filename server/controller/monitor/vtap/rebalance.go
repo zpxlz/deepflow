@@ -22,9 +22,14 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	"github.com/deepflowio/deepflow/server/controller/http/service/rebalance"
 	"github.com/deepflowio/deepflow/server/controller/monitor/config"
+)
+
+var (
+	intervalSendWeight = time.Second * 10
 )
 
 type RebalanceCheck struct {
@@ -42,17 +47,29 @@ func NewRebalanceCheck(cfg config.MonitorConfig, ctx context.Context) *Rebalance
 	}
 }
 
-func (r *RebalanceCheck) Start() {
+func (r *RebalanceCheck) Start(sCtx context.Context) {
 	log.Info("rebalance check start")
 	go func() {
 		if !r.cfg.AutoRebalanceVTap {
 			return
 		}
 
-		for range time.Tick(time.Duration(r.cfg.RebalanceCheckInterval) * time.Second) {
-			r.controllerRebalance()
-			if r.cfg.IngesterLoadBalancingConfig.Algorithm == common.ANALYZER_ALLOC_BY_AGENT_COUNT {
-				r.analyzerRebalance()
+		ticker := time.NewTicker(time.Duration(r.cfg.RebalanceCheckInterval) * time.Second)
+		defer ticker.Stop()
+	LOOP1:
+		for {
+			select {
+			case <-ticker.C:
+				for _, db := range metadb.GetDBs().All() {
+					r.controllerRebalance(db)
+					if r.cfg.IngesterLoadBalancingConfig.Algorithm == common.ANALYZER_ALLOC_BY_AGENT_COUNT {
+						r.analyzerRebalance(db)
+					}
+				}
+			case <-sCtx.Done():
+				break LOOP1
+			case <-r.vCtx.Done():
+				break LOOP1
 			}
 		}
 	}()
@@ -62,11 +79,27 @@ func (r *RebalanceCheck) Start() {
 			return
 		}
 
-		if r.cfg.IngesterLoadBalancingConfig.Algorithm == common.ANALYZER_ALLOC_BY_INGESTED_DATA {
-			duration := r.cfg.IngesterLoadBalancingConfig.DataDuration
-			r.analyzerRebalanceByTraffic(duration)
-			for range time.Tick(time.Duration(r.cfg.IngesterLoadBalancingConfig.RebalanceInterval) * time.Second) {
+		if r.cfg.IngesterLoadBalancingConfig.Algorithm != common.ANALYZER_ALLOC_BY_INGESTED_DATA {
+			return
+		}
+
+		duration := r.cfg.IngesterLoadBalancingConfig.DataDuration
+		r.analyzerRebalanceByTraffic(duration)
+
+		// report agent weight every 10 secends
+		sendWeight(sCtx, duration)
+
+		ticker := time.NewTicker(time.Duration(r.cfg.IngesterLoadBalancingConfig.RebalanceInterval) * time.Second)
+		defer ticker.Stop()
+	LOOP2:
+		for {
+			select {
+			case <-ticker.C:
 				r.analyzerRebalanceByTraffic(duration)
+			case <-sCtx.Done():
+				break LOOP2
+			case <-r.vCtx.Done():
+				break LOOP2
 			}
 		}
 	}()
@@ -79,10 +112,10 @@ func (r *RebalanceCheck) Stop() {
 	log.Info("rebalance check stopped")
 }
 
-func (r *RebalanceCheck) controllerRebalance() {
-	controllers, err := service.GetControllers(map[string]string{})
+func (r *RebalanceCheck) controllerRebalance(db *metadb.DB) {
+	controllers, err := service.GetControllers(common.DEFAULT_ORG_ID, map[string]string{})
 	if err != nil {
-		log.Errorf("get controllers failed, (%v)", err)
+		log.Errorf("get controllers failed, (%v)", err, db.LogPrefixORGID)
 		return
 	}
 
@@ -90,43 +123,43 @@ func (r *RebalanceCheck) controllerRebalance() {
 		// check if need rebalance
 		if controller.VtapCount == 0 && controller.VTapMax > 0 &&
 			controller.State == common.HOST_STATE_COMPLETE && len(controller.Azs) != 0 {
-			log.Infof("need rebalance vtap for controller (%s)", controller.IP)
+			log.Infof("need rebalance vtap for controller (%s)", controller.IP, db.LogPrefixORGID)
 			args := map[string]interface{}{
 				"check": false,
 				"type":  "controller",
 			}
-			if result, err := service.VTapRebalance(args, r.cfg.IngesterLoadBalancingConfig); err != nil {
-				log.Error(err)
+			if result, err := service.VTapRebalance(db, args, r.cfg.IngesterLoadBalancingConfig); err != nil {
+				log.Errorf("%s", err.Error(), db.LogPrefixORGID)
 			} else {
 				data, _ := json.Marshal(result)
-				log.Infof("exec rebalance: %s", string(data))
+				log.Infof("exec rebalance: %s", string(data), db.LogPrefixORGID)
 			}
 			break
 		}
 	}
 }
 
-func (r *RebalanceCheck) analyzerRebalance() {
+func (r *RebalanceCheck) analyzerRebalance(db *metadb.DB) {
 	// check if need rebalance
-	analyzers, err := service.GetAnalyzers(map[string]interface{}{})
+	analyzers, err := service.GetAnalyzers(db.ORGID, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("get analyzers failed, (%v)", err)
+		log.Errorf("get analyzers failed, (%v)", err, db.LogPrefixORGID)
 		return
 	}
 
 	for _, analyzer := range analyzers {
 		if analyzer.VtapCount == 0 && analyzer.VTapMax > 0 &&
 			analyzer.State == common.HOST_STATE_COMPLETE && len(analyzer.Azs) != 0 {
-			log.Info("need rebalance vtap for analyzer (%s)", analyzer.IP)
+			log.Infof("need rebalance vtap for analyzer (%s)", analyzer.IP, db.LogPrefixORGID)
 			args := map[string]interface{}{
 				"check": false,
 				"type":  "analyzer",
 			}
-			if result, err := service.VTapRebalance(args, r.cfg.IngesterLoadBalancingConfig); err != nil {
-				log.Error(err)
+			if result, err := service.VTapRebalance(db, args, r.cfg.IngesterLoadBalancingConfig); err != nil {
+				log.Errorf("%s", err.Error(), db.LogPrefixORGID)
 			} else {
 				data, _ := json.Marshal(result)
-				log.Infof("exec rebalance: %s", string(data))
+				log.Infof("exec rebalance: %s", string(data), db.LogPrefixORGID)
 			}
 			break
 		}
@@ -134,17 +167,44 @@ func (r *RebalanceCheck) analyzerRebalance() {
 }
 
 func (r *RebalanceCheck) analyzerRebalanceByTraffic(dataDuration int) {
-	log.Infof("check analyzer rebalance, traffic duration(%vs)", dataDuration)
-	analyzerInfo := rebalance.NewAnalyzerInfo()
-	result, err := analyzerInfo.RebalanceAnalyzerByTraffic(true, dataDuration)
-	if err != nil {
-		log.Errorf("fail to rebalance analyzer by data(if check: true): %v", err)
-		return
+	for _, db := range metadb.GetDBs().All() {
+		log.Infof("check analyzer rebalance, traffic duration(%vs)", dataDuration, db.LogPrefixORGID)
+		analyzerInfo := rebalance.NewAnalyzerInfo(false)
+		result, err := analyzerInfo.RebalanceAnalyzerByTraffic(db, true, dataDuration)
+		if err != nil {
+			log.Errorf("fail to rebalance analyzer by data(if check: true): %v", err, db.LogPrefixORGID)
+			return
+		}
+		if result != nil && result.TotalSwitchVTapNum != 0 {
+			log.Infof("need rebalance, total switch vtap num(%d)", result.TotalSwitchVTapNum, db.LogPrefixORGID)
+			if _, err := analyzerInfo.RebalanceAnalyzerByTraffic(db, false, dataDuration); err != nil {
+				log.Errorf("fail to rebalance analyzer by data(if check: false): %v", err, db.LogPrefixORGID)
+			}
+			continue
+		}
 	}
-	if result.TotalSwitchVTapNum != 0 {
-		log.Infof("need rebalance, total switch vtap num(%d)", result.TotalSwitchVTapNum)
-		_, err := analyzerInfo.RebalanceAnalyzerByTraffic(false, dataDuration)
-		log.Errorf("fail to rebalance analyzer by data(if check: false): %v", err)
-		return
-	}
+}
+
+func sendWeight(ctx context.Context, dataDuration int) {
+	go func() {
+		ticker := time.NewTicker(intervalSendWeight)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Infof("agent traffic context done")
+				return
+			case <-ticker.C:
+				for _, db := range metadb.GetDBs().All() {
+					analyzerInfo := rebalance.NewAnalyzerInfo(true)
+					_, err := analyzerInfo.RebalanceAnalyzerByTraffic(db, true, dataDuration)
+					if err != nil {
+						log.Errorf("fail to rebalance analyzer by data(if check: true): %v", err, db.LogPrefixORGID)
+						return
+					}
+				}
+			}
+		}
+	}()
 }

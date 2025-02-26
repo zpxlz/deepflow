@@ -16,6 +16,8 @@
 
 use std::io::Read;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use std::{
     fs::{self, File},
     string::String,
@@ -33,7 +35,7 @@ use log::{debug, error, info, warn};
 use sysinfo::{get_current_pid, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt};
 
 use super::process::{
-    get_current_sys_free_memory_percentage, get_file_and_size_sum, get_memory_rss, get_thread_num,
+    get_current_sys_memory_percentage, get_file_and_size_sum, get_memory_rss, get_thread_num,
     FileAndSizeSum,
 };
 use crate::common::{
@@ -42,14 +44,100 @@ use crate::common::{
 };
 use crate::config::handler::EnvironmentAccess;
 use crate::exception::ExceptionHandler;
+use crate::rpc::get_timestamp;
+use crate::trident::AgentState;
+#[cfg(target_os = "linux")]
+use crate::utils::environment::SocketInfo;
 use crate::utils::{cgroups::is_kernel_available_for_cgroups, environment::running_in_container};
 
-use public::proto::trident::{Exception, TapMode};
+use public::proto::agent::{Exception, PacketCaptureType, SysMemoryMetric, SystemLoadMetric};
+
+struct SystemLoadGuard {
+    system: Arc<Mutex<System>>,
+
+    exception_handler: ExceptionHandler,
+
+    last_exceeded: Duration,
+    last_exceeded_metric: SystemLoadMetric,
+}
+
+const CONTINUOUS_SAFETY_TIME: Duration = Duration::from_secs(300);
+
+impl SystemLoadGuard {
+    fn new(system: Arc<Mutex<System>>, exception_handler: ExceptionHandler) -> Self {
+        Self {
+            system,
+            exception_handler,
+            last_exceeded: Duration::ZERO,
+            last_exceeded_metric: SystemLoadMetric::Load15,
+        }
+    }
+
+    fn check(
+        &mut self,
+        system_load_circuit_breaker_threshold: f32,
+        system_load_circuit_breaker_recover: f32,
+        system_load_circuit_breaker_metric: SystemLoadMetric,
+    ) {
+        if system_load_circuit_breaker_threshold == 0.0
+            || system_load_circuit_breaker_recover == 0.0
+        {
+            self.last_exceeded = Duration::ZERO;
+            self.exception_handler
+                .clear(Exception::SystemLoadCircuitBreaker);
+            return;
+        }
+        if system_load_circuit_breaker_metric != self.last_exceeded_metric {
+            self.last_exceeded_metric = system_load_circuit_breaker_metric;
+            self.last_exceeded = Duration::ZERO;
+        }
+
+        let system = self.system.lock().unwrap();
+
+        let cpu_count = system.cpus().len() as f32;
+        let system_load = match system_load_circuit_breaker_metric {
+            SystemLoadMetric::Load1 => system.load_average().one,
+            SystemLoadMetric::Load5 => system.load_average().five,
+            SystemLoadMetric::Load15 => system.load_average().fifteen,
+        } as f32;
+
+        if self
+            .exception_handler
+            .has(Exception::SystemLoadCircuitBreaker)
+        {
+            let has_exceeded = system_load / cpu_count >= system_load_circuit_breaker_recover;
+            if has_exceeded {
+                self.last_exceeded = get_timestamp(0);
+            } else {
+                let now = get_timestamp(0);
+                if now > self.last_exceeded + CONTINUOUS_SAFETY_TIME {
+                    info!(
+                        "Current load {:?} is below the recover threshold({:?}), set the agent to enabled.",
+                        system_load_circuit_breaker_metric, system_load_circuit_breaker_recover
+                    );
+                    self.exception_handler
+                        .clear(Exception::SystemLoadCircuitBreaker);
+                }
+            }
+        } else {
+            let has_exceeded = system_load / cpu_count >= system_load_circuit_breaker_threshold;
+            if has_exceeded {
+                error!(
+                    "Current load {:?} exceeds the threshold({:?}), set the agent to disabled.",
+                    system_load_circuit_breaker_metric, system_load_circuit_breaker_threshold
+                );
+                self.last_exceeded = get_timestamp(0);
+                self.exception_handler
+                    .set(Exception::SystemLoadCircuitBreaker);
+            }
+        }
+    }
+}
 
 pub struct Guard {
     config: EnvironmentAccess,
+    state: Arc<AgentState>,
     log_dir: String,
-    interval: Duration,
     thread: Mutex<Option<JoinHandle<()>>>,
     running: Arc<(Mutex<bool>, Condvar)>,
     exception_handler: ExceptionHandler,
@@ -58,33 +146,36 @@ pub struct Guard {
     memory_trim_disabled: bool,
     system: Arc<Mutex<System>>,
     pid: Pid,
+    cgroups_disabled: bool,
 }
 
 impl Guard {
     pub fn new(
         config: EnvironmentAccess,
+        state: Arc<AgentState>,
         log_dir: String,
-        interval: Duration,
         exception_handler: ExceptionHandler,
         cgroup_mount_path: String,
         is_cgroup_v2: bool,
-        memory_trim_disabled: bool,
+        memory_trim_enabled: bool,
+        cgroups_disabled: bool,
     ) -> Result<Self, &'static str> {
         let Ok(pid) = get_current_pid() else {
             return Err("get the process' pid failed: {}, deepflow-agent restart...");
         };
         Ok(Self {
             config,
+            state,
             log_dir,
-            interval,
             thread: Mutex::new(None),
             running: Arc::new((Mutex::new(false), Condvar::new())),
             exception_handler,
             cgroup_mount_path,
             is_cgroup_v2,
-            memory_trim_disabled,
+            memory_trim_disabled: !memory_trim_enabled,
             system: Arc::new(Mutex::new(System::new())),
             pid,
+            cgroups_disabled,
         })
     }
 
@@ -172,11 +263,8 @@ impl Guard {
     }
 
     fn check_cpu(system: Arc<Mutex<System>>, pid: Pid, cpu_limit: u32) -> bool {
-        let mut system_guard = system.lock().unwrap();
-        if !system_guard.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu()) {
-            warn!("refresh process with cpu failed");
-            return false;
-        }
+        let system_guard = system.lock().unwrap();
+
         let cpu_usage = match system_guard.process(pid) {
             Some(process) => process.cpu_usage(),
             None => {
@@ -184,24 +272,77 @@ impl Guard {
                 return false;
             }
         };
-        (cpu_limit * 100) as f32 > cpu_usage
+        (cpu_limit / 10) as f32 > cpu_usage // The cpu_usage is in percentage, and the unit of cpu_limit is milli-cores. Divide cpu_limit by 10 to align the units
+    }
+
+    fn check_sys_memory(
+        sys_memory_limit: f64,
+        sys_memory_metric: SysMemoryMetric,
+        under_sys_memory_limit: &mut bool,
+        last_exceeded: &mut Duration,
+        exception_handler: &ExceptionHandler,
+    ) {
+        let (current_sys_free_memory_percentage, current_sys_available_memory_percentage) =
+            get_current_sys_memory_percentage();
+        debug!(
+            "current_sys_memory_percentage: [ free: {}, available: {} ], sys_memory_metric: {:?} sys_memory_limit: {}",
+            current_sys_free_memory_percentage, current_sys_available_memory_percentage, sys_memory_metric, sys_memory_limit
+        );
+        let current_memory_percentage = if sys_memory_metric == SysMemoryMetric::Free {
+            current_sys_free_memory_percentage as f64
+        } else {
+            current_sys_available_memory_percentage as f64
+        };
+
+        if sys_memory_limit != 0.0 {
+            if current_memory_percentage < sys_memory_limit * 0.7 {
+                *last_exceeded = get_timestamp(0);
+                exception_handler.set(Exception::FreeMemExceeded);
+                *under_sys_memory_limit = true;
+                error!(
+                    "current system {:?} memory percentage is less than the 70% of sys_memory_limit, current system memory percentage={}%, sys_memory_limit={}%, deepflow-agent restart...",
+                    sys_memory_metric, current_memory_percentage, sys_memory_limit
+                );
+                crate::utils::notify_exit(-1);
+            } else if current_memory_percentage < sys_memory_limit {
+                *last_exceeded = get_timestamp(0);
+                exception_handler.set(Exception::FreeMemExceeded);
+                *under_sys_memory_limit = true;
+                error!(
+                    "current system {:?} memory percentage is less than sys_memory_limit, current system memory percentage={}%, sys_memory_limit={}%, set the agent to disabled",
+                    sys_memory_metric, current_memory_percentage, sys_memory_limit
+                );
+            } else if current_memory_percentage >= sys_memory_limit * 1.1 {
+                let now = get_timestamp(0);
+                if *under_sys_memory_limit && now > *last_exceeded + CONTINUOUS_SAFETY_TIME {
+                    exception_handler.clear(Exception::FreeMemExceeded);
+                    *under_sys_memory_limit = false;
+                    info!(
+                        "current system {:?} memory percentage: {}% remains above sys_memory_limit: {} * 110%, set the agent to enabled.",
+                        sys_memory_metric, current_memory_percentage, sys_memory_limit
+                    );
+                }
+            }
+        } else {
+            exception_handler.clear(Exception::FreeMemExceeded);
+        }
     }
 
     pub fn start(&self) {
         {
-            let (started, _) = &*self.running;
-            let mut started = started.lock().unwrap();
-            if *started {
+            let (running, _) = &*self.running;
+            let mut running = running.lock().unwrap();
+            if *running {
                 return;
             }
-            *started = true;
+            *running = true;
         }
 
         let config = self.config.clone();
-        let running = self.running.clone();
+        let running_state = self.running.clone();
+        let state = self.state.clone();
         let exception_handler = self.exception_handler.clone();
         let log_dir = self.log_dir.clone();
-        let interval = self.interval;
         let mut over_memory_limit = false; // Higher than the limit does not meet expectations
         let mut over_cpu_limit = false; // Higher than the limit does not meet expectations
         let mut under_sys_free_memory_limit = false; // Below the limit, it does not meet expectations
@@ -214,12 +355,25 @@ impl Guard {
         let pid: Pid = self.pid.clone();
         let cgroups_available = is_kernel_available_for_cgroups();
         let in_container = running_in_container();
+        let cgroups_disabled = self.cgroups_disabled;
+        let mut last_exceeded = get_timestamp(0);
+        #[cfg(target_os = "linux")]
+        let mut last_page_reclaim = Instant::now();
 
         let thread = thread::Builder::new().name("guard".to_owned()).spawn(move || {
+            let mut system_load = SystemLoadGuard::new(system.clone(), exception_handler.clone());
+            #[cfg(target_os = "linux")]
+            let mut last_over_max_sockets_limit = None;
             loop {
                 let config = config.load();
-                let tap_mode = config.tap_mode;
-                let cpu_limit = config.max_cpus;
+                let capture_mode = config.capture_mode;
+                let cpu_limit = config.max_millicpus;
+                let mut system_guard = system.lock().unwrap();
+                if !system_guard.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu()) {
+                    warn!("refresh process with cpu failed");
+                }
+                drop(system_guard);
+                system_load.check(config.system_load_circuit_breaker_threshold, config.system_load_circuit_breaker_recover, config.system_load_circuit_breaker_metric);
                 match get_file_and_size_sum(&log_dir) {
                     Ok(file_and_size_sum) => {
                         let log_file_size = config.log_file_size; // Log file size limit (unit: M)
@@ -242,9 +396,9 @@ impl Guard {
                         warn!("{}", e);
                     }
                 }
-                // If it is in a container or tap_mode is Analyzer, there is no need to limit resource, so there is no need to check cgroups
-                if !in_container && config.tap_mode != TapMode::Analyzer {
-                    if cgroups_available {
+                // If it is in a container or capture_mode is Analyzer, there is no need to limit resource, so there is no need to check cgroups
+                if !in_container && config.capture_mode != PacketCaptureType::Analyzer {
+                    if cgroups_available && !cgroups_disabled {
                         if check_cgroup_result {
                             check_cgroup_result = Self::check_cgroups(cgroup_mount_path.clone(), is_cgroup_v2);
                             if !check_cgroup_result {
@@ -286,12 +440,18 @@ impl Guard {
                     unsafe { let _ = malloc_trim(0); }
                 }
 
+                #[cfg(target_os = "linux")]
+                if last_page_reclaim.elapsed() >= Duration::from_secs(60) {
+                    last_page_reclaim = Instant::now();
+                    let _ = crate::utils::cgroups::page_cache_reclaim_check(config.page_cache_reclaim_percentage);
+                }
+
                 // Periodic memory checks are necessary:
                 // Cgroups does not count the memory of RssFile, and AF_PACKET Block occupies RssFile.
                 // Therefore, using Cgroups to limit the memory usage may not be accurate in some scenarios.
                 // Periodically checking the memory usage can determine whether the memory exceeds the limit.
                 // Reference: https://unix.stackexchange.com/questions/686814/cgroup-and-process-memory-statistics-mismatch
-                if tap_mode != TapMode::Analyzer {
+                if capture_mode != PacketCaptureType::Analyzer {
                     let memory_limit = config.max_memory;
                     if memory_limit != 0 {
                         match get_memory_rss() {
@@ -320,30 +480,7 @@ impl Guard {
                     }
                 }
 
-                let sys_free_memory_limit = config.sys_free_memory_limit;
-                let current_sys_free_memory_percentage = get_current_sys_free_memory_percentage();
-                debug!(
-                    "current_sys_free_memory_percentage: {}, sys_free_memory_limit: {}",
-                    current_sys_free_memory_percentage, sys_free_memory_limit
-                );
-                if sys_free_memory_limit != 0 {
-                    if current_sys_free_memory_percentage < sys_free_memory_limit {
-                        if under_sys_free_memory_limit {
-                            error!(
-                                    "current system free memory percentage is less than sys_free_memory_limit twice, current system free memory percentage={}%, sys_free_memory_limit={}%, deepflow-agent restart...",
-                                    current_sys_free_memory_percentage, sys_free_memory_limit
-                                    );
-                            crate::utils::notify_exit(-1);
-                            break;
-                        } else {
-                            warn!(
-                                    "current system free memory percentage is less than sys_free_memory_limit, current system free memory percentage={}%, sys_free_memory_limit={}%",
-                                    current_sys_free_memory_percentage, sys_free_memory_limit
-                                    );
-                            under_sys_free_memory_limit = true;
-                        }
-                    }
-                }
+                Self::check_sys_memory(config.sys_memory_limit as f64, config.sys_memory_metric, &mut under_sys_free_memory_limit, &mut last_exceeded, &exception_handler);
 
                 match get_thread_num() {
                     Ok(thread_num) => {
@@ -368,13 +505,56 @@ impl Guard {
                     }
                 }
 
-                let (running, timer) = &*running;
-                let mut running = running.lock().unwrap();
-                if !*running {
+                if exception_handler.has(Exception::SystemLoadCircuitBreaker) {
+                    info!("Set the state to melt_down when the system load exceeds the threshold.");
+                    state.melt_down();
+                } else if exception_handler.has(Exception::FreeMemExceeded) {
+                    info!("Set the state to melt_down when the free memory exceeds the threshold.");
+                    state.melt_down();
+                } else {
+                    state.recover();
+                }
+
+                #[cfg(target_os = "linux")]
+                match SocketInfo::get() {
+                    Ok(SocketInfo { tcp, tcp6, udp, udp6 }) => {
+                        let (n_tcp, n_tcp6, n_udp, n_udp6) = (tcp.len(), tcp6.len(), udp.len(), udp6.len());
+                        if n_tcp + n_tcp6 + n_udp + n_udp6 <= config.max_sockets {
+                            debug!("socket count check passed: {n_tcp}(tcp) + {n_tcp6}(tcp6) + {n_udp}(udp) + {n_udp6}(udp6) <= {}", config.max_sockets);
+                            last_over_max_sockets_limit = None;
+                        } else {
+                            match last_over_max_sockets_limit {
+                                None => {
+                                    last_over_max_sockets_limit = Some(Instant::now());
+                                    warn!("the number of socket exceeds the limit: {n_tcp}(tcp) + {n_tcp6}(tcp6) + {n_udp}(udp) + {n_udp6}(udp6) > {}", config.max_sockets);
+                                    warn!("opened sockets:\n{}", SocketInfo { tcp, tcp6, udp, udp6 });
+                                }
+                                Some(last) if last.elapsed() > config.max_sockets_tolerate_interval => {
+                                    warn!("the number of socket exceeds the limit longer than {:?}, deepflow-agent restart...", config.max_sockets_tolerate_interval);
+                                    warn!("opened sockets:\n{}", SocketInfo { tcp, tcp6, udp, udp6 });
+                                    crate::utils::notify_exit(NORMAL_EXIT_WITH_RESTART);
+                                    break;
+                                }
+                                Some(last) => {
+                                    debug!("the number of socket exceeds the limit for {:?}", last.elapsed());
+                                    debug!("opened sockets:\n{}", SocketInfo { tcp, tcp6, udp, udp6 });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Check agent sockets failed: {e}");
+                        last_over_max_sockets_limit = None;
+                    }
+                }
+
+                let (running, notifier) = &*running_state;
+                let mut rg = running.lock().unwrap();
+                if !*rg {
                     break;
                 }
-                running = timer.wait_timeout(running, interval).unwrap().0;
-                if !*running {
+                rg = notifier.wait_timeout(rg, config.guard_interval).unwrap().0;
+                if !*rg {
                     break;
                 }
             }
@@ -386,15 +566,15 @@ impl Guard {
     }
 
     pub fn stop(&self) {
-        let (stopped, timer) = &*self.running;
+        let (running, notifier) = &*self.running;
         {
-            let mut stopped = stopped.lock().unwrap();
-            if !*stopped {
+            let mut running = running.lock().unwrap();
+            if !*running {
                 return;
             }
-            *stopped = false;
+            *running = false;
         }
-        timer.notify_one();
+        notifier.notify_one();
 
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();

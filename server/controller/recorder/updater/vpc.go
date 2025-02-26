@@ -18,26 +18,52 @@ package updater
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
+	"github.com/deepflowio/deepflow/server/controller/common"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type VPC struct {
-	UpdaterBase[cloudmodel.VPC, mysql.VPC, *diffbase.VPC]
+	UpdaterBase[
+		cloudmodel.VPC,
+		*diffbase.VPC,
+		*metadbmodel.VPC,
+		metadbmodel.VPC,
+		*message.VPCAdd,
+		message.VPCAdd,
+		*message.VPCUpdate,
+		message.VPCUpdate,
+		*message.VPCFieldsUpdate,
+		message.VPCFieldsUpdate,
+		*message.VPCDelete,
+		message.VPCDelete]
 }
 
 func NewVPC(wholeCache *cache.Cache, cloudData []cloudmodel.VPC) *VPC {
 	updater := &VPC{
-		UpdaterBase[cloudmodel.VPC, mysql.VPC, *diffbase.VPC]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_VPC_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewVPC(),
-			diffBaseData: wholeCache.DiffBaseDataSet.VPCs,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.VPC,
+			*diffbase.VPC,
+			*metadbmodel.VPC,
+			metadbmodel.VPC,
+			*message.VPCAdd,
+			message.VPCAdd,
+			*message.VPCUpdate,
+			message.VPCUpdate,
+			*message.VPCFieldsUpdate,
+			message.VPCFieldsUpdate,
+			*message.VPCDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN,
+			wholeCache,
+			db.NewVPC().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.VPCs,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,13 +74,16 @@ func (v *VPC) getDiffBaseByCloudItem(cloudItem *cloudmodel.VPC) (diffBase *diffb
 	return
 }
 
-func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*mysql.VPC, bool) {
-	dbItem := &mysql.VPC{
+func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*metadbmodel.VPC, bool) {
+	if cloudItem.Label == "" {
+		cloudItem.Label = common.GenerateVPCShortUUID()
+	}
+	dbItem := &metadbmodel.VPC{
 		Name:         cloudItem.Name,
 		Label:        cloudItem.Label,
 		UID:          cloudItem.Label,
 		CreateMethod: ctrlrcommon.CREATE_METHOD_LEARN,
-		Domain:       v.cache.DomainLcuuid,
+		Domain:       v.metadata.Domain.Lcuuid,
 		Region:       cloudItem.RegionLcuuid,
 		CIDR:         cloudItem.CIDR,
 		TunnelID:     cloudItem.TunnelID,
@@ -63,26 +92,38 @@ func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*mysql.VPC, bool) 
 	return dbItem, true
 }
 
-func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.VPC) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.VPC) (*message.VPCFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.VPCFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
-	}
-	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
-	}
-	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
-	}
-	if diffBase.CIDR != cloudItem.CIDR {
-		updateInfo["cidr"] = cloudItem.CIDR
-	}
-	if diffBase.TunnelID != cloudItem.TunnelID {
-		updateInfo["tunnel_id"] = cloudItem.TunnelID
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
+	if cloudItem.Label == "" {
+		if diffBase.Label == "" {
+			cloudItem.Label = common.GenerateVPCShortUUID()
+		} else {
+			cloudItem.Label = diffBase.Label
+		}
 	}
-	return nil, false
+	if diffBase.Label != cloudItem.Label {
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
+		mapInfo["uid"] = cloudItem.Label
+	}
+	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
+	}
+	if diffBase.CIDR != cloudItem.CIDR {
+		mapInfo["cidr"] = cloudItem.CIDR
+		structInfo.CIDR.Set(diffBase.CIDR, cloudItem.CIDR)
+	}
+	if diffBase.TunnelID != cloudItem.TunnelID {
+		mapInfo["tunnel_id"] = cloudItem.TunnelID
+		structInfo.TunnelID.Set(diffBase.TunnelID, cloudItem.TunnelID)
+	}
+
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

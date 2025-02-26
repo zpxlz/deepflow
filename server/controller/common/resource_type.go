@@ -32,9 +32,6 @@ const (
 	RESOURCE_TYPE_WAN_IP_EN                   = "wan_ip"
 	RESOURCE_TYPE_LAN_IP_EN                   = "lan_ip"
 	RESOURCE_TYPE_FLOATING_IP_EN              = "floating_ip"
-	RESOURCE_TYPE_SECURITY_GROUP_EN           = "security_group"
-	RESOURCE_TYPE_SECURITY_GROUP_RULE_EN      = "security_group_rule"
-	RESOURCE_TYPE_VM_SECURITY_GROUP_EN        = "vm_security_group"
 	RESOURCE_TYPE_NAT_GATEWAY_EN              = "nat_gateway"
 	RESOURCE_TYPE_NAT_RULE_EN                 = "nat_rule"
 	RESOURCE_TYPE_NAT_VM_CONNECTION_EN        = "nat_vm_connection"
@@ -62,9 +59,27 @@ const (
 	RESOURCE_TYPE_PROCESS_EN                  = "process"
 	RESOURCE_TYPE_PROMETHEUS_TARGET_EN        = "prometheus_target"
 	RESOURCE_TYPE_VIP_EN                      = "vip"
+	RESOURCE_TYPE_VTAP_EN                     = "vtap"
+	RESOURCE_TYPE_ORG_EN                      = "org"
 
 	// http api resource type
 	RESOURCE_TYPE_IP_EN      = "ip"
 	RESOURCE_TYPE_ALL_IP_EN  = "all_ip"
 	RESOURCE_TYPE_LB_RULE_EN = "lb_rule"
+
+	RESOURCE_TYPE_CUSTOM_SERVICE_EN = "custom_service"
 )
+
+var VIF_DEVICE_TYPE_TO_RESOURCE_TYPE = map[int]string{
+	VIF_DEVICE_TYPE_HOST:           RESOURCE_TYPE_HOST_EN,
+	VIF_DEVICE_TYPE_VM:             RESOURCE_TYPE_VM_EN,
+	VIF_DEVICE_TYPE_VROUTER:        RESOURCE_TYPE_VROUTER_EN,
+	VIF_DEVICE_TYPE_DHCP_PORT:      RESOURCE_TYPE_DHCP_PORT_EN,
+	VIF_DEVICE_TYPE_NAT_GATEWAY:    RESOURCE_TYPE_NAT_GATEWAY_EN,
+	VIF_DEVICE_TYPE_LB:             RESOURCE_TYPE_LB_EN,
+	VIF_DEVICE_TYPE_RDS_INSTANCE:   RESOURCE_TYPE_RDS_INSTANCE_EN,
+	VIF_DEVICE_TYPE_REDIS_INSTANCE: RESOURCE_TYPE_REDIS_INSTANCE_EN,
+	VIF_DEVICE_TYPE_POD_NODE:       RESOURCE_TYPE_POD_NODE_EN,
+	VIF_DEVICE_TYPE_POD_SERVICE:    RESOURCE_TYPE_POD_SERVICE_EN,
+	VIF_DEVICE_TYPE_POD:            RESOURCE_TYPE_POD_EN,
+}

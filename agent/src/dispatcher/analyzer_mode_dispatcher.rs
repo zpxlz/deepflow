@@ -25,18 +25,24 @@ use std::{
 
 use arc_swap::access::Access;
 use log::{debug, info, warn};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use nix::{
+    sched::{sched_setaffinity, CpuSet},
+    unistd::Pid,
+};
 use packet_dedup::PacketDedupMap;
 
 use super::base_dispatcher::BaseDispatcher;
+use super::Packet;
 use crate::{
     common::{
         decapsulate::{TunnelInfo, TunnelType, TunnelTypeBitmap},
-        enums::TapType,
+        enums::CaptureNetworkType,
         MetaPacket, TapPort, ETH_HEADER_SIZE, VLAN_HEADER_SIZE,
     },
     config::DispatcherConfig,
     dispatcher::{
-        base_dispatcher::{BaseDispatcherListener, TapTypeHandler},
+        base_dispatcher::{BaseDispatcherListener, CaptureNetworkTypeHandler},
         error::Result,
     },
     flow_generator::{flow_map::Config, FlowMap},
@@ -44,13 +50,13 @@ use crate::{
     rpc::get_timestamp,
     utils::{
         bytes::read_u32_be,
-        stats::{self, Countable, StatsOption},
+        stats::{self, Countable, QueueStats},
     },
 };
 use public::{
-    buffer::{Allocator, BatchedBuffer},
+    buffer::Allocator,
     debug::QueueDebugger,
-    proto::trident::IfMacSource,
+    proto::agent::IfMacSource,
     queue::{self, bounded_with_debug, DebugSender, Receiver},
     utils::net::{Link, MacAddr},
 };
@@ -77,9 +83,9 @@ impl AnalyzerModeDispatcherListener {
         &self.base.netns
     }
 
-    pub fn on_tap_interface_change(&self, _: &[Link], _: IfMacSource) {
+    pub fn on_tap_interface_change(&self, links: &[Link], _: IfMacSource) {
         self.base
-            .on_tap_interface_change(vec![], IfMacSource::IfMac);
+            .on_tap_interface_change(links.to_vec(), IfMacSource::IfMac);
     }
 
     pub fn on_vm_change(&self, vm_mac_addrs: &[MacAddr], gateway_vmac_addrs: &[MacAddr]) {
@@ -136,17 +142,9 @@ impl AnalyzerModeDispatcherListener {
 }
 
 pub(super) struct AnalyzerPipeline {
-    tap_type: TapType,
+    tap_type: CaptureNetworkType,
     handlers: Vec<PacketHandler>,
     timestamp: Duration,
-}
-
-#[derive(Debug)]
-struct Packet {
-    timestamp: Duration,
-    raw: BatchedBuffer<u8>,
-    original_length: u32,
-    raw_length: u32,
 }
 
 pub(super) struct AnalyzerModeDispatcher {
@@ -171,8 +169,8 @@ impl AnalyzerModeDispatcher {
     }
 
     fn timestamp(
-        timestamp_map: &mut HashMap<TapType, Duration>,
-        tap_type: TapType,
+        timestamp_map: &mut HashMap<CaptureNetworkType, Duration>,
+        tap_type: CaptureNetworkType,
         mut timestamp: Duration,
     ) -> (Duration, bool) {
         let last_timestamp = timestamp_map.entry(tap_type).or_insert(Duration::ZERO);
@@ -212,7 +210,7 @@ impl AnalyzerModeDispatcher {
             Some(vmac) => (true, u64::from(*vmac) as u32),
             None => (false, 0),
         };
-        let mut tap_port = TapPort::from_id(tunnel_info.tunnel_type, id as u32);
+        let mut tap_port = TapPort::from_id(tunnel_info.tunnel_type, id as u32, tunnel_info.from);
         let is_unicast = tunnel_info.tier > 0 || !MacAddr::is_multicast(overlay_packet); // Consider unicast when there is a tunnel
 
         if src_remote && dst_remote && is_unicast {
@@ -246,12 +244,13 @@ impl AnalyzerModeDispatcher {
     fn run_flow_generator(
         &mut self,
         receiver: Receiver<Packet>,
-        sender: DebugSender<(TapType, MiniPacket<'static>)>,
+        sender: DebugSender<(CaptureNetworkType, MiniPacket<'static>)>,
     ) {
-        let base = &self.base;
+        let base = &self.base.is;
 
         let terminated = base.terminated.clone();
         let tunnel_type_bitmap = base.tunnel_type_bitmap.clone();
+        let tunnel_type_trim_bitmap = base.tunnel_type_trim_bitmap.clone();
         let tap_type_handler = base.tap_type_handler.clone();
         let counter = base.counter.clone();
         let analyzer_dedup_disabled = base.analyzer_dedup_disabled;
@@ -271,17 +270,19 @@ impl AnalyzerModeDispatcher {
         let collector_config = base.collector_config.clone();
         let packet_sequence_output_queue = base.packet_sequence_output_queue.clone(); // Enterprise Edition Feature: packet-sequence
         let stats = base.stats.clone();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let cpu_set = base.options.lock().unwrap().cpu_set;
 
         self.flow_generator_thread_handler.replace(
             thread::Builder::new()
                 .name("dispatcher-packet-to-flow-generator".to_owned())
                 .spawn(move || {
-                    let mut timestamp_map: HashMap<TapType, Duration> = HashMap::new();
+                    let mut timestamp_map: HashMap<CaptureNetworkType, Duration> = HashMap::new();
                     let mut batch = Vec::with_capacity(HANDLER_BATCH_SIZE);
                     let mut output_batch = Vec::with_capacity(HANDLER_BATCH_SIZE);
                     let mut flow_map = FlowMap::new(
                         id as u32,
-                        flow_output_queue,
+                        Some(flow_output_queue),
                         l7_stats_output_queue,
                         policy_getter,
                         log_output_queue,
@@ -291,6 +292,12 @@ impl AnalyzerModeDispatcher {
                         stats,
                         false, // !from_ebpf
                     );
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if cpu_set != CpuSet::new() {
+                        if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+                            warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
+                        }
+                    }
 
                     while !terminated.load(Ordering::Relaxed) {
                         let config = Config {
@@ -316,7 +323,7 @@ impl AnalyzerModeDispatcher {
                             let raw_length = (packet.raw_length as usize)
                                 .min(packet.raw.len())
                                 .min(pool_raw_size);
-                            let tunnel_type_bitmap = tunnel_type_bitmap.lock().unwrap().clone();
+                            let tunnel_type_bitmap = tunnel_type_bitmap.read().unwrap().clone();
                             let mut tunnel_info = TunnelInfo::default();
 
                             let (decap_length, tap_type) = match Self::decap_tunnel(
@@ -324,6 +331,7 @@ impl AnalyzerModeDispatcher {
                                 &tap_type_handler,
                                 &mut tunnel_info,
                                 tunnel_type_bitmap,
+                                tunnel_type_trim_bitmap,
                             ) {
                                 Ok(d) => d,
                                 Err(e) => {
@@ -356,7 +364,7 @@ impl AnalyzerModeDispatcher {
                             let mut overlay_packet = packet.raw;
                             overlay_packet.truncate(decap_length..raw_length);
                             // Only cloud traffic goes to de-duplication
-                            if tap_type == TapType::Cloud
+                            if tap_type == CaptureNetworkType::Cloud
                                 && !analyzer_dedup_disabled
                                 && dedup.duplicate(overlay_packet.as_mut(), timestamp)
                             {
@@ -414,7 +422,7 @@ impl AnalyzerModeDispatcher {
                             );
                             flow_map.inject_meta_packet(&config, &mut meta_packet);
                             let mini_packet =
-                                MiniPacket::new(meta_packet.raw.take().unwrap(), &meta_packet);
+                                MiniPacket::new(meta_packet.raw.take().unwrap(), &meta_packet, 0);
                             output_batch.push((tap_type, mini_packet));
                         }
                         if let Err(e) = sender.send_all(&mut output_batch) {
@@ -435,19 +443,29 @@ impl AnalyzerModeDispatcher {
     // 2. NPB/PCAP/...
     fn run_additional_packet_pipeline(
         &mut self,
-        receiver: Receiver<(TapType, MiniPacket<'static>)>,
+        receiver: Receiver<(CaptureNetworkType, MiniPacket<'static>)>,
     ) {
-        let base = &self.base;
+        let base = &self.base.is;
         let terminated = base.terminated.clone();
-        let handler_builder = self.base.handler_builder.clone();
+        let handler_builder = base.handler_builder.clone();
         let id = base.id;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let cpu_set = base.options.lock().unwrap().cpu_set;
 
         self.pipeline_thread_handler.replace(
             thread::Builder::new()
                 .name("dispatcher-additional-packet-pipeline".to_owned())
                 .spawn(move || {
-                    let mut tap_pipelines: HashMap<TapType, AnalyzerPipeline> = HashMap::new();
+                    let mut tap_pipelines: HashMap<CaptureNetworkType, AnalyzerPipeline> =
+                        HashMap::new();
                     let mut batch = Vec::with_capacity(HANDLER_BATCH_SIZE);
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if cpu_set != CpuSet::new() {
+                        if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+                            warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
+                        }
+                    }
+
                     while !terminated.load(Ordering::Relaxed) {
                         match receiver.recv_all(&mut batch, Some(Duration::from_secs(1))) {
                             Ok(_) => {}
@@ -459,12 +477,12 @@ impl AnalyzerModeDispatcher {
                         for (tap_type, mini_packet) in batch.drain(..) {
                             let pipeline = match tap_pipelines.get_mut(&tap_type) {
                                 None => {
-                                    // ff : ff : ff : ff : DispatcherID : TapType(1-255)
+                                    // ff : ff : ff : ff : DispatcherID : CaptureNetworkType(1-255)
                                     let mac = ((0xffffffff as u64) << 16)
                                         | ((id as u64) << 8)
                                         | (u16::from(tap_type) as u64);
                                     let handlers = handler_builder
-                                        .lock()
+                                        .read()
                                         .unwrap()
                                         .iter()
                                         .map(|b| {
@@ -494,29 +512,21 @@ impl AnalyzerModeDispatcher {
     }
 
     fn setup_inner_thread_and_queue(&mut self) -> DebugSender<Packet> {
-        let id = self.base.id.to_string();
+        let id = self.base.is.id;
         let name = "0.1-raw-packet-to-flow-generator";
         let (sender_to_parser, receiver_from_dispatcher, counter) =
             bounded_with_debug(self.inner_queue_size, name, &self.queue_debugger);
         self.stats_collector.register_countable(
-            "queue",
+            &QueueStats { id, module: name },
             Countable::Owned(Box::new(counter)),
-            vec![
-                StatsOption::Tag("module", name.to_string()),
-                StatsOption::Tag("index", id.clone()),
-            ],
         );
 
         let name = "0.2-packet-to-additional-pipeline";
         let (sender_to_pipeline, receiver_from_flow, counter) =
             bounded_with_debug(self.inner_queue_size, name, &self.queue_debugger);
         self.stats_collector.register_countable(
-            "queue",
+            &QueueStats { id, module: name },
             Countable::Owned(Box::new(counter)),
-            vec![
-                StatsOption::Tag("module", name.to_string()),
-                StatsOption::Tag("index", id),
-            ],
         );
 
         self.run_flow_generator(receiver_from_dispatcher, sender_to_pipeline);
@@ -526,13 +536,21 @@ impl AnalyzerModeDispatcher {
 
     pub(super) fn run(&mut self) {
         let sender_to_parser = self.setup_inner_thread_and_queue();
-        let base = &mut self.base;
+        let base = &mut self.base.is;
         info!("Start analyzer dispatcher {}", base.log_id);
         let time_diff = base.ntp_diff.load(Ordering::Relaxed);
         let mut prev_timestamp = get_timestamp(time_diff);
         let id = base.id;
         let mut batch = Vec::with_capacity(HANDLER_BATCH_SIZE);
         let mut allocator = Allocator::new(self.raw_packet_block_size);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let cpu_set = base.options.lock().unwrap().cpu_set;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if cpu_set != CpuSet::new() {
+            if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+                warn!("CPU Affinity({:?}) bind error: {:?}.", &cpu_set, e);
+            }
+        }
 
         while !base.terminated.load(Ordering::Relaxed) {
             if base.reset_whitelist.swap(false, Ordering::Relaxed) {
@@ -541,7 +559,7 @@ impl AnalyzerModeDispatcher {
             // The lifecycle of the recved will end before the next call to recv.
             let recved = unsafe {
                 BaseDispatcher::recv(
-                    &mut base.engine,
+                    &mut self.base.engine,
                     &base.leaky_bucket,
                     &base.exception_handler,
                     &mut prev_timestamp,
@@ -560,7 +578,7 @@ impl AnalyzerModeDispatcher {
                     base.need_update_bpf.store(true, Ordering::Relaxed);
                 }
                 drop(recved);
-                base.check_and_update_bpf();
+                base.check_and_update_bpf(&mut self.base.engine);
                 continue;
             }
             if base.pause.load(Ordering::Relaxed) {
@@ -581,8 +599,14 @@ impl AnalyzerModeDispatcher {
                 raw: buffer,
                 original_length: packet.capture_length as u32,
                 raw_length: packet.data.len() as u32,
+                if_index: 0,
+                ns_ino: 0,
             };
             batch.push(info);
+
+            drop(packet);
+
+            base.check_and_update_bpf(&mut self.base.engine);
         }
         if let Some(handler) = self.flow_generator_thread_handler.take() {
             let _ = handler.join();
@@ -591,16 +615,17 @@ impl AnalyzerModeDispatcher {
             let _ = handler.join();
         }
 
-        base.terminate_handler();
-        info!("Stopped dispatcher {}", base.log_id);
+        self.base.terminate_handler();
+        info!("Stopped dispatcher {}", self.base.is.log_id);
     }
 
     pub(super) fn decap_tunnel<T: AsMut<[u8]>>(
         mut packet: T,
-        tap_type_handler: &TapTypeHandler,
+        tap_type_handler: &CaptureNetworkTypeHandler,
         tunnel_info: &mut TunnelInfo,
         bitmap: TunnelTypeBitmap,
-    ) -> Result<(usize, TapType)> {
+        trim_bitmap: TunnelTypeBitmap,
+    ) -> Result<(usize, CaptureNetworkType)> {
         let packet = packet.as_mut();
         if packet[BILD_FLAGS_OFFSET] == BILD_FLAGS as u8 && packet.len() > ETH_HEADER_SIZE {
             // bild will mark ERSPAN traffic and reduce the Trident process
@@ -616,17 +641,17 @@ impl AnalyzerModeDispatcher {
             return Ok((overlay_offset, tap_type));
         }
 
-        BaseDispatcher::decap_tunnel(packet, tap_type_handler, tunnel_info, bitmap)
+        BaseDispatcher::decap_tunnel(packet, tap_type_handler, tunnel_info, bitmap, trim_bitmap)
     }
 
     pub(super) fn prepare_flow(
         meta_packet: &mut MetaPacket,
-        tap_type: TapType,
+        tap_type: CaptureNetworkType,
         queue_hash: u8,
         npb_dedup: bool,
     ) {
         let mut reset_ttl = false;
-        if tap_type == TapType::Cloud {
+        if tap_type == CaptureNetworkType::Cloud {
             reset_ttl = true;
         }
         BaseDispatcher::prepare_flow(meta_packet, tap_type, reset_ttl, queue_hash, npb_dedup)

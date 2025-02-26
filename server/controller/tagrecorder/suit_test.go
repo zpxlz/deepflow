@@ -27,7 +27,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 const (
@@ -43,12 +44,12 @@ func TestSuite(t *testing.T) {
 	if _, err := os.Stat(TEST_DB_FILE); err == nil {
 		os.Remove(TEST_DB_FILE)
 	}
-	mysql.Db = GetDB(TEST_DB_FILE)
+	metadb.DefaultDB = GetDB(TEST_DB_FILE)
 	suite.Run(t, new(SuiteTest))
 }
 
 func (t *SuiteTest) SetupSuite() {
-	t.db = mysql.Db
+	t.db = metadb.DefaultDB
 
 	for _, val := range getModels() {
 		t.db.AutoMigrate(val)
@@ -81,11 +82,11 @@ func GetDB(dbFile string) *gorm.DB {
 
 func getModels() []interface{} {
 	return []interface{}{
-		&mysql.Region{}, &mysql.AZ{}, &mysql.VPC{}, &mysql.VM{}, &mysql.VInterface{},
-		&mysql.WANIP{}, &mysql.LANIP{}, &mysql.NATGateway{}, &mysql.NATRule{},
-		&mysql.NATVMConnection{}, &mysql.LB{}, &mysql.LBListener{}, &mysql.LBTargetServer{},
-		&mysql.LBVMConnection{}, &mysql.PodIngress{}, &mysql.PodService{}, mysql.PodGroup{},
-		&mysql.PodGroupPort{}, &mysql.Pod{},
-		&mysql.ChRegion{}, &mysql.ChAZ{}, &mysql.ChVPC{}, &mysql.ChIPRelation{},
+		&metadbmodel.Region{}, &metadbmodel.AZ{}, &metadbmodel.VPC{}, &metadbmodel.VM{}, &metadbmodel.VInterface{},
+		&metadbmodel.WANIP{}, &metadbmodel.LANIP{}, &metadbmodel.NATGateway{}, &metadbmodel.NATRule{},
+		&metadbmodel.NATVMConnection{}, &metadbmodel.LB{}, &metadbmodel.LBListener{}, &metadbmodel.LBTargetServer{},
+		&metadbmodel.LBVMConnection{}, &metadbmodel.PodIngress{}, &metadbmodel.PodService{}, metadbmodel.PodGroup{},
+		&metadbmodel.PodGroupPort{}, &metadbmodel.Pod{},
+		&metadbmodel.ChRegion{}, &metadbmodel.ChAZ{}, &metadbmodel.ChVPC{}, &metadbmodel.ChIPRelation{},
 	}
 }

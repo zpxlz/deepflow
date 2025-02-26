@@ -16,13 +16,15 @@
 
 use std::mem::swap;
 
+use serde::Serialize;
+
 use public::proto::metric;
 
 const FLOW_ID: u32 = 1;
 const USAGE_ID: u32 = 4;
 const APP_ID: u32 = 5;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Debug, Clone, Copy)]
 pub enum Meter {
     Flow(FlowMeter),
     App(AppMeter),
@@ -82,7 +84,7 @@ impl From<Meter> for metric::Meter {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct FlowMeter {
     pub traffic: Traffic,
     pub latency: Latency,
@@ -125,7 +127,7 @@ impl From<FlowMeter> for metric::FlowMeter {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct Traffic {
     pub packet_tx: u64,
     pub packet_rx: u64,
@@ -196,7 +198,7 @@ impl From<Traffic> for metric::Traffic {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct Latency {
     pub rtt_max: u32,
     pub rtt_client_max: u32,
@@ -303,7 +305,7 @@ impl From<Latency> for metric::Latency {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct Performance {
     pub retrans_tx: u64,
     pub retrans_rx: u64,
@@ -337,12 +339,12 @@ impl From<Performance> for metric::Performance {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct Anomaly {
     pub client_rst_flow: u64,
     pub server_rst_flow: u64,
-    pub client_syn_repeat: u64,
-    pub server_synack_repeat: u64,
+    pub client_ack_miss: u64,
+    pub server_syn_miss: u64,
     pub client_half_close_flow: u64,
     pub server_half_close_flow: u64,
 
@@ -362,8 +364,8 @@ impl Anomaly {
     pub fn sequential_merge(&mut self, other: &Anomaly) {
         self.client_rst_flow += other.client_rst_flow;
         self.server_rst_flow += other.server_rst_flow;
-        self.client_syn_repeat += other.client_syn_repeat;
-        self.server_synack_repeat += other.server_synack_repeat;
+        self.client_ack_miss += other.client_ack_miss;
+        self.server_syn_miss += other.server_syn_miss;
         self.client_half_close_flow += other.client_half_close_flow;
         self.server_half_close_flow += other.server_half_close_flow;
 
@@ -385,8 +387,8 @@ impl From<Anomaly> for metric::Anomaly {
         metric::Anomaly {
             client_rst_flow: m.client_rst_flow,
             server_rst_flow: m.server_rst_flow,
-            client_syn_repeat: m.client_syn_repeat,
-            server_synack_repeat: m.server_synack_repeat,
+            client_ack_miss: m.client_ack_miss,
+            server_syn_miss: m.server_syn_miss,
             client_half_close_flow: m.client_half_close_flow,
             server_half_close_flow: m.server_half_close_flow,
 
@@ -404,7 +406,7 @@ impl From<Anomaly> for metric::Anomaly {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq)]
 pub struct FlowLoad {
     pub load: u64,
     pub flow_count: u64,
@@ -427,7 +429,7 @@ impl From<FlowLoad> for metric::FlowLoad {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy)]
 pub struct AppMeter {
     pub traffic: AppTraffic,
     pub latency: AppLatency,
@@ -455,7 +457,7 @@ impl From<AppMeter> for metric::AppMeter {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy)]
 pub struct AppTraffic {
     pub request: u32,
     pub response: u32,
@@ -484,7 +486,7 @@ impl From<AppTraffic> for metric::AppTraffic {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy)]
 pub struct AppLatency {
     pub rrt_max: u32,
     pub rrt_sum: u64,
@@ -511,7 +513,7 @@ impl From<AppLatency> for metric::AppLatency {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy)]
 pub struct AppAnomaly {
     pub client_error: u32,
     pub server_error: u32,
@@ -536,7 +538,7 @@ impl From<AppAnomaly> for metric::AppAnomaly {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Serialize, Debug, Default, Clone, Copy)]
 pub struct UsageMeter {
     pub packet_tx: u64,
     pub packet_rx: u64,

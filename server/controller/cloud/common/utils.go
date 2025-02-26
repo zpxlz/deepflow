@@ -33,19 +33,22 @@ import (
 	"github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
 	"github.com/mikioh/ipaddr"
-	logging "github.com/op/go-logging"
 	uuid "github.com/satori/go.uuid"
+	"gorm.io/gorm"
 	"inet.af/netaddr"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbcommon "github.com/deepflowio/deepflow/server/controller/db/metadb/common"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	controllermodel "github.com/deepflowio/deepflow/server/controller/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.common")
+var log = logger.MustGetLogger("cloud.common")
 
 func StringStringMapKeys(m map[string]string) (keys []string) {
 	for k := range m {
@@ -125,6 +128,21 @@ func UnionMapStringSet(m, n map[string]mapset.Set) map[string]mapset.Set {
 	return m
 }
 
+func UniqRegions(regionStrings string) map[string]bool {
+	retRegions := map[string]bool{}
+	if regionStrings == "" {
+		return retRegions
+	}
+	regionStrings = strings.ReplaceAll(regionStrings, "，", ",")
+	for _, regionName := range strings.Split(regionStrings, ",") {
+		if regionName == "" {
+			continue
+		}
+		retRegions[regionName] = false
+	}
+	return retRegions
+}
+
 func ReadJSONFile(path string) (*simplejson.Json, error) {
 	jsonFile, err := os.ReadFile(path)
 	if err != nil {
@@ -171,7 +189,7 @@ func GetBasicNetworkLcuuid(vpcLcuuid string) string {
 	return common.GenerateUUID(vpcLcuuid)
 }
 
-func GetBasicVPCAndNetworks(regions []model.Region, regionLcuuid, domainName, uuidGenerate string) ([]model.VPC, []model.Network) {
+func GetBasicVPCAndNetworks(orgID int, regions []model.Region, regionLcuuid, domainName, uuidGenerate string) ([]model.VPC, []model.Network) {
 	var retVPCs []model.VPC
 	var retNetworks []model.Network
 
@@ -184,15 +202,15 @@ func GetBasicVPCAndNetworks(regions []model.Region, regionLcuuid, domainName, uu
 	}
 
 	for _, region := range regions {
-		vpcLcuuid := GetBasicVPCLcuuid(uuidGenerate, region.Lcuuid)
-		vpcName := domainName + fmt.Sprintf("%s_基础VPC_%s", domainName, region.Name)
+		vpcLcuuid := common.GenerateUUIDByOrgID(orgID, uuidGenerate+region.Lcuuid)
+		vpcName := fmt.Sprintf("%s_基础VPC_%s", domainName, region.Name)
 		retVPCs = append(retVPCs, model.VPC{
 			Lcuuid:       vpcLcuuid,
 			Name:         vpcName,
 			RegionLcuuid: region.Lcuuid,
 		})
 		retNetworks = append(retNetworks, model.Network{
-			Lcuuid:         GetBasicNetworkLcuuid(vpcLcuuid),
+			Lcuuid:         common.GenerateUUIDByOrgID(orgID, vpcLcuuid),
 			Name:           vpcName + "子网",
 			SegmentationID: 1,
 			NetType:        common.NETWORK_TYPE_LAN,
@@ -205,15 +223,20 @@ func GetBasicVPCAndNetworks(regions []model.Region, regionLcuuid, domainName, uu
 }
 
 // 根据采集器上报的接口信息，生成宿主机的接口和IP信息
-func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex string, excludeIPs []string) (
+func GetHostNics(orgID int, hosts []model.Host, domainName, uuidGenerate, portNameRegex string, excludeIPs []string) (
 	[]model.Subnet, []model.VInterface, []model.IP, map[string][]model.Subnet, error,
 ) {
 	var retSubnets []model.Subnet
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	vtaps := []mysql.VTap{}
-	mysql.Db.Find(&vtaps)
+	db, err := metadb.GetDB(orgID)
+	if err != nil {
+		log.Error("get metadb session failed", logger.NewORGPrefix(orgID))
+		return []model.Subnet{}, []model.VInterface{}, []model.IP{}, map[string][]model.Subnet{}, err
+	}
+	vtaps := []metadbmodel.VTap{}
+	db.Find(&vtaps)
 
 	vtapLaunchServerToCtrlIP := make(map[string]string)
 	for _, vtap := range vtaps {
@@ -223,7 +246,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 	if genesis.GenesisService == nil {
 		return []model.Subnet{}, []model.VInterface{}, []model.IP{}, map[string][]model.Subnet{}, errors.New("genesis service is nil")
 	}
-	genesisData, err := genesis.GenesisService.GetGenesisSyncResponse()
+	genesisData, err := genesis.GenesisService.GetGenesisSyncResponse(orgID)
 	if err != nil {
 		return []model.Subnet{}, []model.VInterface{}, []model.IP{}, map[string][]model.Subnet{}, err
 	}
@@ -248,16 +271,16 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 	for _, host := range hosts {
 		vtapCtrlIP, ok := vtapLaunchServerToCtrlIP[host.IP]
 		if !ok {
-			log.Debugf("no vtap with launch_server (%s)", host.IP)
+			log.Debugf("no vtap with launch_server (%s)", host.IP, logger.NewORGPrefix(orgID))
 			continue
 		}
 		vinterfaces, ok := hostIPToVInterfaces[vtapCtrlIP]
 		if !ok {
-			log.Debugf("no host (%s) vinterfaces in response", host.IP)
+			log.Debugf("no host (%s) vinterfaces in response", host.IP, logger.NewORGPrefix(orgID))
 			continue
 		}
-		vpcLcuuid := GetBasicVPCLcuuid(uuidGenerate, host.RegionLcuuid)
-		networkLcuuid := GetBasicNetworkLcuuid(vpcLcuuid)
+		vpcLcuuid := common.GenerateUUIDByOrgID(orgID, uuidGenerate+host.RegionLcuuid)
+		networkLcuuid := common.GenerateUUIDByOrgID(orgID, vpcLcuuid)
 		subnets, ok := vpcLcuuidToSubnets[vpcLcuuid]
 		if !ok {
 			subnets = []model.Subnet{}
@@ -268,16 +291,16 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 		includeHostIP := false
 		for _, vinterface := range vinterfaces {
 			if reg == nil || !reg.MatchString(vinterface.Name) {
-				log.Debugf("vinterface name (%s) reg (%s) not match", vinterface.Name, portNameRegex)
+				log.Debugf("vinterface name (%s) reg (%s) not match", vinterface.Name, portNameRegex, logger.NewORGPrefix(orgID))
 				continue
 			}
 
 			if vinterface.IPs == "" {
-				log.Debugf("vinterface name (%s) not found ips", vinterface.Name)
+				log.Debugf("vinterface name (%s) not found ips", vinterface.Name, logger.NewORGPrefix(orgID))
 				continue
 			}
 
-			vinterfaceLcuuid := common.GenerateUUID(host.Lcuuid + vinterface.Mac)
+			vinterfaceLcuuid := common.GenerateUUIDByOrgID(orgID, host.Lcuuid+vinterface.Mac)
 			ips := strings.Split(vinterface.IPs, ",")
 			for _, ip := range ips {
 				subnetLcuuid := ""
@@ -293,7 +316,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 				if len(ipMasks) > 1 {
 					ipAddr, err = netaddr.ParseIP(ipMasks[0])
 					if err != nil {
-						log.Debugf("parse ip (%s) failed", ipMasks[0])
+						log.Debugf("parse ip (%s) failed", ipMasks[0], logger.NewORGPrefix(orgID))
 						continue
 					}
 					ipMask = ipMasks[1]
@@ -314,7 +337,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 				for _, subnet := range subnets {
 					subnetCidr, err := netaddr.ParseIPPrefix(subnet.CIDR)
 					if err != nil {
-						log.Debugf("parse ip prefix (%s) failed", subnet.CIDR)
+						log.Debugf("parse ip prefix (%s) failed", subnet.CIDR, logger.NewORGPrefix(orgID))
 						continue
 					}
 					if subnetCidr.Contains(ipAddr) {
@@ -325,11 +348,11 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 				if subnetLcuuid == "" {
 					cidrParse, err := ipaddr.Parse(ip)
 					if err != nil {
-						log.Debugf("parse ip (%s) failed", ip)
+						log.Debugf("parse ip (%s) failed", ip, logger.NewORGPrefix(orgID))
 						continue
 					}
 					subnetCidr := cidrParse.First().IP.String() + "/" + ipMask
-					subnetLcuuid = common.GenerateUUID(networkLcuuid + subnetCidr)
+					subnetLcuuid = common.GenerateUUIDByOrgID(orgID, networkLcuuid+subnetCidr)
 					retSubnet := model.Subnet{
 						Lcuuid:        subnetLcuuid,
 						Name:          subnetCidr,
@@ -345,7 +368,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 
 				// 增加IP信息
 				retIPs = append(retIPs, model.IP{
-					Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + ipMasks[0]),
+					Lcuuid:           common.GenerateUUIDByOrgID(orgID, vinterfaceLcuuid+ipMasks[0]),
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               ipMasks[0],
 					SubnetLcuuid:     subnetLcuuid,
@@ -374,14 +397,14 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 		// 判断IP是否已经在当前网段中；如果不在，则生成新的网段信息
 		ipAddr, err := netaddr.ParseIP(host.IP)
 		if err != nil {
-			log.Debugf("parse ip (%s) failed", host.IP)
+			log.Debugf("parse ip (%s) failed", host.IP, logger.NewORGPrefix(orgID))
 			continue
 		}
 		subnetLcuuid := ""
 		for _, subnet := range subnets {
 			subnetCidr, err := netaddr.ParseIPPrefix(subnet.CIDR)
 			if err != nil {
-				log.Debugf("parse ip prefix (%s) failed", subnet.CIDR)
+				log.Debugf("parse ip prefix (%s) failed", subnet.CIDR, logger.NewORGPrefix(orgID))
 				continue
 			}
 			if subnetCidr.Contains(ipAddr) {
@@ -396,11 +419,11 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 			}
 			cidrParse, err := ipaddr.Parse(host.IP + "/" + ipMask)
 			if err != nil {
-				log.Debugf("parse ip (%s) failed", host.IP+"/"+ipMask)
+				log.Debugf("parse ip (%s) failed", host.IP+"/"+ipMask, logger.NewORGPrefix(orgID))
 				continue
 			}
 			subnetCidr := cidrParse.First().IP.String() + "/" + ipMask
-			subnetLcuuid = common.GenerateUUID(networkLcuuid + subnetCidr)
+			subnetLcuuid = common.GenerateUUIDByOrgID(orgID, networkLcuuid+subnetCidr)
 			retSubnet := model.Subnet{
 				Lcuuid:        subnetLcuuid,
 				Name:          subnetCidr,
@@ -416,7 +439,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 
 		// 增加接口和IP信息
 		mac := common.VIF_DEFAULT_MAC
-		vinterfaceLcuuid := common.GenerateUUID(host.Lcuuid + mac)
+		vinterfaceLcuuid := common.GenerateUUIDByOrgID(orgID, host.Lcuuid+mac)
 		retVInterfaces = append(retVInterfaces, model.VInterface{
 			Lcuuid:        vinterfaceLcuuid,
 			Type:          common.VIF_TYPE_LAN,
@@ -428,7 +451,7 @@ func GetHostNics(hosts []model.Host, domainName, uuidGenerate, portNameRegex str
 			RegionLcuuid:  host.RegionLcuuid,
 		})
 		retIPs = append(retIPs, model.IP{
-			Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + host.IP),
+			Lcuuid:           common.GenerateUUIDByOrgID(orgID, vinterfaceLcuuid+host.IP),
 			VInterfaceLcuuid: vinterfaceLcuuid,
 			IP:               host.IP,
 			SubnetLcuuid:     subnetLcuuid,
@@ -538,7 +561,17 @@ func InetNToA(ip uint32) string {
 	return fmt.Sprintf("%d.%d.%d.%d", data[3], data[2], data[1], data[0])
 }
 
-func GetAZLcuuidFromUUIDGenerate(uuidGenerate string) string {
+func GetVPCLcuuidFromUUIDGenerate(orgID int, uuidGenerate string) string {
+	if orgID != metadbcommon.DEFAULT_ORG_ID {
+		uuidGenerate += strconv.Itoa(orgID)
+	}
+	return common.GetUUID(uuidGenerate+K8S_VPC_NAME, uuid.Nil)
+}
+
+func GetAZLcuuidFromUUIDGenerate(orgID int, uuidGenerate string) string {
+	if orgID != metadbcommon.DEFAULT_ORG_ID {
+		uuidGenerate += strconv.Itoa(orgID)
+	}
 	lcuuid := common.GetUUID(uuidGenerate, uuid.Nil)
 	return lcuuid[:len(lcuuid)-2] + "ff"
 }
@@ -568,11 +601,108 @@ func DiffMap(base, newTags map[string]string) bool {
 	return false
 }
 
-func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
+func GetNodeHostNameByDomain(lcuuid string, isSubDomain bool, db *gorm.DB) (map[string]string, error) {
+	podNodeLcuuidToHostName := map[string]string{}
+	var domain string
+	if isSubDomain {
+		var subDomain metadbmodel.SubDomain
+		err := db.Where("lcuuid = ?", lcuuid).Find(&subDomain).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+		domain = subDomain.Domain
+	} else {
+		domain = lcuuid
+	}
+
+	var azs []metadbmodel.AZ
+	err := db.Where("domain = ?", domain).Find(&azs).Error
+	if err != nil {
+		return map[string]string{}, err
+	}
+	azLcuuids := []string{}
+	for _, az := range azs {
+		azLcuuids = append(azLcuuids, az.Lcuuid)
+	}
+	var vtaps []metadbmodel.VTap
+	err = db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	if err != nil {
+		return map[string]string{}, err
+	}
+	var podNodes []metadbmodel.PodNode
+	if isSubDomain {
+		err = db.Where("domain = ? AND sub_domain = ?", domain, lcuuid).Find(&podNodes).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+	} else {
+		err = db.Where("domain = ?", domain).Find(&podNodes).Error
+		if err != nil {
+			return map[string]string{}, err
+		}
+	}
+
+	podNodeIDs := map[int]bool{}
+	for _, podNode := range podNodes {
+		podNodeIDs[podNode.ID] = false
+	}
+
+	for _, vtap := range vtaps {
+		if vtap.Type != common.VTAP_TYPE_POD_HOST && vtap.Type != common.VTAP_TYPE_POD_VM {
+			continue
+		}
+		if _, ok := podNodeIDs[vtap.LaunchServerID]; !ok {
+			continue
+		}
+		podNodeLcuuidToHostName[vtap.Lcuuid] = vtap.RawHostname
+	}
+	return podNodeLcuuidToHostName, nil
+}
+
+func GetHostAndVmHostNameByDomain(domain string, db *gorm.DB) (map[string]string, map[string]string, error) {
+	hostIPToHostName := map[string]string{}
+	vmLcuuidToHostName := map[string]string{}
+
+	var azs []metadbmodel.AZ
+	err := db.Where("domain = ?", domain).Find(&azs).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	azLcuuids := []string{}
+	for _, az := range azs {
+		azLcuuids = append(azLcuuids, az.Lcuuid)
+	}
+	var vtaps []metadbmodel.VTap
+	err = db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	var podNodes []metadbmodel.PodNode
+	err = db.Where("domain = ?", domain).Find(&podNodes).Error
+	if err != nil {
+		return map[string]string{}, map[string]string{}, err
+	}
+	podNodeIDs := map[int]bool{}
+	for _, podNode := range podNodes {
+		podNodeIDs[podNode.ID] = false
+	}
+
+	for _, vtap := range vtaps {
+		switch vtap.Type {
+		case common.VTAP_TYPE_KVM, common.VTAP_TYPE_HYPER_V:
+			hostIPToHostName[vtap.CtrlIP] = vtap.RawHostname
+		case common.VTAP_TYPE_WORKLOAD_V, common.VTAP_TYPE_WORKLOAD_P:
+			vmLcuuidToHostName[vtap.Lcuuid] = vtap.RawHostname
+		}
+	}
+	return hostIPToHostName, vmLcuuidToHostName, nil
+}
+
+func GetVTapSubDomainMappingByDomain(domain string, db *gorm.DB) (map[int]string, error) {
 	vtapIDToSubDomain := make(map[int]string)
 
-	var azs []mysql.AZ
-	err := mysql.Db.Where("domain = ?", domain).Find(&azs).Error
+	var azs []metadbmodel.AZ
+	err := db.Where("domain = ?", domain).Find(&azs).Error
 	if err != nil {
 		return vtapIDToSubDomain, err
 	}
@@ -581,8 +711,8 @@ func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
 		azLcuuids = append(azLcuuids, az.Lcuuid)
 	}
 
-	var podNodes []mysql.PodNode
-	err = mysql.Db.Where("domain = ?", domain).Find(&podNodes).Error
+	var podNodes []metadbmodel.PodNode
+	err = db.Where("domain = ?", domain).Find(&podNodes).Error
 	if err != nil {
 		return vtapIDToSubDomain, err
 	}
@@ -591,8 +721,8 @@ func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
 		podNodeIDToSubDomain[podNode.ID] = podNode.SubDomain
 	}
 
-	var pods []mysql.Pod
-	err = mysql.Db.Where("domain = ?", domain).Find(&pods).Error
+	var pods []metadbmodel.Pod
+	err = db.Where("domain = ?", domain).Find(&pods).Error
 	if err != nil {
 		return vtapIDToSubDomain, err
 	}
@@ -601,8 +731,8 @@ func GetVTapSubDomainMappingByDomain(domain string) (map[int]string, error) {
 		podIDToSubDomain[pod.ID] = pod.SubDomain
 	}
 
-	var vtaps []mysql.VTap
-	err = mysql.Db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
+	var vtaps []metadbmodel.VTap
+	err = db.Where("az IN ?", azLcuuids).Find(&vtaps).Error
 	if err != nil {
 		return vtapIDToSubDomain, err
 	}

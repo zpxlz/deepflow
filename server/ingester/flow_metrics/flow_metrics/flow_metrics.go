@@ -24,10 +24,13 @@ import (
 	logging "github.com/op/go-logging"
 
 	"github.com/deepflowio/deepflow/server/ingester/droplet/queue"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
 	"github.com/deepflowio/deepflow/server/ingester/flow_metrics/config"
 	"github.com/deepflowio/deepflow/server/ingester/flow_metrics/dbwriter"
 	"github.com/deepflowio/deepflow/server/ingester/flow_metrics/unmarshaller"
+	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/ingester/ingesterctl"
+	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	"github.com/deepflowio/deepflow/server/libs/debug"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
@@ -40,10 +43,11 @@ var log = logging.MustGetLogger("flow_metrics")
 type FlowMetrics struct {
 	unmarshallers []*unmarshaller.Unmarshaller
 	platformDatas []*grpc.PlatformInfoTable
-	dbwriters     []dbwriter.DbWriter
+	dbwriter      dbwriter.DbWriter
+	exporters     *exporters.Exporters
 }
 
-func NewFlowMetrics(cfg *config.Config, recv *receiver.Receiver, platformDataManager *grpc.PlatformDataManager) (*FlowMetrics, error) {
+func NewFlowMetrics(cfg *config.Config, recv *receiver.Receiver, platformDataManager *grpc.PlatformDataManager, exporters *exporters.Exporters) (*FlowMetrics, error) {
 	flowMetrics := FlowMetrics{}
 
 	manager := queue.NewManager(ingesterctl.INGESTERCTL_FLOW_METRICS_QUEUE)
@@ -57,35 +61,31 @@ func NewFlowMetrics(cfg *config.Config, recv *receiver.Receiver, platformDataMan
 	recv.RegistHandler(datatype.MESSAGE_TYPE_METRICS, unmarshallQueues, unmarshallQueueCount)
 
 	var err error
-	var writers []dbwriter.DbWriter
-	ckWriter, err := dbwriter.NewCkDbWriter(cfg.Base.CKDB.ActualAddrs, cfg.Base.CKDBAuth.Username, cfg.Base.CKDBAuth.Password, cfg.Base.CKDB.ClusterName, cfg.Base.CKDB.StoragePolicy, cfg.Base.CKDB.TimeZone,
-		cfg.CKWriterConfig, cfg.FlowMetricsTTL, cfg.Base.GetCKDBColdStorages())
+	ckWriter, err := dbwriter.NewCkDbWriter(*cfg.Base.CKDB.ActualAddrs, cfg.Base.CKDBAuth.Username, cfg.Base.CKDBAuth.Password, cfg.Base.CKDB.ClusterName, cfg.Base.CKDB.StoragePolicy, cfg.Base.CKDB.TimeZone, cfg.Base.CKDB.Type,
+		cfg.CKWriterConfig, cfg.FlowMetricsTTL, cfg.Base.GetCKDBColdStorages(), cfg.Base.CKDB.Watcher)
 	if err != nil {
 		log.Error(err)
 		return nil, err
 	}
-	writers = append(writers, ckWriter)
 
-	if cfg.PromWriterConfig.Enabled {
-		writer := dbwriter.NewPromWriter(cfg.PromWriterConfig)
-		writers = append(writers, writer)
-	}
-
-	flowMetrics.dbwriters = writers
+	flowMetrics.dbwriter = ckWriter
+	flowMetrics.exporters = exporters
 	flowMetrics.unmarshallers = make([]*unmarshaller.Unmarshaller, unmarshallQueueCount)
 	flowMetrics.platformDatas = make([]*grpc.PlatformInfoTable, unmarshallQueueCount)
 	for i := 0; i < unmarshallQueueCount; i++ {
+		flowMetrics.platformDatas[i], err = platformDataManager.NewPlatformInfoTable("flowMetrics-" + strconv.Itoa(i))
 		if i == 0 {
-			// 只第一个上报数据节点信息
-			flowMetrics.platformDatas[i], err = platformDataManager.NewPlatformInfoTable("ingester")
 			debug.ServerRegisterSimple(ingesterctl.CMD_PLATFORMDATA_FLOW_METRIC, flowMetrics.platformDatas[i])
-		} else {
-			flowMetrics.platformDatas[i], err = platformDataManager.NewPlatformInfoTable("flowMetrics-" + strconv.Itoa(i))
 		}
 		if err != nil {
 			return nil, err
 		}
-		flowMetrics.unmarshallers[i] = unmarshaller.NewUnmarshaller(i, flowMetrics.platformDatas[i], cfg.DisableSecondWrite, libqueue.QueueReader(unmarshallQueues.FixedMultiQueue[i]), flowMetrics.dbwriters)
+		appServiceTagWriter, err := flow_tag.NewAppServiceTagWriter(i, ckdb.METRICS_DB, datatype.MESSAGE_TYPE_METRICS.String(), cfg.FlowMetricsTTL.VtapApp1M, ckdb.TimeFuncTwelveHour, cfg.Base)
+		if err != nil {
+			return nil, err
+		}
+
+		flowMetrics.unmarshallers[i] = unmarshaller.NewUnmarshaller(i, flowMetrics.platformDatas[i], cfg.DisableSecondWrite, libqueue.QueueReader(unmarshallQueues.FixedMultiQueue[i]), flowMetrics.dbwriter, exporters, appServiceTagWriter)
 	}
 
 	return &flowMetrics, nil
@@ -102,8 +102,6 @@ func (r *FlowMetrics) Close() error {
 	for i := 0; i < len(r.unmarshallers); i++ {
 		r.platformDatas[i].ClosePlatformInfoTable()
 	}
-	for i := 0; i < len(r.dbwriters); i++ {
-		r.dbwriters[i].Close()
-	}
+	r.dbwriter.Close()
 	return nil
 }

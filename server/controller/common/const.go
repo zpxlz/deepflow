@@ -26,6 +26,15 @@ const GO_BIRTHDAY = "2006-01-02 15:04:05"
 const K8S_CA_CRT_PATH = "/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 const (
+	DEFAULT_ORG_ID    = 1
+	DEFAULT_USER_TYPE = 1
+	DEFAULT_USER_ID   = 1
+	DEFAULT_TEAM_ID   = 1
+	DEFAULT_APP_KEY   = "8c434f9a48bf1b7e729bde006e0409f8"
+	ORG_ID_MAX        = 1024
+)
+
+const (
 	REMOTE_API_TIMEOUT = 30
 	INGESTER_API_PORT  = 30106
 )
@@ -146,8 +155,8 @@ var VTapTypeName = map[int]string{
 var VTapTypeChinese = map[int]string{
 	VTAP_TYPE_KVM:                  "KVM",
 	VTAP_TYPE_ESXI:                 "ESXI",
-	VTAP_TYPE_WORKLOAD_V:           "云服务器-V",
-	VTAP_TYPE_WORKLOAD_P:           "云服务器-P",
+	VTAP_TYPE_WORKLOAD_V:           "云主机-V",
+	VTAP_TYPE_WORKLOAD_P:           "云主机-P",
 	VTAP_TYPE_DEDICATED:            "专属服务器",
 	VTAP_TYPE_POD_HOST:             "容器-P",
 	VTAP_TYPE_POD_VM:               "容器-V",
@@ -164,25 +173,26 @@ const (
 )
 
 var VTapExceptionChinese = map[int64]string{
-	2 << 0:                                 "自检失败：日志所在磁盘剩余空间不足100MB",
-	2 << 1:                                 "自检失败：可用内存不足",
-	2 << 2:                                 "自检失败：Coredump文件过多",
-	2 << 3:                                 "分发熔断",
-	2 << 4:                                 "分发流量达到限速",
-	2 << 5:                                 "到分发点的网关ARP无法找到",
-	2 << 6:                                 "采集包速率达到限速",
-	2 << 7:                                 "到数据节点的网关ARP无法找到",
-	2 << 8:                                 "控制器下发的配置信息校验不通过",
-	2 << 9:                                 "采集器线程数超限",
-	2 << 10:                                "采集器进程数超限",
-	2 << 11:                                "采集器编译生成的分发和PCAP策略数量超限",
-	2 << 12:                                "空闲内存超限",
-	2 << 13:                                "日志文件大小超限",
-	2 << 14:                                "控制SOCKET错误",
-	2 << 15:                                "数据SOCKET错误",
-	2 << 16:                                "分发SOCKET错误",
-	2 << 17:                                "集成SOCKET错误",
-	2 << 18:                                "CGROUPS配置错误",
+	1 << 0:                                 "自检失败：日志所在磁盘剩余空间不足100MB",
+	1 << 1:                                 "自检失败：可用内存不足",
+	1 << 2:                                 "自检失败：Coredump文件过多",
+	1 << 3:                                 "分发熔断",
+	1 << 4:                                 "分发流量达到限速",
+	1 << 5:                                 "到分发点的网关ARP无法找到",
+	1 << 6:                                 "采集包速率达到限速",
+	1 << 7:                                 "到数据节点的网关ARP无法找到",
+	1 << 8:                                 "控制器下发的配置信息校验不通过",
+	1 << 9:                                 "采集器线程数超限",
+	1 << 10:                                "采集器进程数超限",
+	1 << 11:                                "",
+	1 << 12:                                "采集器编译生成的分发和PCAP策略数量超限",
+	1 << 13:                                "空闲内存超限",
+	1 << 14:                                "日志文件大小超限",
+	1 << 15:                                "控制SOCKET错误",
+	1 << 16:                                "数据SOCKET错误",
+	1 << 17:                                "分发SOCKET错误",
+	1 << 18:                                "集成SOCKET错误",
+	1 << 19:                                "CGROUPS配置错误",
 	VTAP_EXCEPTION_LICENSE_NOT_ENGOUTH:     "采集器授权个数不足",
 	VTAP_EXCEPTION_ALLOC_ANALYZER_FAILED:   "分配数据节点失败",
 	VTAP_EXCEPTION_ALLOC_CONTROLLER_FAILED: "分配控制器失败",
@@ -207,8 +217,12 @@ const (
 	VTAP_LICENSE_FUNCTION_FUNCTION_MONITORING
 	VTAP_LICENSE_FUNCTION_APPLICATION_MONITORING
 	VTAP_LICENSE_FUNCTION_INDICATOR_MONITORING
+	VTAP_LICENSE_FUNCTION_DATABASE_MONITORING
+	VTAP_LICENSE_FUNCTION_LOG_MONITORING
 	VTAP_LICENSE_FUNCTION_MAX
 )
+
+const VTAP_ALL_LICENSE_FUNCTIONS = "1,2,3,4,5,6,7,8"
 
 var VTAP_TYPE_TO_DEVICE_TYPE = map[int]int{
 	VTAP_TYPE_KVM:                  VIF_DEVICE_TYPE_HOST,
@@ -249,6 +263,11 @@ const (
 )
 
 const (
+	POLICY_VTAP_TYPE_VTAP       = 1
+	POLICY_VTAP_TYPE_VTAP_GROUP = 2
+)
+
+const (
 	DEFAULT_ENCRYPTION_PASSWORD = "******"
 	DEFAULT_ALL_MATCH_REGEX     = ".*"
 	DEFAULT_NOT_MATCH_REGEX     = "^$"
@@ -260,7 +279,6 @@ const (
 	TENCENT           = 4
 	FILEREADER        = 5
 	AWS               = 6
-	PINGAN            = 7
 	ZSTACK            = 8
 	ALIYUN            = 9
 	HUAWEI_PRIVATE    = 10
@@ -280,6 +298,11 @@ const (
 	BAIDU_BCE         = 25
 	ESHORE            = 26
 	CLOUD_TOWER       = 27
+	NFVO              = 28
+	SUGON             = 29
+	VOLCENGINE        = 30
+	H3C               = 31
+	FUSIONCOMPUTE     = 32
 
 	OPENSTACK_EN         = "openstack"
 	VSPHERE_EN           = "vsphere"
@@ -287,7 +310,6 @@ const (
 	TENCENT_EN           = "tencent"
 	FILEREADER_EN        = "filereader"
 	AWS_EN               = "aws"
-	PINGAN_EN            = "pingan"
 	ZSTACK_EN            = "zstack"
 	ALIYUN_EN            = "aliyun"
 	HUAWEI_PRIVATE_EN    = "huawei_private"
@@ -308,9 +330,13 @@ const (
 	MICROSOFT_ACS_EN     = "microsoft_acs"
 	BAIDU_BCE_EN         = "baidu_bce"
 	CLOUD_TOWER_EN       = "cloudtower"
+	NFVO_EN              = "nfvo"
+	SUGON_EN             = "sugon"
+	VOLCENGINE_EN        = "volcengine"
+	H3C_EN               = "h3c"
+	FUSIONCOMPUTE_EN     = "fusioncompute"
 
 	TENCENT_CH          = "腾讯云"
-	PINGAN_CH           = "平安云"
 	ALIYUN_CH           = "阿里云"
 	HUAWEI_CH           = "华为云"
 	QINGCLOUD_CH        = "青云"
@@ -318,28 +344,31 @@ const (
 	MICROSOFT_CH        = "微软云"
 	BAIDU_BCE_CH        = "百度云"
 	ESHORE_CH           = "亿迅云"
+	NFVO_CH             = "华为NFVO+"
+	SUGON_CH            = "曙光云"
+	VOLCENGINE_CH       = "火山云"
+	H3C_CH              = "华三云"
 
-	OPENSTACK_CH   = "OpenStack"
-	VSPHERE_CH     = "vSphere"
-	NSP_CH         = "NSP"
-	AWS_CH         = "AWS"
-	ZSTACK_CH      = "ZStack"
-	KUBERNETES_CH  = "Kubernetes"
-	CLOUD_TOWER_CH = "CloudTower"
+	OPENSTACK_CH     = "OpenStack"
+	VSPHERE_CH       = "vSphere"
+	NSP_CH           = "NSP"
+	AWS_CH           = "AWS"
+	ZSTACK_CH        = "ZStack"
+	KUBERNETES_CH    = "Kubernetes"
+	CLOUD_TOWER_CH   = "CloudTower"
+	FUSIONCOMPUTE_CH = "FusionCompute"
 )
 
 var DomainTypeToIconID = map[int]int{
 	KUBERNETES: 14,
 }
 
-// TODO delete tagrecorder dup definition
 var IconNameToDomainTypes = map[string][]int{
 	OPENSTACK_CH:        {OPENSTACK},
 	VSPHERE_CH:          {VSPHERE},
 	NSP_CH:              {NSP},
 	TENCENT_CH:          {TENCENT, TENCENT_TCE},
 	AWS_CH:              {AWS},
-	PINGAN_CH:           {PINGAN},
 	ZSTACK_CH:           {ZSTACK},
 	ALIYUN_CH:           {ALIYUN, APSARA_STACK},
 	KUBERNETES_CH:       {KUBERNETES},
@@ -348,6 +377,7 @@ var IconNameToDomainTypes = map[string][]int{
 	MICROSOFT_CH:        {AZURE, CMB_CMDB, MICROSOFT_ACS},
 	KINGSOFT_PRIVATE_CH: {KINGSOFT_PRIVATE},
 	BAIDU_BCE_CH:        {BAIDU_BCE},
+	VOLCENGINE_CH:       {VOLCENGINE},
 }
 
 const (
@@ -392,6 +422,7 @@ const (
 	VIF_DEVICE_TYPE_INTERNET                        = 0
 	VIF_DEVICE_TYPE_POD_GROUP                       = 101
 	VIF_DEVICE_TYPE_SERVICE                         = 102
+	VIF_DEVICE_TYPE_POD_CLUSTER                     = 103
 	VIF_DEVICE_TYPE_GPROCESS                        = 120
 	VIF_DEVICE_TYPE_POD_GROUP_DEPLOYMENT            = 130
 	VIF_DEVICE_TYPE_POD_GROUP_STATEFULSET           = 131
@@ -406,22 +437,6 @@ const (
 	CREATE_METHOD_LEARN         = 0
 	CREATE_METHOD_USER_DEFINE   = 1
 	CONTACT_CREATE_METHOD_LEARN = 1 // TODO 修改与其他统一
-)
-
-const (
-	SECURITY_GROUP_RULE_UNKNOWN = 0
-	SECURITY_GROUP_RULE_ACCEPT  = 1
-	SECURITY_GROUP_RULE_DROP    = 2
-
-	SECURITY_GROUP_RULE_INGRESS = 1
-	SECURITY_GROUP_RULE_EGRESS  = 2
-
-	SECURITY_GROUP_IP_TYPE_UNKNOWN = 0
-	SECURITY_GROUP_RULE_IPV4       = 1
-	SECURITY_GROUP_RULE_IPV6       = 2
-
-	SECURITY_GROUP_RULE_IPV4_CIDR = "0.0.0.0/0"
-	SECURITY_GROUP_RULE_IPV6_CIDR = "::/0"
 )
 
 const (
@@ -478,8 +493,9 @@ const (
 )
 
 const (
-	DATA_SOURCE_FLOW = "flow_metrics.vtap_flow*"
-	DATA_SOURCE_APP  = "flow_metrics.vtap_app*"
+	DATA_SOURCE_NETWORK        = "flow_metrics.network*"
+	DATA_SOURCE_APPLICATION    = "flow_metrics.application*"
+	DATA_SOURCE_TRAFFIC_POLICY = "flow_metrics.traffic_policy"
 
 	DATA_SOURCE_STATE_EXCEPTION = 0
 	DATA_SOURCE_STATE_NORMAL    = 1
@@ -505,8 +521,9 @@ const (
 )
 
 const (
-	POD_SERVICE_TYPE_CLUSTERIP = 1
-	POD_SERVICE_TYPE_NODEPORT  = 2
+	POD_SERVICE_TYPE_CLUSTERIP    = 1
+	POD_SERVICE_TYPE_NODEPORT     = 2
+	POD_SERVICE_TYPE_LOADBALANCER = 3
 )
 
 const (
@@ -549,12 +566,11 @@ const (
 )
 
 const (
-	DEEPFLOW_STATSD_PREFIX            = "deepflow_server_controller"
-	CLOUD_METRIC_NAME_TASK_COST       = "cloud_task_cost"
-	CLOUD_METRIC_NAME_INFO_COUNT      = "cloud_info_count"
-	CLOUD_METRIC_NAME_API_COUNT       = "cloud_api_count"
-	CLOUD_METRIC_NAME_API_COST        = "cloud_api_cost"
-	GENESIS_METRIC_NAME_K8SINFO_DELAY = "genesis_k8sinfo_delay"
+	CLOUD_METRIC_NAME_TASK_COST       = "controller_cloud_task_cost"
+	CLOUD_METRIC_NAME_INFO_COUNT      = "controller_cloud_info_count"
+	CLOUD_METRIC_NAME_API_COUNT       = "controller_cloud_api_count"
+	CLOUD_METRIC_NAME_API_COST        = "controller_cloud_api_cost"
+	GENESIS_METRIC_NAME_K8SINFO_DELAY = "controller_genesis_k8sinfo_delay"
 )
 
 var (
@@ -638,6 +654,7 @@ const (
 const (
 	PLUGIN_TYPE_WASM = 1
 	PLUGIN_TYPE_SO   = 2
+	PLUGIN_TYPE_LUA  = 3
 )
 
 var (
@@ -663,4 +680,48 @@ const (
 
 const (
 	RUNNING_MODE_STANDALONE = "STANDALONE"
+)
+
+const (
+	HEADER_KEY_CONTENT_TYPE = "Content-Type"
+	CONTENT_TYPE_JSON       = "application/json"
+	CONTENT_TYPE_FORM       = "application/x-www-form-urlencoded"
+	CONTENT_TYPE_CSV        = "text/csv"
+
+	HEADER_KEY_CONTENT_DISPOSITION          = "Content-Disposition"
+	CONTENT_DISPOSITION_ATTACHMENT_FILENAME = "attachment; filename=%s"
+
+	HEADER_KEY_ACCEPT = "Accept"
+	ACCEPT_JSON       = "application/json, text/plain"
+
+	HEADER_KEY_X_ORG_ID    = "X-Org-Id"
+	HEADER_KEY_X_USER_TYPE = "X-User-Type"
+	HEADER_KEY_X_USER_ID   = "X-User-Id"
+	HEADER_KEY_X_APP_KEY   = "X-App-Key"
+
+	USER_TYPE_SUPER_ADMIN = 1
+	USER_TYPE_ADMIN       = 2
+	USER_ID_SUPER_ADMIN   = 1
+
+	INGESTER_BODY_ORG_ID = "org-id"
+)
+
+const (
+	SET_RESOURCE_TYPE_DOMAIN             = "domain"
+	SET_RESOURCE_TYPE_SUB_DOMAIN         = "sub_domain"
+	SET_RESOURCE_TYPE_AGENT              = "agent"
+	SET_RESOURCE_TYPE_AGENT_GROUP        = "agent_group"
+	SET_RESOURCE_TYPE_AGENT_GROUP_CONFIG = "agent_group_config"
+	SET_RESOURCE_TYPE_DATA_SOURCE        = "datasource"
+)
+
+const TRISOLARIS_NODE_TYPE_MASTER = "master"
+
+const CLICK_HOUSE_VERSION = "24"
+
+const TAP_TYPE_VALUE_CLOUD_NETWORK = 3
+
+const (
+	CUSTOM_SERVICE_TYPE_IP   = 1
+	CUSTOM_SERVICE_TYPE_PORT = 2
 )

@@ -16,8 +16,72 @@
 
 package log_data
 
-import "net"
+import (
+	"bytes"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+
+	"github.com/deepflowio/deepflow/server/libs/datatype"
+)
 
 func IPIntToString(ipInt uint32) string {
 	return net.IPv4(byte(ipInt>>24), byte(ipInt>>16), byte(ipInt>>8), byte(ipInt)).String()
+}
+
+// eg. url=http://nacos:8848/nacos/v1/ns/instance/list, parse return `/nacos/v1/ns/instance/list`
+func ParseUrlPath(rawURL string) (string, error) {
+	parts := strings.SplitN(rawURL, "://", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return "", fmt.Errorf("invalid URL format")
+	}
+	pathStart := strings.Index(parts[1], "/")
+	if pathStart == -1 {
+		return "/", nil
+	}
+
+	return parts[1][pathStart:], nil
+}
+
+var bufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+func GetBuffer() *bytes.Buffer {
+	buffer := bufferPool.Get().(*bytes.Buffer)
+	buffer.Reset()
+	return buffer
+}
+
+func PutBuffer(buffer *bytes.Buffer) {
+	bufferPool.Put(buffer)
+}
+
+func ParseL7Protocol(l7ProtocolStr string, version string) (uint8, uint8) {
+	var l7Protocol uint8 = 0
+	var isTLS uint8 = 0
+	if len(l7ProtocolStr) > 0 {
+		l7ProtocolStrLower := strings.ToLower(l7ProtocolStr)
+		if strings.Contains(l7ProtocolStrLower, "https") {
+			isTLS = 1
+		}
+		for l7ProtocolStr, l7ProtocolMap := range datatype.L7ProtocolStringMap {
+			if strings.Contains(l7ProtocolStr, l7ProtocolStrLower) {
+				l7Protocol = uint8(l7ProtocolMap)
+				break
+			}
+		}
+		// If the protocol name is 'http', it may be randomly matched to 'http1' or 'http2' and needs to be corrected.
+		if l7Protocol == uint8(datatype.L7_PROTOCOL_HTTP_1) || l7Protocol == uint8(datatype.L7_PROTOCOL_HTTP_2) {
+			if strings.HasPrefix(version, "2") {
+				l7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_2)
+			} else {
+				l7Protocol = uint8(datatype.L7_PROTOCOL_HTTP_1)
+			}
+		}
+	}
+	return l7Protocol, isTLS
 }

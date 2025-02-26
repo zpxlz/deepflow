@@ -17,9 +17,10 @@
 use chrono::prelude::DateTime;
 use chrono::FixedOffset;
 use chrono::Utc;
+use std::env;
 use std::ffi::CString;
 use profiler::ebpf::*;
-use std::env::set_var;
+use std::ptr;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
@@ -79,6 +80,7 @@ fn cp_container_id_safe(cp: *mut stack_profile_data) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn increment_counter(num: u32, counter_type: u32) {
     if counter_type == 0 {
         let mut counter = COUNTER.lock().unwrap();
@@ -117,12 +119,12 @@ extern "C" fn debug_callback(_data: *mut c_char, len: c_int) {
     }
 }
 
-extern "C" fn socket_trace_callback(_sd: *mut SK_BPF_DATA) {}
+extern "C" fn socket_trace_callback(_: *mut c_void, _sd: *mut SK_BPF_DATA) {}
 
-extern "C" fn continuous_profiler_callback(cp: *mut stack_profile_data) {
+extern "C" fn continuous_profiler_callback(_: *mut c_void, cp: *mut stack_profile_data) {
     unsafe {
         process_stack_trace_data_for_flame_graph(cp);
-        increment_counter((*cp).count, 1);
+        increment_counter((*cp).count as u32, 1);
         increment_counter(1, 0);
         //let data = sk_data_str_safe(cp);
         //println!("\n+ --------------------------------- +");
@@ -143,6 +145,7 @@ extern "C" fn continuous_profiler_callback(cp: *mut stack_profile_data) {
     }
 }
 
+#[allow(dead_code)]
 fn get_counter(counter_type: u32) -> u32 {
     if counter_type == 0 {
         *COUNTER.lock().unwrap()
@@ -152,7 +155,9 @@ fn get_counter(counter_type: u32) -> u32 {
 }
 
 fn main() {
-    set_var("RUST_LOG", "info");
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "info")
+    }
     env_logger::builder()
       .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
       .init();
@@ -168,29 +173,42 @@ fn main() {
             ::std::process::exit(1);
         }
 
+	set_bpf_map_prealloc(false);
+
         if running_socket_tracer(
             socket_trace_callback, /* Callback interface rust -> C */
             1, /* Number of worker threads, indicating how many user-space threads participate in data processing */
             64, /* Number of page frames occupied by kernel-shared memory, must be a power of 2. Used for perf data transfer */
             65536, /* Size of the circular buffer queue, must be a power of 2. e.g: 2, 4, 8, 16, 32, 64, 128 */
-            524288, /* Maximum number of hash table entries for socket tracing, depends on the actual number of concurrent requests in the scenario */
-            524288, /* Maximum number of hash table entries for thread/coroutine tracing sessions */
-            520000, /* Maximum threshold for cleaning socket map entries. If the current number of map entries exceeds this value, map cleaning operation is performed */
+            131072, /* Maximum number of hash table entries for socket tracing, depends on the actual number of concurrent requests in the scenario */
+            131072, /* Maximum number of hash table entries for thread/coroutine tracing sessions */
+            120000, /* Maximum threshold for cleaning socket map entries. If the current number of map entries exceeds this value, map cleaning operation is performed */
         ) != 0
         {
             println!("running_socket_tracer() error.");
             ::std::process::exit(1);
         }
 
+        set_dwarf_enabled(true);
+
+        let mut contexts = [ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+
         // Used to test our DeepFlow products, written as 97 frequency, so that
         // it will not affect the sampling test of deepflow agent (using 99Hz).
-        if start_continuous_profiler(97, 10, 300, continuous_profiler_callback) != 0 {
+        if start_continuous_profiler(97, 60, continuous_profiler_callback, &contexts as *const [*mut c_void; PROFILER_CTX_NUM]) != 0 {
             println!("start_continuous_profiler() error.");
             ::std::process::exit(1);
         }
 
-        set_profiler_regex(
-            CString::new("^(socket_tracer|java|deepflow-.*)$".as_bytes())
+        let pids: [c_int; 6] = [5346, 6963, 19966, 23117, 24412, 26611];
+        let num: c_int = pids.len() as c_int;
+        let result = set_feature_pids(FEATURE_PROFILE_ONCPU, pids.as_ptr(), num);
+        println!("Result {}", result);
+        let result = set_feature_pids(FEATURE_DWARF_UNWINDING, pids.as_ptr(), num);
+        println!("Result {}", result);
+
+        set_dwarf_regex(
+            CString::new("^(python.*)$".as_bytes())
                 .unwrap()
                 .as_c_str()
                 .as_ptr(),
@@ -201,7 +219,7 @@ fn main() {
 
         bpf_tracer_finish();
 
-        //if cpdbg_set_config(60, debug_callback) != 0 {
+        //if cpdbg_set_config(600, debug_callback) != 0 {
         //    println!("cpdbg_set_config() error");
         //    ::std::process::exit(1);
         //}
@@ -216,16 +234,19 @@ fn main() {
         }
 
         thread::sleep(Duration::from_secs(150));
-        stop_continuous_profiler();
+        stop_continuous_profiler(&mut contexts as *mut [*mut c_void; PROFILER_CTX_NUM]);
         print!(
-            "====== capture count {}, sum {}\n",
-            get_counter(0),
-            get_counter(1)
+          "====== capture count {}, sum {}\n",
+          get_counter(0),
+          get_counter(1)
         );
         release_flame_graph_hash();
     }
 
     loop {
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(30));
+	    // unsafe {
+        //     show_collect_pool();
+	    // }
     }
 }

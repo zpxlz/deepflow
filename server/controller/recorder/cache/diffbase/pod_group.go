@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodGroup(dbItem *mysql.PodGroup, seq int) {
+func (b *DataSet) AddPodGroup(dbItem *metadbmodel.PodGroup, seq int) {
 	b.PodGroups[dbItem.Lcuuid] = &PodGroup{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -36,12 +36,12 @@ func (b *DataSet) AddPodGroup(dbItem *mysql.PodGroup, seq int) {
 		AZLcuuid:        dbItem.AZ,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, b.PodGroups[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, b.PodGroups[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodGroup(lcuuid string) {
 	delete(b.PodGroups, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodGroup struct {

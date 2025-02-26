@@ -20,25 +20,50 @@ import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type Process struct {
-	UpdaterBase[cloudmodel.Process, mysql.Process, *diffbase.Process]
+	UpdaterBase[
+		cloudmodel.Process,
+		*diffbase.Process,
+		*metadbmodel.Process,
+		metadbmodel.Process,
+		*message.ProcessAdd,
+		message.ProcessAdd,
+		*message.ProcessUpdate,
+		message.ProcessUpdate,
+		*message.ProcessFieldsUpdate,
+		message.ProcessFieldsUpdate,
+		*message.ProcessDelete,
+		message.ProcessDelete]
 }
 
 func NewProcess(wholeCache *cache.Cache, cloudData []cloudmodel.Process) *Process {
 	updater := &Process{
-		UpdaterBase[cloudmodel.Process, mysql.Process, *diffbase.Process]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_PROCESS_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewProcess(),
-			diffBaseData: wholeCache.DiffBaseDataSet.Process,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.Process,
+			*diffbase.Process,
+			*metadbmodel.Process,
+			metadbmodel.Process,
+			*message.ProcessAdd,
+			message.ProcessAdd,
+			*message.ProcessUpdate,
+			message.ProcessUpdate,
+			*message.ProcessFieldsUpdate,
+			message.ProcessFieldsUpdate,
+			*message.ProcessDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_PROCESS_EN,
+			wholeCache,
+			db.NewProcess().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.Process,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -49,23 +74,8 @@ func (p *Process) getDiffBaseByCloudItem(cloudItem *cloudmodel.Process) (diffBas
 	return
 }
 
-func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*mysql.Process, bool) {
-	var deviceType, deviceID int
-	podID, ok := p.cache.ToolDataSet.GetPodIDByContainerID(cloudItem.ContainerID)
-	if len(cloudItem.ContainerID) != 0 && ok {
-		deviceType = common.VIF_DEVICE_TYPE_POD
-		deviceID = podID
-	} else {
-		var vtap *mysql.VTap
-		if err := mysql.Db.Where("id = ?", cloudItem.VTapID).First(&vtap).Error; err != nil {
-			log.Error(err)
-		}
-		if vtap != nil {
-			deviceType = common.VTAP_TYPE_TO_DEVICE_TYPE[vtap.Type]
-			deviceID = vtap.LaunchServerID
-		}
-	}
-
+func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*metadbmodel.Process, bool) {
+	deviceType, deviceID := p.cache.ToolDataSet.GetProcessDeviceTypeAndID(cloudItem.ContainerID, cloudItem.VTapID)
 	// add pod node id
 	var podNodeID int
 	if deviceType == common.VIF_DEVICE_TYPE_POD {
@@ -85,9 +95,12 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*mysql.Pro
 	var vmID int
 	if deviceType == common.VIF_DEVICE_TYPE_POD ||
 		deviceType == common.VIF_DEVICE_TYPE_POD_NODE {
-		id, ok := p.cache.ToolDataSet.GetVMIDByPodNodeID(podNodeID)
-		if ok {
-			vmID = id
+		if podNodeID != 0 {
+			id, ok := p.cache.ToolDataSet.GetVMIDByPodNodeID(podNodeID)
+			if ok {
+				vmID = id
+			}
+
 		}
 	} else {
 		vmID = deviceID
@@ -101,7 +114,7 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*mysql.Pro
 		vpcID = vmInfo.VPCID
 	}
 
-	dbItem := &mysql.Process{
+	dbItem := &metadbmodel.Process{
 		Name:        cloudItem.Name,
 		VTapID:      cloudItem.VTapID,
 		PID:         cloudItem.PID,
@@ -110,7 +123,7 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*mysql.Pro
 		UserName:    cloudItem.UserName,
 		ContainerID: cloudItem.ContainerID,
 		OSAPPTags:   cloudItem.OSAPPTags,
-		Domain:      p.cache.DomainLcuuid,
+		Domain:      p.metadata.Domain.Lcuuid,
 		SubDomain:   cloudItem.SubDomainLcuuid,
 		NetnsID:     cloudItem.NetnsID,
 		DeviceType:  deviceType,
@@ -124,20 +137,26 @@ func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*mysql.Pro
 	return dbItem, true
 }
 
-func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *cloudmodel.Process) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *cloudmodel.Process) (*message.ProcessFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.ProcessFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.OSAPPTags != cloudItem.OSAPPTags {
-		updateInfo["os_app_tags"] = cloudItem.OSAPPTags
+		mapInfo["os_app_tags"] = cloudItem.OSAPPTags
+		structInfo.OSAPPTags.Set(diffBase.OSAPPTags, cloudItem.OSAPPTags)
 	}
 	if diffBase.ContainerID != cloudItem.ContainerID {
-		updateInfo["container_id"] = cloudItem.ContainerID
+		mapInfo["container_id"] = cloudItem.ContainerID
+		structInfo.ContainerID.Set(diffBase.ContainerID, cloudItem.ContainerID)
+	}
+	deviceType, deviceID := p.cache.ToolDataSet.GetProcessDeviceTypeAndID(cloudItem.ContainerID, cloudItem.VTapID)
+	if diffBase.DeviceType != deviceType || diffBase.DeviceID != deviceID {
+		mapInfo["devicetype"] = deviceType
+		mapInfo["deviceid"] = deviceID
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

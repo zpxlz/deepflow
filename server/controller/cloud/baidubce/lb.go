@@ -24,19 +24,20 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getLoadBalances(region model.Region, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
+func (b *BaiduBce) getLoadBalances(vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
 	[]model.LB, []model.VInterface, []model.IP, error,
 ) {
 	var retLBs []model.LB
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get lbs starting")
+	log.Debug("get lbs starting", logger.NewORGPrefix(b.orgID))
 
 	// 普通型负载均衡器
-	tmpLBs, tmpVInterfaces, tmpIPs, err := b.getBLoadBalances(region, vpcIdToLcuuid, networkIdToLcuuid)
+	tmpLBs, tmpVInterfaces, tmpIPs, err := b.getBLoadBalances(vpcIdToLcuuid, networkIdToLcuuid)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -45,7 +46,7 @@ func (b *BaiduBce) getLoadBalances(region model.Region, vpcIdToLcuuid map[string
 	retIPs = append(retIPs, tmpIPs...)
 
 	// 应用型负载均衡器
-	tmpLBs, tmpVInterfaces, tmpIPs, err = b.getAppBLoadBalances(region, vpcIdToLcuuid, networkIdToLcuuid)
+	tmpLBs, tmpVInterfaces, tmpIPs, err = b.getAppBLoadBalances(vpcIdToLcuuid, networkIdToLcuuid)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -53,18 +54,18 @@ func (b *BaiduBce) getLoadBalances(region model.Region, vpcIdToLcuuid map[string
 	retVInterfaces = append(retVInterfaces, tmpVInterfaces...)
 	retIPs = append(retIPs, tmpIPs...)
 
-	log.Debug("get lbs complete")
+	log.Debug("get lbs complete", logger.NewORGPrefix(b.orgID))
 	return retLBs, retVInterfaces, retIPs, nil
 }
 
-func (b *BaiduBce) getBLoadBalances(region model.Region, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
+func (b *BaiduBce) getBLoadBalances(vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
 	[]model.LB, []model.VInterface, []model.IP, error,
 ) {
 	var retLBs []model.LB
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get blbs starting")
+	log.Debug("get blbs starting", logger.NewORGPrefix(b.orgID))
 
 	blbClient, _ := blb.NewClient(b.secretID, b.secretKey, "blb."+b.endpoint)
 	blbClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -76,7 +77,7 @@ func (b *BaiduBce) getBLoadBalances(region model.Region, vpcIdToLcuuid map[strin
 		startTime := time.Now()
 		result, err := blbClient.DescribeLoadBalancers(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("blbDescribeLoadBalancers", len(result.BlbList), startTime)
@@ -92,45 +93,43 @@ func (b *BaiduBce) getBLoadBalances(region model.Region, vpcIdToLcuuid map[strin
 		for _, lb := range r.BlbList {
 			vpcLcuuid, ok := vpcIdToLcuuid[lb.VpcId]
 			if !ok {
-				log.Debugf("lb (%s) vpc (%s) not found", lb.BlbId, lb.VpcId)
+				log.Debugf("lb (%s) vpc (%s) not found", lb.BlbId, lb.VpcId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			networkLcuuid, ok := networkIdToLcuuid[lb.SubnetId]
 			if !ok {
-				log.Debugf("lb (%s) network (%s) not found", lb.BlbId, lb.SubnetId)
+				log.Debugf("lb (%s) network (%s) not found", lb.BlbId, lb.SubnetId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
-			lbLcuuid := common.GenerateUUID(lb.BlbId)
+			lbLcuuid := common.GenerateUUIDByOrgID(b.orgID, lb.BlbId)
 			retLB := model.LB{
 				Lcuuid:       lbLcuuid,
 				Name:         lb.Name,
 				Label:        lb.BlbId,
 				Model:        common.LB_MODEL_INTERNAL,
 				VPCLcuuid:    vpcLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			}
 			retLBs = append(retLBs, retLB)
-			b.regionLcuuidToResourceNum[retLB.RegionLcuuid]++
 
 			tmpVInterfaces, tmpIPs := b.getLBVInterfaceAndIPs(
-				region, vpcLcuuid, networkLcuuid, lbLcuuid, lb.Address, lb.PublicIp,
+				vpcLcuuid, networkLcuuid, lbLcuuid, lb.Address, lb.PublicIp,
 			)
 			retVInterfaces = append(retVInterfaces, tmpVInterfaces...)
 			retIPs = append(retIPs, tmpIPs...)
 		}
 	}
-	log.Debug("get blbs complete")
+	log.Debug("get blbs complete", logger.NewORGPrefix(b.orgID))
 	return retLBs, retVInterfaces, retIPs, nil
 }
 
-func (b *BaiduBce) getAppBLoadBalances(region model.Region, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
-	[]model.LB, []model.VInterface, []model.IP, error,
-) {
+func (b *BaiduBce) getAppBLoadBalances(vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) (
+	[]model.LB, []model.VInterface, []model.IP, error) {
 	var retLBs []model.LB
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get app_blbs starting")
+	log.Debug("get app_blbs starting", logger.NewORGPrefix(b.orgID))
 
 	appblbClient, _ := appblb.NewClient(b.secretID, b.secretKey, "blb."+b.endpoint)
 	appblbClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -142,7 +141,7 @@ func (b *BaiduBce) getAppBLoadBalances(region model.Region, vpcIdToLcuuid map[st
 		startTime := time.Now()
 		result, err := appblbClient.DescribeLoadBalancers(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("appblbDescribeLoadBalancers", len(result.BlbList), startTime)
@@ -158,47 +157,44 @@ func (b *BaiduBce) getAppBLoadBalances(region model.Region, vpcIdToLcuuid map[st
 		for _, lb := range r.BlbList {
 			vpcLcuuid, ok := vpcIdToLcuuid[lb.VpcId]
 			if !ok {
-				log.Debugf("lb (%s) vpc (%s) not found", lb.BlbId, lb.VpcId)
+				log.Debugf("lb (%s) vpc (%s) not found", lb.BlbId, lb.VpcId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			networkLcuuid, ok := networkIdToLcuuid[lb.SubnetId]
 			if !ok {
-				log.Debugf("lb (%s) network (%s) not found", lb.BlbId, lb.SubnetId)
+				log.Debugf("lb (%s) network (%s) not found", lb.BlbId, lb.SubnetId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
-			lbLcuuid := common.GenerateUUID(lb.BlbId)
+			lbLcuuid := common.GenerateUUIDByOrgID(b.orgID, lb.BlbId)
 			retLB := model.LB{
 				Lcuuid:       lbLcuuid,
 				Name:         lb.Name,
 				Label:        lb.BlbId,
 				Model:        common.LB_MODEL_INTERNAL,
 				VPCLcuuid:    vpcLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			}
 			retLBs = append(retLBs, retLB)
-			b.regionLcuuidToResourceNum[retLB.RegionLcuuid]++
 
 			tmpVInterfaces, tmpIPs := b.getLBVInterfaceAndIPs(
-				region, vpcLcuuid, networkLcuuid, lbLcuuid, lb.Address, lb.PublicIp,
+				vpcLcuuid, networkLcuuid, lbLcuuid, lb.Address, lb.PublicIp,
 			)
 			retVInterfaces = append(retVInterfaces, tmpVInterfaces...)
 			retIPs = append(retIPs, tmpIPs...)
 		}
 	}
-	log.Debug("get app_blbs complete")
+	log.Debug("get app_blbs complete", logger.NewORGPrefix(b.orgID))
 	return retLBs, retVInterfaces, retIPs, nil
 }
 
-func (b *BaiduBce) getLBVInterfaceAndIPs(
-	region model.Region, vpcLcuuid, networkLcuuid, lbLcuuid, ip, publicIP string,
-) ([]model.VInterface, []model.IP) {
+func (b *BaiduBce) getLBVInterfaceAndIPs(vpcLcuuid, networkLcuuid, lbLcuuid, ip, publicIP string) ([]model.VInterface, []model.IP) {
 
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
 	// 内网接口+IP
 	if ip != "" {
-		vinterfaceLcuuid := common.GenerateUUID(lbLcuuid + ip)
+		vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, lbLcuuid+ip)
 		retVInterfaces = append(retVInterfaces, model.VInterface{
 			Lcuuid:        vinterfaceLcuuid,
 			Type:          common.VIF_TYPE_LAN,
@@ -207,20 +203,20 @@ func (b *BaiduBce) getLBVInterfaceAndIPs(
 			DeviceType:    common.VIF_DEVICE_TYPE_LB,
 			NetworkLcuuid: networkLcuuid,
 			VPCLcuuid:     vpcLcuuid,
-			RegionLcuuid:  region.Lcuuid,
+			RegionLcuuid:  b.regionLcuuid,
 		})
 		retIPs = append(retIPs, model.IP{
-			Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + ip),
+			Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+ip),
 			VInterfaceLcuuid: vinterfaceLcuuid,
 			IP:               ip,
-			SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-			RegionLcuuid:     region.Lcuuid,
+			SubnetLcuuid:     common.GenerateUUIDByOrgID(b.orgID, networkLcuuid),
+			RegionLcuuid:     b.regionLcuuid,
 		})
 	}
 
 	// 公网接口+IP
 	if publicIP != "" {
-		vinterfaceLcuuid := common.GenerateUUID(lbLcuuid + publicIP)
+		vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, lbLcuuid+publicIP)
 		retVInterfaces = append(retVInterfaces, model.VInterface{
 			Lcuuid:        vinterfaceLcuuid,
 			Type:          common.VIF_TYPE_WAN,
@@ -229,13 +225,13 @@ func (b *BaiduBce) getLBVInterfaceAndIPs(
 			DeviceType:    common.VIF_DEVICE_TYPE_LB,
 			NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 			VPCLcuuid:     vpcLcuuid,
-			RegionLcuuid:  region.Lcuuid,
+			RegionLcuuid:  b.regionLcuuid,
 		})
 		retIPs = append(retIPs, model.IP{
-			Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + publicIP),
+			Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+publicIP),
 			VInterfaceLcuuid: vinterfaceLcuuid,
 			IP:               publicIP,
-			RegionLcuuid:     region.Lcuuid,
+			RegionLcuuid:     b.regionLcuuid,
 		})
 	}
 	return retVInterfaces, retIPs

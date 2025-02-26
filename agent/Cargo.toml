@@ -6,24 +6,40 @@ default-run = "deepflow-agent"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[workspace]
+members = ["crates/*", "plugins/packet_segmentation_reassembly"]
+exclude = [
+    "src/ebpf/samples/rust/profiler",
+    "src/ebpf/samples/rust/socket-tracer",
+]
+
+[workspace.dependencies]
+k8s-openapi = { version = "0.16", features = ["v1_19", "schemars"] }
+kube = { version = "0.77", default-features = false }
+prost = "0.11"
+regex = "1"
 
 [dependencies]
-ahash = "0.8.3"
+ahash = "0.8"
 anyhow = "1.0"
 arc-swap = "1.5.0"
-base64 = "0.13.0"
+base64 = "0.21"
 bincode = "2.0.0-rc.1"
 bitflags = "1.3.2"
+bollard = "0.16.1"
 bson = "2.7.0"
 bytesize = "1.1.0"
 cadence = "0.27.0"
+cfg-if = "1.0"
 chrono = "0.4"
 clap = { version = "3.2.8", features = ["derive"] }
 cloud_platform = { path = "plugins/cloud_platform" }
 dashmap = "5.3.3"
 dns-lookup = "1.0.8"
 elf = "0.4.0"
+enterprise-utils = { path = "crates/enterprise-utils", optional = true }
 enum_dispatch = "0.3.7"
+envmnt = "0.10.4"
 flate2 = "1.0.23"
 # the feature flag fixes the following problem:
 #
@@ -39,8 +55,11 @@ http = "0.2.5"
 http2 = { path = "plugins/http2" }
 humantime-serde = "1.0"
 hyper = { version = "0.14", features = ["full"] }
+integration_skywalking = { path = "plugins/integration_skywalking" }
+integration_vector = { path = "plugins/integration_vector" }
 ipnet = "2.4.0"
 ipnetwork = "0.18.0"
+lazy_static = "1.5.0"
 l7 = { path = "plugins/l7" }
 libc = "0.2.103"
 log = "0.4"
@@ -49,18 +68,20 @@ md-5 = "0.10.1"
 nom = "7.1.1"
 npb_handler = { path = "plugins/npb_handler" }
 npb_pcap_policy = { path = "plugins/npb_pcap_policy" }
+npb_sender = { path = "plugins/npb_sender" }
 num_enum = "0.5.7"
 packet_dedup = { path = "plugins/packet_dedup" }
+packet_segmentation_reassembly = { path = "plugins/packet_segmentation_reassembly" }
 packet_sequence_block = { path = "plugins/packet_sequence_block" }
 page_size = "0.4.2"
 parking_lot = "0.11"
 pcap_assembler = { path = "plugins/pcap_assembler" }
 pcap-sys = "0.1.3"
 pnet = "^0.29"
-prost = "0.11.0"
+prost.workspace = true
 public = { path = "crates/public" }
 rand = "0.8.5"
-regex = "1"
+regex.workspace = true
 reqwest = { version = "0.11", default-features = false, features = [
     "blocking",
     "json",
@@ -70,7 +91,7 @@ ring = "0.16.20"
 roxmltree = "0.14.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.72"
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 signal-hook = "0.3"
 socket2 = "0.4.4"
 special_recv_engine = { path = "plugins/special_recv_engine" }
@@ -79,31 +100,32 @@ thiserror = "1.0"
 time = "0.3.9"
 tokio = { version = "1.20.1", features = ["full"] }
 tonic = "0.8.1"
-envmnt = "0.10.4"
+tunnel = { path = "plugins/tunnel" }
 wasmtime = "12.0.1"
 wasmtime-wasi = "12.0.1"
+zstd = "0.13.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 cgroups-rs = "0.2.9"
 nix = "0.23"
 pcap = "0.9.1"
+# As of procfs 0.16.0, Process::fd().iter() still not giving correct results on kernel 2.6.32
+# ref: https://github.com/eminence/procfs/pull/241
 procfs = { git = "https://github.com/deepflowio/procfs/" }
+reorder = { path = "plugins/reorder" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-k8s-openapi = { version = "^0.15", features = ["v1_19", "schemars"] }
-kube = { version = "0.74", default-features = false, features = [
+k8s-openapi.workspace = true
+kube = { workspace = true, features = [
     "client",
     "derive",
     "runtime",
     "rustls-tls",
 ] }
-kube-derive = "0.74"
-openshift-openapi = { version = "0.3.1", features = ["v4_6"] }
+kube-derive = "0.77"
+openshift-openapi = { version = "0.3.1", features = ["v4_5"] }
 schemars = "0.8"
-
-[patch.crates-io]
-kube = { git = "https://github.com/deepflowio/kube", tag = "0.74.2" }
-openshift-openapi = { git = "https://github.com/deepflowio/openshift-openapi.git" }
+trace-utils = { path = "crates/trace-utils" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pcap = "0.10.1"
@@ -130,11 +152,16 @@ tempfile = "3.2.0"
 uluru = "3.0.0"
 
 [build-dependencies]
+anyhow = "1.0"
 chrono = "0.4"
-dunce = "0.1.1"
+dunce = "1"
 tonic-build = "0.8.0"
+walkdir = "2"
 
 [features]
+enterprise = ["extended_observability", "enterprise-utils"]
+extended_observability = []
+dylib_pcap = []
 
 [[bench]]
 name = "common"
@@ -161,5 +188,3 @@ panic = 'abort'
 
 [profile.dev]
 panic = 'abort'
-debug-assertions = false
-overflow-checks = false

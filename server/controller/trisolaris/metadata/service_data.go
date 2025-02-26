@@ -24,7 +24,8 @@ import (
 
 	"github.com/deepflowio/deepflow/message/trident"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	models "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	. "github.com/deepflowio/deepflow/server/controller/trisolaris/dbcache"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 )
 
@@ -48,6 +49,7 @@ type ServiceDataOP struct {
 	serviceRawData *ServiceRawData
 	metaData       *MetaData
 	services       []*trident.ServiceInfo
+	ORGID
 }
 
 func newServiceDataOP(metaData *MetaData) *ServiceDataOP {
@@ -55,6 +57,7 @@ func newServiceDataOP(metaData *MetaData) *ServiceDataOP {
 		serviceRawData: newServiceRawData(),
 		metaData:       metaData,
 		services:       []*trident.ServiceInfo{},
+		ORGID:          metaData.ORGID,
 	}
 }
 
@@ -210,15 +213,14 @@ func (s *ServiceDataOP) generateService() {
 		podServiceID := rData.podGroupIDToPodServiceID[podGroup.ID]
 		keyToPorts := make(map[GroupKey][]uint32)
 		for _, port := range ports {
-			if port.PodServiceID != podServiceID {
-				continue
-			}
 			key := GroupKey{
 				protocol:     getProtocol(port.Protocol),
-				podServiceID: port.PodServiceID,
+				podServiceID: podServiceID,
 			}
-			if _, ok := keyToPorts[key]; ok {
-				keyToPorts[key] = append(keyToPorts[key], uint32(port.Port))
+			if ports, ok := keyToPorts[key]; ok {
+				if Find[uint32](ports, uint32(port.Port)) != true {
+					keyToPorts[key] = append(keyToPorts[key], uint32(port.Port))
+				}
 			} else {
 				groupKeys = append(groupKeys, key)
 				keyToPorts[key] = []uint32{uint32(port.Port)}
@@ -246,7 +248,7 @@ func (s *ServiceDataOP) generateService() {
 			continue
 		}
 		if podService.ServiceClusterIP == "" {
-			log.Debugf("pod service(id=%d) has no service_cluster_ip", podService.ID)
+			log.Debugf(s.Logf("pod service(id=%d) has no service_cluster_ip", podService.ID))
 			continue
 		}
 		protocols := []trident.ServiceProtocol{}
@@ -259,7 +261,7 @@ func (s *ServiceDataOP) generateService() {
 				protocols = append(protocols, protocol)
 				protocolToPorts[protocol] = []uint32{uint32(podServiceport.Port)}
 			}
-			if podService.Type == POD_SERVICE_TYPE_NODEPORT {
+			if podService.Type == POD_SERVICE_TYPE_NODEPORT || podService.Type == POD_SERVICE_TYPE_LOADBALANCER {
 				key := NodeKey{
 					podClusterID: podService.PodClusterID,
 					protocol:     protocol,
@@ -323,7 +325,7 @@ func (s *ServiceDataOP) generateService() {
 		vpcID := rData.lbIDToVPCID[lbts.LBID]
 		var ips []string
 		if lbts.IP == "" {
-			log.Debugf("lb_target_server(id=%d) has no ips", lbts.ID)
+			log.Debugf(s.Logf("lb_target_server(id=%d) has no ips", lbts.ID))
 			continue
 		} else {
 			ips = []string{lbts.IP}
@@ -340,7 +342,7 @@ func (s *ServiceDataOP) generateService() {
 		services = append(services, service)
 	}
 	s.services = services
-	log.Debugf("service have %d", len(s.services))
+	log.Debugf(s.Logf("service have %d", len(s.services)))
 }
 
 func (s *ServiceDataOP) GetServiceData() []*trident.ServiceInfo {

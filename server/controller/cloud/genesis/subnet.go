@@ -20,26 +20,19 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getSubnets() ([]model.Subnet, error) {
-	log.Debug("get subnets starting")
+	log.Debug("get subnets starting", logger.NewORGPrefix(g.orgID))
 	subnets := []model.Subnet{}
 
 	g.cloudStatsd.RefreshAPIMoniter("subnets", len(g.subnets), time.Time{})
 
 	for _, s := range g.subnets {
 		if s.NetworkLcuuid == "" {
-			log.Debug("network lcuuid not found")
+			log.Debug("network lcuuid not found", logger.NewORGPrefix(g.orgID))
 			continue
-		}
-		vpcLcuuid := s.VPCLcuuid
-		if vpcLcuuid == "" {
-			vpcLcuuid = common.GetUUID(g.defaultVpcName, uuid.Nil)
-			g.defaultVpc = true
 		}
 		subnetName := s.Name
 		if subnetName == "" {
@@ -49,11 +42,11 @@ func (g *Genesis) getSubnets() ([]model.Subnet, error) {
 			Lcuuid:        s.Lcuuid,
 			Name:          subnetName,
 			CIDR:          s.CIDR,
-			VPCLcuuid:     vpcLcuuid,
+			VPCLcuuid:     s.VPCLcuuid,
 			NetworkLcuuid: s.NetworkLcuuid,
 		}
 		subnets = append(subnets, subnet)
 	}
-	log.Debug("get subnets complete")
+	log.Debug("get subnets complete", logger.NewORGPrefix(g.orgID))
 	return subnets, nil
 }

@@ -20,12 +20,11 @@ import (
 	"net"
 	"os"
 
-	"github.com/op/go-logging"
-
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/config")
+var log = logger.MustGetLogger("trisolaris.config")
 
 type Chrony struct {
 	Host    string `default:"chrony" yaml:"host"`
@@ -40,7 +39,8 @@ type Config struct {
 	Chrony                         Chrony   `yaml:"chrony"`
 	SelfUpdateUrl                  string   `default:"grpc" yaml:"self-update-url"`
 	RemoteApiTimeout               uint16   `default:"30" yaml:"remote-api-timeout"`
-	TridentTypeForUnkonwVtap       uint16   `default:"0" yaml:"trident-type-for-unkonw-vtap"`
+	TridentTypeForUnknowVtap       uint16   `default:"0" yaml:"trident-type-for-unknow-vtap"`
+	OldTridentTypeForUnknowVtap    uint16   `default:"0" yaml:"trident-type-for-unkonw-vtap"` // Compatible with older configurations
 	PlatformVips                   []string `yaml:"platform-vips"`
 	NodeType                       string   `default:"master" yaml:"node-type"`
 	RegionDomainPrefix             string   `yaml:"region-domain-prefix"`
@@ -58,9 +58,20 @@ type Config struct {
 	IngesterPort                   int
 	PodClusterInternalIPToIngester int
 	GrpcMaxMessageLength           int
+	ExportersEnabled               bool
+	PlatformDataRefreshDelayTime   int `default:"1" yaml:"platform-data-refresh-delay-time"`
+	ORGDataRefreshInterval         int `default:"60" yaml:"org-data-refresh-interval"`
+	NoTeamIDRefused                bool
+	FPermit                        common.FPermit
+	IngesterAPI                    common.IngesterApi // data source
+	AllAgentConnectToNatIP         bool
+	NoIPOverlapping                bool
 }
 
 func (c *Config) Convert() {
+	if c.OldTridentTypeForUnknowVtap != 0 && c.TridentTypeForUnknowVtap == 0 {
+		c.TridentTypeForUnknowVtap = c.OldTridentTypeForUnknowVtap
+	}
 	if c.Chrony.Host != "" {
 		if value, ok := os.LookupEnv(c.Chrony.Host); ok {
 			c.Chrony.Host = value
@@ -80,6 +91,22 @@ func (c *Config) Convert() {
 	}
 }
 
+func (c *Config) SetAllAgentConnectToNatIP(data bool) {
+	c.AllAgentConnectToNatIP = data
+}
+
+func (c *Config) GetAllAgentConnectToNatIP() bool {
+	return c.AllAgentConnectToNatIP
+}
+
+func (c *Config) SetNoIPOverlapping(data bool) {
+	c.NoIPOverlapping = data
+}
+
+func (c *Config) GetNoIPOverlapping() bool {
+	return c.NoIPOverlapping
+}
+
 func (c *Config) SetGrpcPort(port int) {
 	c.GrpcPort = port
 }
@@ -94,6 +121,14 @@ func (c *Config) GetGrpcPort() int {
 
 func (c *Config) GetIngesterPort() int {
 	return c.IngesterPort
+}
+
+func (c *Config) SetIngesterAPI(ingesterAPI common.IngesterApi) {
+	c.IngesterAPI = ingesterAPI
+}
+
+func (c *Config) GetIngesterAPI() common.IngesterApi {
+	return c.IngesterAPI
 }
 
 func (c *Config) SetLogLevel(logLevel string) {
@@ -114,4 +149,28 @@ func (c *Config) SetGrpcMaxMessageLength(maxLen int) {
 
 func (c *Config) GetGrpcMaxMessageLength() int {
 	return c.GrpcMaxMessageLength
+}
+
+func (c *Config) SetExportersEnabled(exporterEnabled bool) {
+	c.ExportersEnabled = exporterEnabled
+}
+
+func (c *Config) GetExportersEnabled() bool {
+	return c.ExportersEnabled
+}
+
+func (c *Config) SetNoTeamIDRefused(refused bool) {
+	c.NoTeamIDRefused = refused
+}
+
+func (c *Config) GetNoTeamIDRefused() bool {
+	return c.NoTeamIDRefused
+}
+
+func (c *Config) SetFPermitConfig(fpermit common.FPermit) {
+	c.FPermit = fpermit
+}
+
+func (c *Config) GetFPermitConfig() common.FPermit {
+	return c.FPermit
 }

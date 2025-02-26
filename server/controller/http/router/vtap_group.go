@@ -21,8 +21,9 @@ import (
 	"github.com/gin-gonic/gin/binding"
 
 	"github.com/deepflowio/deepflow/server/controller/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/common"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/router/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	"github.com/deepflowio/deepflow/server/controller/model"
 )
@@ -36,33 +37,48 @@ func NewVtapGroup(cfg *config.ControllerConfig) *VtapGroup {
 }
 
 func (v *VtapGroup) RegisterTo(e *gin.Engine) {
-	e.GET("/v1/vtap-groups/:lcuuid/", getVtapGroup)
-	e.GET("/v1/vtap-groups/", getVtapGroups)
-	e.POST("/v1/vtap-groups/", createVtapGroup(v.cfg))
-	e.PATCH("/v1/vtap-groups/:lcuuid/", updateVtapGroup(v.cfg))
-	e.DELETE("/v1/vtap-groups/:lcuuid/", deleteVtapGroup)
+	e.GET("/v1/vtap-groups/:lcuuid/", v.getVtapGroup())
+	e.GET("/v1/vtap-groups/", v.getVtapGroups())
+	e.POST("/v1/vtap-groups/", v.createVtapGroup())
+	e.PATCH("/v1/vtap-groups/:lcuuid/", v.updateVtapGroup())
+	e.DELETE("/v1/vtap-groups/:lcuuid/", v.deleteVtapGroup())
 }
 
-func getVtapGroup(c *gin.Context) {
-	args := make(map[string]interface{})
-	args["lcuuid"] = c.Param("lcuuid")
-	data, err := service.GetVtapGroups(args)
-	JsonResponse(c, data, err)
-}
-
-func getVtapGroups(c *gin.Context) {
-	args := make(map[string]interface{})
-	if value, ok := c.GetQuery("name"); ok {
-		args["name"] = value
+func (v *VtapGroup) getVtapGroup() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		args := make(map[string]interface{})
+		args["lcuuid"] = c.Param("lcuuid")
+		agentGroupService := service.NewAgentGroup(httpcommon.GetUserInfo(c), v.cfg)
+		data, err := agentGroupService.Get(args)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	}
-	if value, ok := c.GetQuery("short_uuid"); ok {
-		args["short_uuid"] = value
-	}
-	data, err := service.GetVtapGroups(args)
-	JsonResponse(c, data, err)
 }
 
-func createVtapGroup(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (v *VtapGroup) getVtapGroups() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		args := make(map[string]interface{})
+		if value, ok := c.GetQuery("name"); ok {
+			args["name"] = value
+		}
+		if value, ok := c.GetQuery("short_uuid"); ok {
+			args["short_uuid"] = value
+		}
+		if value, ok := c.GetQuery("team_id"); ok {
+			args["team_id"] = value
+		}
+		if value, ok := c.GetQuery("user_id"); ok {
+			args["user_id"] = value
+		}
+		if value, ok := c.GetQuery("can_deleted"); ok {
+			args["can_deleted"] = value
+		}
+		agentGroupService := service.NewAgentGroup(httpcommon.GetUserInfo(c), v.cfg)
+		data, err := agentGroupService.Get(args)
+		response.JSON(c, response.SetData(data), response.SetError(err))
+	}
+}
+
+func (v *VtapGroup) createVtapGroup() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		var err error
 		var vtapGroupCreate model.VtapGroupCreate
@@ -70,42 +86,51 @@ func createVtapGroup(cfg *config.ControllerConfig) gin.HandlerFunc {
 		// 参数校验
 		err = c.ShouldBindBodyWith(&vtapGroupCreate, binding.JSON)
 		if err != nil {
-			BadRequestResponse(c, httpcommon.INVALID_POST_DATA, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(err))
 			return
 		}
+		if vtapGroupCreate.TeamID == 0 {
+			vtapGroupCreate.TeamID = common.DEFAULT_TEAM_ID
+		}
 
-		data, err := service.CreateVtapGroup(vtapGroupCreate, cfg)
-		JsonResponse(c, data, err)
+		agentGroupService := service.NewAgentGroup(httpcommon.GetUserInfo(c), v.cfg)
+		data, err := agentGroupService.Create(vtapGroupCreate)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
-func updateVtapGroup(cfg *config.ControllerConfig) gin.HandlerFunc {
+func (v *VtapGroup) updateVtapGroup() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
 		var err error
 		var vtapGroupUpdate model.VtapGroupUpdate
 
-		// 参数校验
 		err = c.ShouldBindBodyWith(&vtapGroupUpdate, binding.JSON)
 		if err != nil {
-			BadRequestResponse(c, httpcommon.INVALID_PARAMETERS, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(err))
 			return
 		}
 
 		// 接收参数
 		// 避免struct会有默认值，这里转为map作为函数入参
 		patchMap := map[string]interface{}{}
-		c.ShouldBindBodyWith(&patchMap, binding.JSON)
+		if err := c.ShouldBindBodyWith(&patchMap, binding.JSON); err != nil {
+			response.JSON(c, response.SetOptStatus(httpcommon.SERVER_ERROR), response.SetError(err))
+			return
+		}
 
-		lcuuid := c.Param("lcuuid")
-		data, err := service.UpdateVtapGroup(lcuuid, patchMap, cfg)
-		JsonResponse(c, data, err)
+		agentGroupService := service.NewAgentGroup(httpcommon.GetUserInfo(c), v.cfg)
+		data, err := agentGroupService.Update(c.Param("lcuuid"), patchMap, v.cfg)
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
-func deleteVtapGroup(c *gin.Context) {
-	var err error
+func (v *VtapGroup) deleteVtapGroup() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var err error
 
-	lcuuid := c.Param("lcuuid")
-	data, err := service.DeleteVtapGroup(lcuuid)
-	JsonResponse(c, data, err)
+		lcuuid := c.Param("lcuuid")
+		agentGroupService := service.NewAgentGroup(httpcommon.GetUserInfo(c), v.cfg)
+		data, err := agentGroupService.Delete(lcuuid)
+		response.JSON(c, response.SetData(data), response.SetError(err))
+	}
 }

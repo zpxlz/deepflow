@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddFloatingIP(dbItem *mysql.FloatingIP, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddFloatingIP(dbItem *metadbmodel.FloatingIP, seq int, toolDataSet *tool.DataSet) {
 	vpcLcuuid, _ := toolDataSet.GetVPCLcuuidByID(dbItem.VPCID)
 	b.FloatingIPs[dbItem.Lcuuid] = &FloatingIP{
 		DiffBase: DiffBase{
@@ -33,12 +33,12 @@ func (b *DataSet) AddFloatingIP(dbItem *mysql.FloatingIP, seq int, toolDataSet *
 		RegionLcuuid: dbItem.Region,
 		VPCLcuuid:    vpcLcuuid,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, b.FloatingIPs[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, b.FloatingIPs[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteFloatingIP(lcuuid string) {
 	delete(b.FloatingIPs, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type FloatingIP struct {

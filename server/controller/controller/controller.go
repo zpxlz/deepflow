@@ -29,25 +29,26 @@ import (
 	servercommon "github.com/deepflowio/deepflow/server/common"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
 	"github.com/deepflowio/deepflow/server/controller/db/redis"
 	"github.com/deepflowio/deepflow/server/controller/election"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/grpc"
+	_ "github.com/deepflowio/deepflow/server/controller/grpc/controller"
+	_ "github.com/deepflowio/deepflow/server/controller/grpc/synchronizer"
 	"github.com/deepflowio/deepflow/server/controller/http"
 	"github.com/deepflowio/deepflow/server/controller/http/router"
 	"github.com/deepflowio/deepflow/server/controller/manager"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
+	"github.com/deepflowio/deepflow/server/controller/native_field"
 	"github.com/deepflowio/deepflow/server/controller/prometheus"
 	"github.com/deepflowio/deepflow/server/controller/recorder"
+	"github.com/deepflowio/deepflow/server/controller/recorder/event"
 	"github.com/deepflowio/deepflow/server/controller/report"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
 	"github.com/deepflowio/deepflow/server/controller/tagrecorder"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris"
-
-	_ "github.com/deepflowio/deepflow/server/controller/grpc/controller"
-	_ "github.com/deepflowio/deepflow/server/controller/grpc/synchronizer"
-	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/grpc/debug"
+	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/grpc/agentdebug"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/grpc/healthcheck"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/http/cache"
 	_ "github.com/deepflowio/deepflow/server/controller/trisolaris/services/http/upgrade"
@@ -83,24 +84,23 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	isMasterController := IsMasterController(cfg)
 	if isMasterController {
-		router.SetInitStageForHealthChecker("MySQL migration")
+		router.SetInitStageForHealthChecker(router.StageMySQLMigration)
 		migrateMySQL(cfg)
 	}
 
 	router.SetInitStageForHealthChecker("MySQL init")
 	// 初始化MySQL
-	err := mysql.InitMySQL(cfg.MySqlCfg)
-	if err != nil {
-		log.Errorf("init mysql failed: %s", err.Error())
+	if err := metadb.GetDBs().Init(cfg.MetadbCfg); err != nil {
+		log.Errorf("init metadb failed: %s", err.Error())
 		time.Sleep(time.Second)
 		os.Exit(0)
 	}
 
 	// 启动资源ID管理器
 	router.SetInitStageForHealthChecker("Resource ID manager init")
-	recorderResource := recorder.GetSingletonResource().Init(&cfg.ManagerCfg.TaskCfg.RecorderCfg)
+	recorderResource := recorder.GetResource().Init(ctx, cfg.ManagerCfg.TaskCfg.RecorderCfg)
 	if isMasterController {
-		err := recorderResource.IDManager.Start()
+		err := recorderResource.IDManagers.Start(ctx)
 		if err != nil {
 			log.Errorf("resource id manager start failed: %s", err.Error())
 			time.Sleep(time.Second)
@@ -126,37 +126,53 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	router.SetInitStageForHealthChecker("Genesis init")
 	// 启动genesis
-	g := genesis.NewGenesis(cfg)
-	g.Start()
+	g := genesis.NewGenesis(ctx, cfg)
+
+	// start tagrecorder before manager to prevent recorder from publishing message when tagrecorder is not ready
+	router.SetInitStageForHealthChecker("TagRecorder init")
+	tr := tagrecorder.GetSingleton()
+	tr.Init(ctx, *cfg)
+	if err := tr.SubscriberManager.Start(); err != nil {
+		log.Errorf("get icon failed: %s", err.Error())
+		time.Sleep(time.Second)
+		os.Exit(0)
+	}
 
 	router.SetInitStageForHealthChecker("Manager init")
 	// 启动resource manager
 	// 每个云平台启动一个cloud和recorder
-	m := manager.NewManager(cfg.ManagerCfg, shared.ResourceEventQueue)
+	err := event.GetSubscriberManager().Start(shared.ResourceEventQueue)
+	if err != nil {
+		log.Errorf("resource event subscriber manager start failed: %s", err.Error())
+		time.Sleep(time.Second)
+		os.Exit(0)
+	}
+	m := manager.NewManager(cfg.ManagerCfg)
 	m.Start()
 
 	router.SetInitStageForHealthChecker("Trisolaris init")
 	// 启动trisolaris
-	t := trisolaris.NewTrisolaris(&cfg.TrisolarisCfg, mysql.Db)
-	go t.Start()
+	tm := trisolaris.NewTrisolarisManager(&cfg.TrisolarisCfg, metadb.DefaultDB.DB)
+	go tm.Start()
 
 	router.SetInitStageForHealthChecker("Prometheus init")
 	prometheus := prometheus.GetSingleton()
-	prometheus.SynchronizerCache.Start(ctx, &cfg.PrometheusCfg)
-	prometheus.Encoder.Init(ctx, &cfg.PrometheusCfg)
-	prometheus.Clear.Init(ctx, &cfg.PrometheusCfg)
+	prometheus.SynchronizerCaches.Start(ctx, &cfg.PrometheusCfg)
+	prometheus.Encoders.Init(ctx, cfg.PrometheusCfg)
+	prometheus.Clear.Init(ctx, cfg.PrometheusCfg)
+	// prometheus.APPLabelLayoutUpdater.Init(ctx, &cfg.PrometheusCfg)
 	if isMasterController {
-		prometheus.Encoder.Start()
+		prometheus.Encoders.Start(ctx)
 	}
 
-	router.SetInitStageForHealthChecker("TagRecorder init")
-	tr := tagrecorder.NewTagRecorder(*cfg, ctx)
-	go checkAndStartAllRegionMasterFunctions(tr)
+	go checkAndStartAllRegionMasterFunctions(ctx)
 
 	router.SetInitStageForHealthChecker("Master function init")
 	controllerCheck := monitor.NewControllerCheck(cfg, ctx)
 	analyzerCheck := monitor.NewAnalyzerCheck(cfg, ctx)
-	go checkAndStartMasterFunctions(cfg, ctx, tr, controllerCheck, analyzerCheck)
+	go checkAndStartMasterFunctions(cfg, ctx, controllerCheck, analyzerCheck)
+	// native field
+	native_field.Refresh()
 
 	router.SetInitStageForHealthChecker("Register routers init")
 	httpServer.SetControllerChecker(controllerCheck)
@@ -168,7 +184,7 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 	grpcStart(ctx, cfg)
 
 	if !cfg.ReportingDisabled {
-		go report.NewReportServer(mysql.Db).StartReporting()
+		go report.NewReportServer(metadb.DefaultDB.DB).StartReporting()
 	}
 }
 

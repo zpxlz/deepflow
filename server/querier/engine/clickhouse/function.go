@@ -17,7 +17,6 @@
 package clickhouse
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -51,6 +50,7 @@ const (
 	TAG_FUNCTION_ENUM                       = "enum"
 	TAG_FUNCTION_FAST_FILTER                = "FastFilter"
 	TAG_FUNCTION_FAST_TRANS                 = "FastTrans"
+	TAG_FUNCTION_COUNT_DISTINCT             = "countDistinct"
 )
 
 const INTERVAL_1D = 86400
@@ -59,7 +59,7 @@ var TAG_FUNCTIONS = []string{
 	TAG_FUNCTION_NODE_TYPE, TAG_FUNCTION_ICON_ID, TAG_FUNCTION_MASK, TAG_FUNCTION_TIME,
 	TAG_FUNCTION_TO_UNIX_TIMESTAMP_64_MICRO, TAG_FUNCTION_TO_STRING, TAG_FUNCTION_IF,
 	TAG_FUNCTION_UNIQ, TAG_FUNCTION_ANY, TAG_FUNCTION_TOPK, TAG_FUNCTION_TO_UNIX_TIMESTAMP,
-	TAG_FUNCTION_NEW_TAG, TAG_FUNCTION_ENUM, TAG_FUNCTION_FAST_FILTER, TAG_FUNCTION_FAST_TRANS,
+	TAG_FUNCTION_NEW_TAG, TAG_FUNCTION_ENUM, TAG_FUNCTION_FAST_FILTER, TAG_FUNCTION_FAST_TRANS, TAG_FUNCTION_COUNT_DISTINCT,
 }
 
 type Function interface {
@@ -68,7 +68,9 @@ type Function interface {
 	SetAlias(alias string)
 }
 
-func GetTagFunction(name string, args []string, alias, db, table string) (Statement, error) {
+func GetTagFunction(name string, args []string, alias string, e *CHEngine) (Statement, error) {
+	db := e.DB
+	table := e.Table
 	if !common.IsValueInSliceString(name, TAG_FUNCTIONS) {
 		return nil, nil
 	}
@@ -77,15 +79,20 @@ func GetTagFunction(name string, args []string, alias, db, table string) (Statem
 		time := Time{Args: args, Alias: alias}
 		return &time, nil
 	default:
-		tagFunction := TagFunction{Name: name, Args: args, Alias: alias, DB: db, Table: table}
+		tagFunction := TagFunction{Name: name, Args: args, Alias: alias, DB: db, Table: table, Engine: e}
 		err := tagFunction.Check()
 		return &tagFunction, err
 	}
 }
 
-func GetAggFunc(name string, args []string, alias string, db string, table string, ctx context.Context, isDerivative bool, derivativeGroupBy []string, derivativeArgs []string) (Statement, int, string, error) {
+func GetAggFunc(name string, args []string, alias string, derivativeArgs []string, e *CHEngine) (Statement, int, string, error) {
+	db := e.DB
+	isDerivative := e.IsDerivative
+	derivativeGroupBy := e.DerivativeGroupBy
 	if name == view.FUNCTION_TOPK || name == view.FUNCTION_ANY {
-		return GetTopKTrans(name, args, alias, db, table, ctx)
+		return GetTopKTrans(name, args, alias, e)
+	} else if name == view.FUNCTION_UNIQ || name == view.FUNCTION_UNIQ_EXACT {
+		return GetUniqTrans(name, args, alias, e)
 	}
 
 	var levelFlag int
@@ -101,7 +108,7 @@ func GetAggFunc(name string, args []string, alias string, db string, table strin
 	if !ok {
 		return nil, 0, "", nil
 	}
-	metricStruct, ok := metrics.GetAggMetrics(field, db, table, ctx)
+	metricStruct, ok := metrics.GetAggMetrics(field, e.DB, e.Table, e.ORGID)
 	if !ok {
 		return nil, 0, "", nil
 	}
@@ -134,8 +141,68 @@ func GetAggFunc(name string, args []string, alias string, db string, table strin
 	}, levelFlag, unit, nil
 }
 
-func GetTopKTrans(name string, args []string, alias string, db string, table string, ctx context.Context) (Statement, int, string, error) {
+func TransMultiTag(isMulti bool, field string, dbFields []string, withs []view.Node) (bool, []string, []view.Node) {
+	// name to id
+	for _, suffix := range []string{"", "_0", "_1"} {
+		ip4Suffix := "ip4" + suffix
+		ip6Suffix := "ip6" + suffix
+		deviceTypeSuffix := "l3_device_type" + suffix
+		deviceIDSuffix := "l3_device_id" + suffix
+		// auto
+		for _, resourceName := range []string{"auto_instance", "auto_service"} {
+			if field == resourceName+suffix {
+				isMulti = true
+				resourceTypeSuffix := "auto_service_type" + suffix
+				resourceIDSuffix := "auto_service_id" + suffix
+				ip4Alias := "auto_service_ip4" + suffix
+				ip6Alias := "auto_service_ip6" + suffix
+				if resourceName == "auto_instance" {
+					resourceTypeSuffix = "auto_instance_type" + suffix
+					resourceIDSuffix = "auto_instance_id" + suffix
+					ip4Alias = "auto_instance_ip4" + suffix
+					ip6Alias = "auto_instance_ip6" + suffix
+				}
+				ip4WithValue := fmt.Sprintf("if(%s IN (0, 255), if(is_ipv4 = 1, %s, NULL), NULL)", resourceTypeSuffix, ip4Suffix)
+				ip6WithValue := fmt.Sprintf("if(%s IN (0, 255), if(is_ipv4 = 0, %s, NULL), NULL)", resourceTypeSuffix, ip6Suffix)
+				dbFields = append(dbFields, []string{"is_ipv4", ip4Alias, ip6Alias, resourceTypeSuffix, resourceIDSuffix}...)
+				withs = append(withs, []view.Node{&view.With{Value: ip4WithValue, Alias: ip4Alias}, &view.With{Value: ip6WithValue, Alias: ip6Alias}}...)
+			}
+		}
+		// ip
+		if field == "ip"+suffix {
+			isMulti = true
+			dbFields = append(dbFields, []string{"is_ipv4", ip4Suffix, ip6Suffix}...)
+		}
+		// device
+		for resourceStr, deviceTypeValue := range tag.DEVICE_MAP {
+			if resourceStr == "pod_service" {
+				continue
+			} else if field == resourceStr+suffix {
+				isMulti = true
+				deviceAlias := "device_type_" + field
+				deviceWithValue := fmt.Sprintf("if(%s = %d, %s, 0)", deviceTypeSuffix, deviceTypeValue, deviceTypeSuffix)
+				dbFields = append(dbFields, []string{deviceIDSuffix, deviceAlias}...)
+				withs = append(withs, &view.With{Value: deviceWithValue, Alias: deviceAlias})
+			}
+		}
+		for resource, _ := range tag.HOSTNAME_IP_DEVICE_MAP {
+			if slices.Contains([]string{common.CHOST_HOSTNAME, common.CHOST_IP}, resource) && field == resource+suffix {
+				isMulti = true
+				deviceAlias := "device_type_" + field
+				deviceWithValue := fmt.Sprintf("if(%s = %d, %s, 0)", deviceTypeSuffix, tag.VIF_DEVICE_TYPE_VM, deviceTypeSuffix)
+				dbFields = append(dbFields, []string{deviceIDSuffix, deviceAlias}...)
+				withs = append(withs, &view.With{Value: deviceWithValue, Alias: deviceAlias})
+			}
+		}
+	}
+	return isMulti, dbFields, withs
+}
+
+func GetTopKTrans(name string, args []string, alias string, e *CHEngine) (Statement, int, string, error) {
+	db := e.DB
+	table := e.Table
 	function, ok := metrics.METRICS_FUNCTIONS_MAP[name]
+	withs := []view.Node{}
 	if !ok {
 		return nil, 0, "", nil
 	}
@@ -160,29 +227,66 @@ func GetTopKTrans(name string, args []string, alias string, db string, table str
 
 	fieldsLen := len(fields)
 	dbFields := make([]string, fieldsLen)
-
+	conditions := make([]string, 0, fieldsLen)
 	var metricStruct *metrics.Metrics
 	for i, field := range fields {
 		field = strings.Trim(field, "`")
-		metricStruct, ok = metrics.GetAggMetrics(field, db, table, ctx)
+		metricStruct, ok = metrics.GetAggMetrics(field, e.DB, e.Table, e.ORGID)
 		if !ok || metricStruct.Type == metrics.METRICS_TYPE_ARRAY {
 			return nil, 0, "", nil
 		}
 		dbFields[i] = metricStruct.DBField
+		// get withs
+		_, _, withs = TransMultiTag(false, field, dbFields, withs)
+		condition := metricStruct.Condition
+
 		// enum tag
 		tagEnum := strings.TrimSuffix(field, "_0")
 		tagEnum = strings.TrimSuffix(tagEnum, "_1")
 		tagDes, getTagOK := tag.GetTag(field, db, table, "enum")
+		enumTable := table
+		if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS, chCommon.DB_NAME_EXT_METRICS}, db) {
+			enumTable = chCommon.DB_TABLE_MAP[db][0]
+		}
 		tagDescription, tagOK := tag.TAG_DESCRIPTIONS[tag.TagDescriptionKey{
-			DB: db, Table: table, TagName: field,
+			DB: db, Table: enumTable, TagName: field,
 		}]
 		if getTagOK {
-			if tagOK {
-				enumFileName := strings.TrimSuffix(tagDescription.EnumFile, "."+config.Cfg.Language)
-				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, enumFileName)
+			nameColumn := ""
+			if e.Language != "" {
+				nameColumn = "name_" + e.Language
 			} else {
-				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, tagEnum)
+				cfgLang := ""
+				if config.Cfg.Language == "en" {
+					cfgLang = "en"
+				} else {
+					cfgLang = "zh"
+				}
+				nameColumn = "name_" + cfgLang
 			}
+			if tagOK {
+				enumFileName := tagDescription.EnumFile
+				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, nameColumn, enumFileName)
+			} else {
+				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, nameColumn, tagEnum)
+			}
+		}
+
+		if condition == "" && metricStruct.TagType != "int" {
+			if metricStruct.TagType == "string" || metricStruct.TagType == "ip" {
+				condition = dbFields[i] + " != ''"
+			} else if metricStruct.TagType == "int" || metricStruct.TagType == "id" {
+				condition = dbFields[i] + " != 0"
+			} else if metricStruct.TagType == "resource" && strings.Contains(metricStruct.DisplayName, "_id") {
+				if strings.Contains(metricStruct.DisplayName, "epc") {
+					condition = dbFields[i] + " != -2"
+				} else {
+					condition = dbFields[i] + " != 0"
+				}
+			} else {
+				condition = dbFields[i] + " != ''"
+			}
+			conditions = append(conditions, condition)
 		}
 
 		// 判断算子是否支持单层
@@ -195,10 +299,13 @@ func GetTopKTrans(name string, args []string, alias string, db string, table str
 	}
 
 	metricStructCopy := *metricStruct
+	metricStructCopy.DBField = strings.Join(dbFields, ", ")
+	metricStructCopy.Condition = strings.Join(conditions, " AND ")
 	if fieldsLen > 1 {
-		metricStructCopy.DBField = "(" + strings.Join(dbFields, ", ") + ")"
-	} else {
-		metricStructCopy.DBField = strings.Join(dbFields, ", ")
+		metricStructCopy.DBField = "(" + metricStructCopy.DBField + ")"
+		if metricStructCopy.Condition != "" {
+			metricStructCopy.Condition = "(" + strings.Join(conditions, " AND ") + ")"
+		}
 	}
 
 	unit := strings.ReplaceAll(function.UnitOverwrite, "$unit", metricStruct.Unit)
@@ -208,6 +315,62 @@ func GetTopKTrans(name string, args []string, alias string, db string, table str
 		Name:    name,
 		Args:    args,
 		Alias:   alias,
+		Withs:   withs,
+	}, levelFlag, unit, nil
+}
+
+func GetUniqTrans(name string, args []string, alias string, e *CHEngine) (Statement, int, string, error) {
+	db := e.DB
+	fields := args
+
+	function, ok := metrics.METRICS_FUNCTIONS_MAP[name]
+	if !ok {
+		return nil, 0, "", nil
+	}
+
+	levelFlag := view.MODEL_METRICS_LEVEL_FLAG_UNLAY
+	dbFields := []string{}
+	withs := []view.Node{}
+	var metricStruct *metrics.Metrics
+	for _, field := range fields {
+		field = strings.Trim(field, "`")
+		metricStruct, ok = metrics.GetAggMetrics(field, e.DB, e.Table, e.ORGID)
+		if !ok || metricStruct.Type == metrics.METRICS_TYPE_ARRAY {
+			return nil, 0, "", nil
+		}
+
+		isMulti := false
+		isMulti, dbFields, withs = TransMultiTag(isMulti, field, dbFields, withs)
+		if !isMulti {
+			if metricStruct.GroupField != "" {
+				dbFields = append(dbFields, metricStruct.GroupField)
+			} else {
+				dbFields = append(dbFields, metricStruct.DBField)
+			}
+		}
+		// judge whether the operator supports single layer
+		if levelFlag == view.MODEL_METRICS_LEVEL_FLAG_UNLAY && db != chCommon.DB_NAME_FLOW_LOG {
+			unlayFuns := metrics.METRICS_TYPE_UNLAY_FUNCTIONS[metricStruct.Type]
+			if !common.IsValueInSliceString(name, unlayFuns) {
+				levelFlag = view.MODEL_METRICS_LEVEL_FLAG_LAYERED
+			}
+		}
+	}
+
+	metricStructCopy := *metricStruct
+	metricStructCopy.DBField = strings.Join(dbFields, ", ")
+	if len(dbFields) > 1 {
+		metricStructCopy.DBField = "(" + metricStructCopy.DBField + ")"
+	}
+
+	unit := strings.ReplaceAll(function.UnitOverwrite, "$unit", metricStruct.Unit)
+
+	return &AggFunction{
+		Metrics: &metricStructCopy,
+		Name:    name,
+		Args:    args,
+		Alias:   alias,
+		Withs:   withs,
 	}, levelFlag, unit, nil
 }
 
@@ -298,6 +461,7 @@ type AggFunction struct {
 	IsDerivative      bool
 	DerivativeArgs    []string
 	DerivativeGroupBy []string
+	Withs             []view.Node
 }
 
 func (f *AggFunction) SetAlias(alias string) {
@@ -312,10 +476,15 @@ func (f *AggFunction) FormatInnerTag(m *view.Model) (innerAlias string) {
 		var innerFunction view.DefaultFunction
 		// Inner layer derivative
 		if f.IsDerivative {
+			args := []string{}
+			if len(f.DerivativeArgs) > 1 {
+				args = append(args, f.DerivativeArgs[1:]...)
+			}
 			innerFunction = view.DefaultFunction{
 				Name:           view.FUNCTION_DERIVATIVE,
 				Fields:         []view.Node{&view.Field{Value: f.Metrics.DBField}},
 				DerivativeArgs: f.DerivativeArgs,
+				Args:           args,
 			}
 		} else {
 			innerFunction = view.DefaultFunction{
@@ -335,11 +504,53 @@ func (f *AggFunction) FormatInnerTag(m *view.Model) (innerAlias string) {
 			Fields:     []view.Node{&view.Field{Value: f.Metrics.DBField}},
 			IgnoreZero: true,
 		}
-		// When using avg, max, and min operators. The inner layer uses itself
-		if slices.Contains([]string{view.FUNCTION_AVG, view.FUNCTION_MAX, view.FUNCTION_MIN}, f.Name) {
+		// When using max, and min operators. The inner layer uses itself
+		if slices.Contains([]string{view.FUNCTION_MAX, view.FUNCTION_MIN}, f.Name) {
+			field := f.Metrics.DBField
+			if f.Metrics.DBField == "time" {
+				field = "toUnixTimestamp(time)"
+			}
 			innerFunction = view.DefaultFunction{
-				Name:   f.Name,
-				Fields: []view.Node{&view.Field{Value: f.Metrics.DBField}},
+				Name:       f.Name,
+				Fields:     []view.Node{&view.Field{Value: field}},
+				IgnoreZero: true,
+			}
+		}
+		if f.Name == view.FUNCTION_AVG {
+			// delay class, inner structure is sum (x)/sum (y)
+			if strings.Contains(f.Metrics.DBField, "/") {
+				divFields := strings.Split(f.Metrics.DBField, "/")
+				divField_0 := view.DefaultFunction{
+					Name:   view.FUNCTION_SUM,
+					Fields: []view.Node{&view.Field{Value: divFields[0]}},
+				}
+				divField_1 := view.DefaultFunction{
+					Name:   view.FUNCTION_SUM,
+					Fields: []view.Node{&view.Field{Value: divFields[1]}},
+				}
+				innerFunction := view.DivFunction{
+					DefaultFunction: view.DefaultFunction{
+						Name:   view.FUNCTION_DIV,
+						Fields: []view.Node{&divField_0, &divField_1},
+					},
+					DivType: view.FUNCTION_DIV_TYPE_0DIVIDER_AS_NULL,
+				}
+				innerAlias = innerFunction.SetAlias("", true)
+				innerFunction.SetFlag(view.METRICS_FLAG_INNER)
+				innerFunction.Init()
+				m.AddTag(&innerFunction)
+				return innerAlias
+			} else {
+				innerFunction := view.DefaultFunction{
+					Name:       f.Name,
+					Fields:     []view.Node{&view.Field{Value: f.Metrics.DBField}},
+					IgnoreZero: true,
+				}
+				innerAlias = innerFunction.SetAlias("", true)
+				innerFunction.SetFlag(view.METRICS_FLAG_INNER)
+				innerFunction.Init()
+				m.AddTag(&innerFunction)
+				return innerAlias
 			}
 		}
 		innerAlias = innerFunction.SetAlias("", true)
@@ -466,11 +677,19 @@ func (f *AggFunction) Trans(m *view.Model) view.Node {
 		if f.Name == view.FUNCTION_COUNT {
 			field = "1"
 		}
+		if slices.Contains([]string{view.FUNCTION_MAX, view.FUNCTION_MIN}, f.Name) && field == "time" {
+			field = "toUnixTimestamp(time)"
+		}
 		outFunc.SetFields([]view.Node{&view.Field{Value: field}})
 	}
 	outFunc.SetFlag(view.METRICS_FLAG_OUTER)
 	outFunc.SetTime(m.Time)
 	outFunc.Init()
+	// uniq function has withs
+	defaultFunc, ok := outFunc.(*view.DefaultFunction)
+	if ok {
+		defaultFunc.Withs = f.Withs
+	}
 	return outFunc
 }
 
@@ -640,19 +859,20 @@ func (t *Time) Format(m *view.Model) {
 		m.AddTag(&view.Tag{Value: tagField, Alias: t.Alias, Flag: view.NODE_FLAG_METRICS_OUTER, Withs: withs})
 	}
 	m.AddGroup(&view.Group{Value: t.Alias, Flag: view.GROUP_FLAG_METRICS_OUTER})
-	if m.Time.Fill != "" && m.Time.Interval > 0 {
+	if (m.Time.Fill == "0" || m.Time.Fill == "none" || m.Time.Fill == "null") && m.Time.Interval > 0 {
 		m.AddCallback("time", TimeFill([]interface{}{m}))
 	}
 }
 
 type TagFunction struct {
-	Name  string
-	Args  []string
-	Alias string
-	Withs []view.Node
-	Value string
-	DB    string
-	Table string
+	Name   string
+	Args   []string
+	Alias  string
+	Withs  []view.Node
+	Value  string
+	DB     string
+	Table  string
+	Engine *CHEngine
 }
 
 func (f *TagFunction) SetAlias(alias string) {
@@ -742,12 +962,12 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 			f.Value = tagDes.TagTranslator
 		} else {
 			// Custom Tag
-			if strings.HasPrefix(f.Args[0], "k8s.label.") || strings.HasPrefix(f.Args[0], "k8s.annotation.") || strings.HasPrefix(f.Args[0], "k8s.env.") || strings.HasPrefix(f.Args[0], "cloud.tag.") || strings.HasPrefix(f.Args[0], "os.app.") {
-				nodeType := strings.TrimSuffix(f.Args[0], "_0")
-				nodeType = strings.TrimSuffix(nodeType, "_1")
+			// map item tag
+			_, nodeType, _ := common.TransMapItem(f.Args[0], f.Table)
+			if nodeType != "" {
 				f.Value = "'" + nodeType + "'"
 			} else {
-				nodeType := strings.Trim(f.Args[0], "'")
+				nodeType = strings.Trim(f.Args[0], "'")
 				nodeType = strings.TrimSuffix(nodeType, "0")
 				nodeType = strings.TrimSuffix(nodeType, "1")
 				f.Value = "'" + nodeType + "'"
@@ -756,6 +976,11 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 
 		if strings.HasPrefix(f.Args[0], "is_internet") {
 			m.AddGroup(&view.Group{Value: fmt.Sprintf("`%s`", strings.Trim(f.Alias, "`"))})
+		}
+		// auto_custom_tag
+		if slices.Contains(tag.AUTO_CUSTOM_TAG_NAMES, f.Args[0]) {
+			m.AddGroup(&view.Group{Value: f.Alias})
+			m.AddGroup(&view.Group{Value: strings.ReplaceAll(f.Alias, "node_type", "icon_id")})
 		}
 
 		return f.getViewNode()
@@ -784,7 +1009,7 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 		return node
 	case TAG_FUNCTION_FAST_TRANS:
 		if f.DB == chCommon.DB_NAME_PROMETHEUS && f.Args[0] == "tag" {
-			_, labelFastTranslatorStr, _ := GetPrometheusAllTagTranslator(f.Table)
+			_, labelFastTranslatorStr, _ := GetPrometheusAllTagTranslator(f.Engine)
 			f.Value = labelFastTranslatorStr
 		}
 		if f.Alias == "" {
@@ -792,28 +1017,49 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 		}
 		return f.getViewNode()
 	case TAG_FUNCTION_ENUM:
-		var tagFilter string
+		var tagTranslator string
 		tagEnum := strings.TrimSuffix(f.Args[0], "_0")
 		tagEnum = strings.TrimSuffix(tagEnum, "_1")
 		tagDes, getTagOK := tag.GetTag(f.Args[0], f.DB, f.Table, f.Name)
+		enumTable := f.Table
+		if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS, chCommon.DB_NAME_EXT_METRICS}, f.DB) {
+			enumTable = chCommon.DB_TABLE_MAP[f.DB][0]
+		}
 		tagDescription, tagOK := tag.TAG_DESCRIPTIONS[tag.TagDescriptionKey{
-			DB: f.DB, Table: f.Table, TagName: f.Args[0],
+			DB: f.DB, Table: enumTable, TagName: f.Args[0],
 		}]
-
+		language := f.Engine.Language
+		nameColumn := ""
+		if language != "" {
+			nameColumn = "name_" + language
+		} else {
+			cfgLang := ""
+			if config.Cfg.Language == "en" {
+				cfgLang = "en"
+			} else {
+				cfgLang = "zh"
+			}
+			nameColumn = "name_" + cfgLang
+		}
 		if getTagOK {
 			if tagOK {
-				enumFileName := strings.TrimSuffix(tagDescription.EnumFile, "."+config.Cfg.Language)
-				tagFilter = fmt.Sprintf(tagDes.TagTranslator, enumFileName)
+				enumFileName := tagDescription.EnumFile
+				if tagEnum == "app_service" || tagEnum == "app_instance" {
+					enumFileName = tagEnum
+					tagTranslator = fmt.Sprintf(tagDes.TagTranslator, enumFileName)
+				} else {
+					tagTranslator = fmt.Sprintf(tagDes.TagTranslator, nameColumn, enumFileName)
+				}
 			} else {
-				tagFilter = fmt.Sprintf(tagDes.TagTranslator, tagEnum)
+				tagTranslator = fmt.Sprintf(tagDes.TagTranslator, nameColumn, tagEnum)
 			}
 		} else {
-			tagFilter = fmt.Sprintf("Enum(%s)", f.Args[0])
+			tagTranslator = fmt.Sprintf("Enum(%s)", f.Args[0])
 		}
 		if f.Alias == "" {
 			f.Alias = fmt.Sprintf("Enum(%s)", f.Args[0])
 		}
-		f.Withs = []view.Node{&view.With{Value: tagFilter, Alias: f.Alias}}
+		f.Withs = []view.Node{&view.With{Value: tagTranslator, Alias: f.Alias}}
 		return f.getViewNode()
 	}
 	values := make([]string, len(fields))
@@ -836,7 +1082,7 @@ func (f *TagFunction) Trans(m *view.Model) view.Node {
 	}
 	var withValue string
 	if len(fields) > 1 {
-		if f.Name == "if" {
+		if f.Name == "if" || strings.HasPrefix(f.Name, "uniq") {
 			withValue = fmt.Sprintf("%s(%s)", f.Name, strings.Join(values, ","))
 		} else if strings.HasPrefix(f.Name, "topK") || strings.HasPrefix(f.Name, "any") {
 			withValue = fmt.Sprintf("%s((%s))", f.Name, strings.Join(values, ","))
@@ -878,10 +1124,17 @@ func (f *TagFunction) Format(m *view.Model) {
 	if f.Name == TAG_FUNCTION_ICON_ID {
 		for resourceStr := range tag.DEVICE_MAP {
 			// 以下分别针对单端/双端-0端/双端-1端生成name和ID的Tag定义
+			// device group add icon_id
 			for _, suffix := range []string{"", "_0", "_1"} {
 				resourceNameSuffix := resourceStr + suffix
 				if f.Args[0] == resourceNameSuffix {
 					m.AddGroup(&view.Group{Value: fmt.Sprintf("`%s`", strings.Trim(f.Alias, "`"))})
+				} else {
+					for resource, _ := range tag.HOSTNAME_IP_DEVICE_MAP {
+						if slices.Contains([]string{common.CHOST_HOSTNAME, common.CHOST_IP}, resource) && f.Args[0] == resource+suffix {
+							m.AddGroup(&view.Group{Value: fmt.Sprintf("`%s`", strings.Trim(f.Alias, "`"))})
+						}
+					}
 				}
 			}
 		}

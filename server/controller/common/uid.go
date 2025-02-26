@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	metadbcommon "github.com/deepflowio/deepflow/server/controller/db/metadb/common"
 	logging "github.com/op/go-logging"
 	uuid "github.com/satori/go.uuid"
 )
@@ -35,6 +36,13 @@ var (
 
 func GenerateUUID(str string) string {
 	return uuid.NewV5(uuid.NamespaceOID, str).String()
+}
+
+func GenerateUUIDByOrgID(orgID int, s string) string {
+	if orgID != metadbcommon.DEFAULT_ORG_ID {
+		s = strconv.Itoa(orgID) + "_" + s
+	}
+	return GenerateUUID(s)
 }
 
 const SHORT_UUID_LENGTH int = 10
@@ -61,6 +69,27 @@ func GetUUID(str string, namespace uuid.UUID) string {
 	return uuid.NewV5(uuid.NamespaceOID, str).String()
 }
 
+func GetUUIDByOrgID(orgID int, s string) string {
+	if orgID != metadbcommon.DEFAULT_ORG_ID {
+		s = strconv.Itoa(orgID) + "_" + s
+	}
+	return GetUUID(s, uuid.Nil)
+}
+
+func GetUUIDByOrgIDAndNamespaceDNS(orgID int, s string) string {
+	if orgID != metadbcommon.DEFAULT_ORG_ID {
+		s = strconv.Itoa(orgID) + "_" + s
+	}
+	return GetUUID(s, uuid.NamespaceDNS)
+}
+
+func IDGenerateUUID(orgID int, s string) string {
+	if orgID == metadbcommon.DEFAULT_ORG_ID || len(s) == 0 {
+		return s
+	}
+	return GetUUID(strconv.Itoa(orgID)+"_"+s, uuid.Nil)
+}
+
 func GenerateKuberneteClusterIDByMD5(md5 string) (string, error) {
 
 	if len(md5) != 32 {
@@ -81,4 +110,8 @@ func GenerateKuberneteClusterIDByMD5(md5 string) (string, error) {
 		b8[i] = letterRunes[rand.New(rand.NewSource(randSourceInt)).Intn(len(letterRunes))]
 	}
 	return "d-" + string(b2) + string(b8), nil
+}
+
+func GenerateVPCShortUUID() string {
+	return "vpc-" + GenerateShortUUID()
 }

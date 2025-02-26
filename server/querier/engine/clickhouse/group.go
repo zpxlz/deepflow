@@ -30,15 +30,86 @@ import (
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/view"
 )
 
-func GetGroup(name string, asTagMap map[string]string, db, table string) ([]Statement, error) {
+func GetMultiGroup(stmts []Statement, name string, asTagMap map[string]string) []Statement {
+	isMulti := false
+	for _, suffix := range []string{"", "_0", "_1"} {
+		ip4Suffix := "ip4" + suffix
+		ip6Suffix := "ip6" + suffix
+		deviceTypeSuffix := "l3_device_type" + suffix
+		deviceIDSuffix := "l3_device_id" + suffix
+		// auto
+		for _, resourceName := range []string{"auto_instance", "auto_service"} {
+			if name == resourceName+suffix {
+				isMulti = true
+				resourceTypeSuffix := "auto_service_type" + suffix
+				resourceIDSuffix := "auto_service_id" + suffix
+				ip4Alias := "auto_service_ip4" + suffix
+				ip6Alias := "auto_service_ip6" + suffix
+				if resourceName == "auto_instance" {
+					resourceTypeSuffix = "auto_instance_type" + suffix
+					resourceIDSuffix = "auto_instance_id" + suffix
+					ip4Alias = "auto_instance_ip4" + suffix
+					ip6Alias = "auto_instance_ip6" + suffix
+				}
+				ip4WithValue := fmt.Sprintf("if(%s IN (0, 255), if(is_ipv4 = 1, %s, NULL), NULL)", resourceTypeSuffix, ip4Suffix)
+				ip6WithValue := fmt.Sprintf("if(%s IN (0, 255), if(is_ipv4 = 0, %s, NULL), NULL)", resourceTypeSuffix, ip6Suffix)
+				stmts = append(stmts, &GroupTag{Value: "is_ipv4"})
+				stmts = append(stmts, &GroupTag{Value: ip4Alias, Withs: []view.Node{&view.With{Value: ip4WithValue, Alias: ip4Alias}}})
+				stmts = append(stmts, &GroupTag{Value: ip6Alias, Withs: []view.Node{&view.With{Value: ip6WithValue, Alias: ip6Alias}}})
+				stmts = append(stmts, &GroupTag{Value: resourceTypeSuffix})
+				stmts = append(stmts, &GroupTag{Value: resourceIDSuffix})
+			}
+		}
+		// ip
+		if name == "ip"+suffix {
+			isMulti = true
+			stmts = append(stmts, &GroupTag{Value: "is_ipv4"})
+			stmts = append(stmts, &GroupTag{Value: ip4Suffix})
+			stmts = append(stmts, &GroupTag{Value: ip6Suffix})
+		}
+		// device
+		for resourceStr, deviceTypeValue := range tag.DEVICE_MAP {
+			if resourceStr == "pod_service" {
+				continue
+			} else if name == resourceStr+suffix {
+				isMulti = true
+				deviceAlias := "device_type_" + name
+				deviceWithValue := fmt.Sprintf("if(%s = %d, %s, 0)", deviceTypeSuffix, deviceTypeValue, deviceTypeSuffix)
+				stmts = append(stmts, &GroupTag{Value: deviceIDSuffix})
+				stmts = append(stmts, &GroupTag{Value: deviceAlias, Withs: []view.Node{&view.With{Value: deviceWithValue, Alias: deviceAlias}}})
+			}
+		}
+		for resource, _ := range tag.HOSTNAME_IP_DEVICE_MAP {
+			if slices.Contains([]string{common.CHOST_HOSTNAME, common.CHOST_IP}, resource) && name == resource+suffix {
+				isMulti = true
+				deviceAlias := "device_type_" + name
+				deviceWithValue := fmt.Sprintf("if(%s = %d, %s, 0)", deviceTypeSuffix, tag.VIF_DEVICE_TYPE_VM, deviceTypeSuffix)
+				stmts = append(stmts, &GroupTag{Value: deviceIDSuffix})
+				stmts = append(stmts, &GroupTag{Value: deviceAlias, Withs: []view.Node{&view.With{Value: deviceWithValue, Alias: deviceAlias}}})
+			}
+		}
+	}
+	if !isMulti {
+		stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+	}
+	return stmts
+}
+
+func GetGroup(name string, e *CHEngine) ([]Statement, error) {
+	asTagMap := e.AsTagMap
+	db := e.DB
+	table := e.Table
 	var stmts []Statement
 	if asTagMap[name] == "time" {
 		return stmts, nil
 	}
 	tagItem, ok := tag.GetTag(name, db, table, "default")
 	if ok {
-		if db == chCommon.DB_NAME_PROMETHEUS {
-			tagTranslatorStr := GetPrometheusGroup(name, table, asTagMap)
+		// Only vtap_acl translate policy_id
+		if name == "policy_id" && table != chCommon.TABLE_NAME_VTAP_ACL {
+			stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+		} else if db == chCommon.DB_NAME_PROMETHEUS && strings.Contains(name, "tag") {
+			tagTranslatorStr := GetPrometheusGroup(name, e)
 			if tagTranslatorStr == name {
 				stmts = append(stmts, &GroupTag{Value: tagTranslatorStr, AsTagMap: asTagMap})
 			} else {
@@ -46,22 +117,21 @@ func GetGroup(name string, asTagMap map[string]string, db, table string) ([]Stat
 			}
 		} else if slices.Contains(tag.AUTO_CUSTOM_TAG_NAMES, strings.Trim(name, "`")) {
 			autoTagMap := tagItem.TagTranslatorMap
-			autoTagSlice := []string{}
 			for autoTagKey, _ := range autoTagMap {
-				autoTagSlice = append(autoTagSlice, autoTagKey)
+				stmts = append(stmts, &GroupTag{Value: "`" + autoTagKey + "`"})
 			}
-			sort.Strings(autoTagSlice)
-			for _, autoTagKey := range autoTagSlice {
-				stmts = append(stmts, &GroupTag{Value: "`" + autoTagKey + "`", AsTagMap: asTagMap})
-			}
-		} else if tagItem.TagTranslator != "" {
-			stmts = append(stmts, &GroupTag{Value: tagItem.TagTranslator, Alias: name, AsTagMap: asTagMap})
+		} else if tagItem.GroupTranslator != "" {
+			stmts = append(stmts, &GroupTag{Value: tagItem.GroupTranslator, AsTagMap: asTagMap})
 		} else {
-			stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+			if table == "alert_event" {
+				stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+			} else {
+				stmts = GetMultiGroup(stmts, name, asTagMap)
+			}
 		}
 	} else {
-		if db == chCommon.DB_NAME_PROMETHEUS {
-			tagTranslatorStr := GetPrometheusGroup(name, table, asTagMap)
+		if db == chCommon.DB_NAME_PROMETHEUS && strings.Contains(name, "tag.") {
+			tagTranslatorStr := GetPrometheusGroup(name, e)
 			if tagTranslatorStr == name {
 				stmts = append(stmts, &GroupTag{Value: tagTranslatorStr, AsTagMap: asTagMap})
 			} else {
@@ -81,26 +151,32 @@ func GetGroup(name string, asTagMap map[string]string, db, table string) ([]Stat
 				}
 			}
 		} else {
-			stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+			if !strings.Contains(name, "node_type") && !strings.Contains(name, "icon_id") {
+				stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+			} else if db == chCommon.DB_NAME_FLOW_TAG {
+				stmts = append(stmts, &GroupTag{Value: name, AsTagMap: asTagMap})
+			}
 		}
 	}
 	return stmts, nil
 }
 
-func GetPrometheusGroup(name, table string, asTagMap map[string]string) string {
+func GetPrometheusGroup(name string, e *CHEngine) string {
+	table := e.Table
+	asTagMap := e.AsTagMap
 	nameNoPreffix := strings.Trim(name, "`")
 	if nameNoPreffix == "tag" {
-		tagTranslatorStr, _, _ := GetPrometheusAllTagTranslator(table)
+		tagTranslatorStr, _, _ := GetPrometheusAllTagTranslator(e)
 		return tagTranslatorStr
 	}
 	labelName := strings.TrimPrefix(nameNoPreffix, "tag.")
-	labelNameID, ok := trans_prometheus.Prometheus.LabelNameToID[labelName]
+	labelNameID, ok := trans_prometheus.ORGPrometheus[e.ORGID].LabelNameToID[labelName]
 	if !ok {
 		errorMessage := fmt.Sprintf("%s not found", labelName)
 		log.Error(errorMessage)
 		return name
 	}
-	metricID, ok := trans_prometheus.Prometheus.MetricNameToID[table]
+	metricID, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricNameToID[table]
 	if !ok {
 		errorMessage := fmt.Sprintf("%s not found", table)
 		log.Error(errorMessage)
@@ -115,17 +191,17 @@ func GetPrometheusGroup(name, table string, asTagMap map[string]string) string {
 		nameNoPreffix = strings.TrimPrefix(nameNoPreffix, "tag.")
 		// Determine whether the tag is app_label or target_label
 		isAppLabel := false
-		if appLabels, ok := trans_prometheus.Prometheus.MetricAppLabelLayout[table]; ok {
+		if appLabels, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricAppLabelLayout[table]; ok {
 			for _, appLabel := range appLabels {
 				if appLabel.AppLabelName == nameNoPreffix {
 					isAppLabel = true
-					tagTranslatorStr = fmt.Sprintf("dictGet(flow_tag.app_label_map, 'label_value', (%d, app_label_value_id_%d))", labelNameID, appLabel.AppLabelColumnIndex)
+					tagTranslatorStr = fmt.Sprintf("dictGet('flow_tag.app_label_map', 'label_value', (toUInt64(%d), toUInt64(app_label_value_id_%d)))", labelNameID, appLabel.AppLabelColumnIndex)
 					break
 				}
 			}
 		}
 		if !isAppLabel {
-			tagTranslatorStr = fmt.Sprintf("dictGet(flow_tag.target_label_map, 'label_value', (%d, %d, target_id))", metricID, labelNameID)
+			tagTranslatorStr = fmt.Sprintf("dictGet('flow_tag.target_label_map', 'label_value', (toUInt64(%d), toUInt64(%d), toUInt64(target_id)))", metricID, labelNameID)
 		}
 	} else {
 		tagTranslatorStr = name
@@ -133,7 +209,9 @@ func GetPrometheusGroup(name, table string, asTagMap map[string]string) string {
 	return tagTranslatorStr
 }
 
-func GetPrometheusNotNullFilter(name, table string, asTagMap map[string]string) (view.Node, bool) {
+func GetPrometheusNotNullFilter(name string, e *CHEngine) (view.Node, bool) {
+	table := e.Table
+	asTagMap := e.AsTagMap
 	nameNoPreffix := strings.Trim(name, "`")
 	preAsTag, ok := asTagMap[name]
 	if ok {
@@ -141,40 +219,43 @@ func GetPrometheusNotNullFilter(name, table string, asTagMap map[string]string) 
 	}
 	nameNoPreffix = strings.TrimPrefix(nameNoPreffix, "tag.")
 	filter := ""
-	metricID, ok := trans_prometheus.Prometheus.MetricNameToID[table]
+	metricID, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricNameToID[table]
 	if !ok {
 		return &view.Expr{}, false
 	}
-	labelNameID, ok := trans_prometheus.Prometheus.LabelNameToID[nameNoPreffix]
+	labelNameID, ok := trans_prometheus.ORGPrometheus[e.ORGID].LabelNameToID[nameNoPreffix]
 	if !ok {
 		return &view.Expr{}, false
 	}
 	// Determine whether the tag is app_label or target_label
 	isAppLabel := false
-	if appLabels, ok := trans_prometheus.Prometheus.MetricAppLabelLayout[table]; ok {
+	if appLabels, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricAppLabelLayout[table]; ok {
 		for _, appLabel := range appLabels {
 			if appLabel.AppLabelName == nameNoPreffix {
 				isAppLabel = true
-				filter = fmt.Sprintf("toUInt64(app_label_value_id_%d) IN (SELECT label_value_id FROM flow_tag.app_label_live_view WHERE label_name_id=%d)", appLabel.AppLabelColumnIndex, labelNameID)
+				filter = fmt.Sprintf("toUInt64(app_label_value_id_%d) GLOBAL IN (SELECT label_value_id FROM flow_tag.app_label_live_view WHERE label_name_id=%d)", appLabel.AppLabelColumnIndex, labelNameID)
 				break
 			}
 		}
 	}
 	if !isAppLabel {
-		filter = fmt.Sprintf("toUInt64(target_id) IN (SELECT target_id FROM flow_tag.target_label_live_view WHERE metric_id=%d and label_name_id=%d)", metricID, labelNameID)
+		filter = fmt.Sprintf("toUInt64(target_id) GLOBAL IN (SELECT target_id FROM flow_tag.target_label_live_view WHERE metric_id=%d and label_name_id=%d)", metricID, labelNameID)
 	}
 	return &view.Expr{Value: "(" + filter + ")"}, true
 }
 
-func GetNotNullFilter(name string, asTagMap map[string]string, db, table string) (view.Node, bool) {
+func GetNotNullFilter(name string, e *CHEngine) (view.Node, bool) {
+	asTagMap := e.AsTagMap
+	db := e.DB
+	table := e.Table
 	preAsTag, preASOK := asTagMap[name]
 	if preASOK {
 		if db == chCommon.DB_NAME_PROMETHEUS && strings.HasPrefix(preAsTag, "`tag.") {
-			return GetPrometheusNotNullFilter(name, table, asTagMap)
+			return GetPrometheusNotNullFilter(name, e)
 		}
 	} else {
 		if db == chCommon.DB_NAME_PROMETHEUS && strings.HasPrefix(name, "`tag.") {
-			return GetPrometheusNotNullFilter(name, table, asTagMap)
+			return GetPrometheusNotNullFilter(name, e)
 		}
 	}
 
@@ -184,80 +265,32 @@ func GetNotNullFilter(name string, asTagMap map[string]string, db, table string)
 			tagItem, ok = tag.GetTag(strings.Trim(preAsTag, "`"), db, table, "default")
 			if !ok {
 				preAsTag := strings.Trim(preAsTag, "`")
-				if strings.HasPrefix(preAsTag, "k8s.label.") {
-					if strings.HasSuffix(preAsTag, "_0") {
-						tagItem, ok = tag.GetTag("k8s_label_0", db, table, "default")
-					} else if strings.HasSuffix(preAsTag, "_1") {
-						tagItem, ok = tag.GetTag("k8s_label_1", db, table, "default")
+				// map item tag
+				filterName, _, transKey := common.TransMapItem(preAsTag, table)
+				if transKey != "" {
+					tagItem, _ = tag.GetTag(transKey, db, table, "default")
+					filter := name
+					if strings.HasPrefix(preAsTag, "os.app.") || strings.HasPrefix(preAsTag, "k8s.env.") {
+						filter = fmt.Sprintf(tagItem.NotNullFilter, filterName)
 					} else {
-						tagItem, ok = tag.GetTag("k8s_label", db, table, "default")
+						filter = fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
 					}
-					filterName := strings.TrimPrefix(preAsTag, "k8s.label.")
-					filterName = strings.TrimSuffix(filterName, "_0")
-					filterName = strings.TrimSuffix(filterName, "_1")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
 					return &view.Expr{Value: "(" + filter + ")"}, true
-				} else if strings.HasPrefix(preAsTag, "k8s.annotation.") {
-					if strings.HasSuffix(preAsTag, "_0") {
-						tagItem, _ = tag.GetTag("k8s_annotation_0", db, table, "default")
-					} else if strings.HasSuffix(preAsTag, "_1") {
-						tagItem, _ = tag.GetTag("k8s_annotation_1", db, table, "default")
-					} else {
-						tagItem, _ = tag.GetTag("k8s_annotation", db, table, "default")
-					}
-					filterName := strings.TrimPrefix(preAsTag, "k8s.annotation.")
-					filterName = strings.TrimSuffix(filterName, "_0")
-					filterName = strings.TrimSuffix(filterName, "_1")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
-					return &view.Expr{Value: "(" + filter + ")"}, true
-				} else if strings.HasPrefix(preAsTag, "k8s.env.") {
-					if strings.HasSuffix(preAsTag, "_0") {
-						tagItem, _ = tag.GetTag("k8s_env_0", db, table, "default")
-					} else if strings.HasSuffix(preAsTag, "_1") {
-						tagItem, _ = tag.GetTag("k8s_env_1", db, table, "default")
-					} else {
-						tagItem, _ = tag.GetTag("k8s_env", db, table, "default")
-					}
-					filterName := strings.TrimPrefix(preAsTag, "k8s.env.")
-					filterName = strings.TrimSuffix(filterName, "_0")
-					filterName = strings.TrimSuffix(filterName, "_1")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
-					return &view.Expr{Value: "(" + filter + ")"}, true
-				} else if strings.HasPrefix(preAsTag, "cloud.tag.") {
-					if strings.HasSuffix(preAsTag, "_0") {
-						tagItem, ok = tag.GetTag("cloud_tag_0", db, table, "default")
-					} else if strings.HasSuffix(preAsTag, "_1") {
-						tagItem, ok = tag.GetTag("cloud_tag_1", db, table, "default")
-					} else {
-						tagItem, ok = tag.GetTag("cloud_tag", db, table, "default")
-					}
-					filterName := strings.TrimPrefix(preAsTag, "cloud.tag.")
-					filterName = strings.TrimSuffix(filterName, "_0")
-					filterName = strings.TrimSuffix(filterName, "_1")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
-					return &view.Expr{Value: "(" + filter + ")"}, true
-				} else if strings.HasPrefix(preAsTag, "os.app.") {
-					if strings.HasSuffix(preAsTag, "_0") {
-						tagItem, ok = tag.GetTag("os_app_0", db, table, "default")
-					} else if strings.HasSuffix(preAsTag, "_1") {
-						tagItem, ok = tag.GetTag("os_app_1", db, table, "default")
-					} else {
-						tagItem, ok = tag.GetTag("os_app", db, table, "default")
-					}
-					filterName := strings.TrimPrefix(preAsTag, "os.app.")
-					filterName = strings.TrimSuffix(filterName, "_0")
-					filterName = strings.TrimSuffix(filterName, "_1")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
-					return &view.Expr{Value: "(" + filter + ")"}, true
-				} else if strings.HasPrefix(preAsTag, "tag.") || strings.HasPrefix(preAsTag, "attribute.") {
+				} else if strings.HasPrefix(preAsTag, "tag.") {
 					if db == chCommon.DB_NAME_PROMETHEUS {
 						return &view.Expr{}, false
 					}
 					tagItem, ok = tag.GetTag("tag.", db, table, "default")
-					filter := fmt.Sprintf(tagItem.NotNullFilter, name)
+					filterName := strings.TrimPrefix(strings.Trim(preAsTag, "`"), "tag.")
+					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
+					return &view.Expr{Value: "(" + filter + ")"}, true
+				} else if strings.HasPrefix(preAsTag, "attribute.") {
+					tagItem, ok = tag.GetTag("attribute.", db, table, "default")
+					filterName := strings.TrimPrefix(strings.Trim(preAsTag, "`"), "attribute.")
+					filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
 					return &view.Expr{Value: "(" + filter + ")"}, true
 				} else if common.IsValueInSliceString(preAsTag, []string{"request_id", "response_code", "span_kind", "request_length", "response_length", "sql_affected_rows"}) {
-					filter := fmt.Sprintf("%s is not null", name)
+					filter := fmt.Sprintf("%s is not null", preAsTag)
 					return &view.Expr{Value: "(" + filter + ")"}, true
 				}
 				return &view.Expr{}, false
@@ -268,80 +301,32 @@ func GetNotNullFilter(name string, asTagMap map[string]string, db, table string)
 			}
 			return &view.Expr{Value: "(" + filter + ")"}, true
 		} else {
-			name := strings.Trim(name, "`")
-			if strings.HasPrefix(name, "k8s.label.") {
-				if strings.HasSuffix(name, "_0") {
-					tagItem, ok = tag.GetTag("k8s_label_0", db, table, "default")
-				} else if strings.HasSuffix(name, "_1") {
-					tagItem, ok = tag.GetTag("k8s_label_1", db, table, "default")
+			noBackQuoteName := strings.Trim(name, "`")
+			// map item tag
+			filterName, _, transKey := common.TransMapItem(noBackQuoteName, table)
+			if transKey != "" {
+				tagItem, _ = tag.GetTag(transKey, db, table, "default")
+				filter := name
+				if strings.HasPrefix(noBackQuoteName, "os.app.") || strings.HasPrefix(noBackQuoteName, "k8s.env.") {
+					filter = fmt.Sprintf(tagItem.NotNullFilter, filterName)
 				} else {
-					tagItem, ok = tag.GetTag("k8s_label", db, table, "default")
+					filter = fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
 				}
-				filterName := strings.TrimPrefix(name, "k8s.label.")
-				filterName = strings.TrimSuffix(filterName, "_0")
-				filterName = strings.TrimSuffix(filterName, "_1")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
 				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if strings.HasPrefix(name, "k8s.annotation.") {
-				if strings.HasSuffix(name, "_0") {
-					tagItem, _ = tag.GetTag("k8s_annotation_0", db, table, "default")
-				} else if strings.HasSuffix(name, "_1") {
-					tagItem, _ = tag.GetTag("k8s_annotation_1", db, table, "default")
-				} else {
-					tagItem, _ = tag.GetTag("k8s_annotation", db, table, "default")
-				}
-				filterName := strings.TrimPrefix(name, "k8s.annotation.")
-				filterName = strings.TrimSuffix(filterName, "_0")
-				filterName = strings.TrimSuffix(filterName, "_1")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
-				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if strings.HasPrefix(name, "k8s.env.") {
-				if strings.HasSuffix(name, "_0") {
-					tagItem, _ = tag.GetTag("k8s_env_0", db, table, "default")
-				} else if strings.HasSuffix(name, "_1") {
-					tagItem, _ = tag.GetTag("k8s_env_1", db, table, "default")
-				} else {
-					tagItem, _ = tag.GetTag("k8s_env", db, table, "default")
-				}
-				filterName := strings.TrimPrefix(name, "k8s.env.")
-				filterName = strings.TrimSuffix(filterName, "_0")
-				filterName = strings.TrimSuffix(filterName, "_1")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
-				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if strings.HasPrefix(name, "cloud.tag.") {
-				if strings.HasSuffix(name, "_0") {
-					tagItem, ok = tag.GetTag("cloud_tag_0", db, table, "default")
-				} else if strings.HasSuffix(name, "_1") {
-					tagItem, ok = tag.GetTag("cloud_tag_1", db, table, "default")
-				} else {
-					tagItem, ok = tag.GetTag("cloud_tag", db, table, "default")
-				}
-				filterName := strings.TrimPrefix(name, "cloud.tag.")
-				filterName = strings.TrimSuffix(filterName, "_0")
-				filterName = strings.TrimSuffix(filterName, "_1")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName, filterName)
-				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if strings.HasPrefix(name, "os.app.") {
-				if strings.HasSuffix(name, "_0") {
-					tagItem, ok = tag.GetTag("os_app_0", db, table, "default")
-				} else if strings.HasSuffix(name, "_1") {
-					tagItem, ok = tag.GetTag("os_app_1", db, table, "default")
-				} else {
-					tagItem, ok = tag.GetTag("os_app", db, table, "default")
-				}
-				filterName := strings.TrimPrefix(name, "os.app.")
-				filterName = strings.TrimSuffix(filterName, "_0")
-				filterName = strings.TrimSuffix(filterName, "_1")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
-				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if strings.HasPrefix(name, "tag.") || strings.HasPrefix(name, "attribute.") {
+			} else if strings.HasPrefix(noBackQuoteName, "tag.") {
 				if db == chCommon.DB_NAME_PROMETHEUS {
 					return &view.Expr{}, false
 				}
 				tagItem, ok = tag.GetTag("tag.", db, table, "default")
-				filter := fmt.Sprintf(tagItem.NotNullFilter, name)
+				filterName := strings.TrimPrefix(strings.Trim(name, "`"), "tag.")
+				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
 				return &view.Expr{Value: "(" + filter + ")"}, true
-			} else if common.IsValueInSliceString(name, []string{"request_id", "response_code", "span_kind", "request_length", "response_length", "sql_affected_rows"}) {
+			} else if strings.HasPrefix(noBackQuoteName, "attribute.") {
+				tagItem, ok = tag.GetTag("attribute.", db, table, "default")
+				filterName := strings.TrimPrefix(strings.Trim(name, "`"), "attribute.")
+				filter := fmt.Sprintf(tagItem.NotNullFilter, filterName)
+				return &view.Expr{Value: "(" + filter + ")"}, true
+			} else if common.IsValueInSliceString(noBackQuoteName, []string{"request_id", "response_code", "span_kind", "request_length", "response_length", "sql_affected_rows"}) {
 				filter := fmt.Sprintf("%s is not null", name)
 				return &view.Expr{Value: "(" + filter + ")"}, true
 			}
@@ -380,35 +365,5 @@ func (g *GroupTag) Format(m *view.Model) {
 		m.AddGroup(&view.Group{Value: g.Value, Alias: g.Alias})
 	} else {
 		m.AddGroup(&view.Group{Value: g.Value, Withs: g.Withs})
-	}
-	preAsTag, preAsOK := g.AsTagMap[g.Value]
-	for _, suffix := range []string{"", "_0", "_1"} {
-		for _, resourceName := range []string{"resource_gl0", "auto_instance", "resource_gl1", "resource_gl2", "auto_service"} {
-			resourceTypeSuffix := "auto_service_type" + suffix
-			oldResourceTypeSuffix := resourceName + "_type" + suffix
-			if common.IsValueInSliceString(resourceName, []string{"resource_gl0", "auto_instance"}) {
-				resourceTypeSuffix = "auto_instance_type" + suffix
-			}
-			preAsTag, preAsOK = g.AsTagMap[g.Value]
-			if preAsOK {
-				if preAsTag == resourceName+suffix {
-					m.AddTag(&view.Tag{Value: resourceTypeSuffix, Alias: oldResourceTypeSuffix})
-					m.AddGroup(&view.Group{Value: oldResourceTypeSuffix})
-				}
-			} else if g.Alias == resourceName+suffix {
-				if resourceTypeSuffix != oldResourceTypeSuffix {
-					m.AddTag(&view.Tag{Value: resourceTypeSuffix, Alias: oldResourceTypeSuffix})
-				} else {
-					m.AddTag(&view.Tag{Value: resourceTypeSuffix})
-				}
-				m.AddGroup(&view.Group{Value: oldResourceTypeSuffix})
-			}
-		}
-	}
-	for _, tag := range []string{"client_node_type", "server_node_type", "node_type"} {
-		if g.Value == tag {
-			iconTag := strings.ReplaceAll(tag, "node_type", "icon_id")
-			m.AddGroup(&view.Group{Value: iconTag})
-		}
 	}
 }

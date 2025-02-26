@@ -60,7 +60,7 @@ type LogMessageStatus uint8
 const (
 	STATUS_OK LogMessageStatus = iota
 	STATUS_ERROR
-	STATUS_NOT_EXIST
+	STATUS_TIMEOUT
 	STATUS_SERVER_ERROR
 	STATUS_CLIENT_ERROR
 )
@@ -76,7 +76,7 @@ func (t LogMessageStatus) String() string {
 	case STATUS_CLIENT_ERROR:
 		return "Client Error"
 	default:
-		return "Unknown"
+		return "Timeout"
 	}
 }
 
@@ -175,12 +175,12 @@ type AppProtoLogsData struct {
 	pool.ReferenceCount
 }
 
-var httpInfoPool = pool.NewLockFreePool(func() interface{} {
+var httpInfoPool = pool.NewLockFreePool(func() *HTTPInfo {
 	return new(HTTPInfo)
 })
 
 func AcquireHTTPInfo() *HTTPInfo {
-	return httpInfoPool.Get().(*HTTPInfo)
+	return httpInfoPool.Get()
 }
 
 func ReleaseHTTPInfo(h *HTTPInfo) {
@@ -188,12 +188,12 @@ func ReleaseHTTPInfo(h *HTTPInfo) {
 	httpInfoPool.Put(h)
 }
 
-var dnsInfoPool = pool.NewLockFreePool(func() interface{} {
+var dnsInfoPool = pool.NewLockFreePool(func() *DNSInfo {
 	return new(DNSInfo)
 })
 
 func AcquireDNSInfo() *DNSInfo {
-	return dnsInfoPool.Get().(*DNSInfo)
+	return dnsInfoPool.Get()
 }
 
 func ReleaseDNSInfo(d *DNSInfo) {
@@ -201,13 +201,13 @@ func ReleaseDNSInfo(d *DNSInfo) {
 	dnsInfoPool.Put(d)
 }
 
-var appProtoLogsDataPool = pool.NewLockFreePool(func() interface{} {
+var appProtoLogsDataPool = pool.NewLockFreePool(func() *AppProtoLogsData {
 	return new(AppProtoLogsData)
 })
 var zeroAppProtoLogsData = AppProtoLogsData{}
 
 func AcquireAppProtoLogsData() *AppProtoLogsData {
-	d := appProtoLogsDataPool.Get().(*AppProtoLogsData)
+	d := appProtoLogsDataPool.Get()
 	d.Reset()
 	return d
 }

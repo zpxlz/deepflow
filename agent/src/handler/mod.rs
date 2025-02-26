@@ -68,10 +68,11 @@ pub struct MiniPacket<'a> {
     l2_l3_opt_size: u16,
     packet_len: u32,
     second_in_minute: u8,
+    if_index: isize,
 }
 
 impl<'a> MiniPacket<'a> {
-    pub fn new<P>(overlay_packet: P, meta_packet: &MetaPacket) -> MiniPacket<'a>
+    pub fn new<P>(overlay_packet: P, meta_packet: &MetaPacket, if_index: isize) -> MiniPacket<'a>
     where
         P: Into<RawPacket<'a>>,
     {
@@ -96,6 +97,19 @@ impl<'a> MiniPacket<'a> {
             l2_l3_opt_size: meta_packet.l2_l3_opt_size,
             packet_len: meta_packet.packet_len,
             second_in_minute: meta_packet.second_in_minute,
+            if_index,
+        }
+    }
+
+    pub fn if_index(&self) -> isize {
+        self.if_index
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        match &self.packet {
+            RawPacket::Borrowed(r) => *r,
+            RawPacket::Owned(r) => r.as_ref(),
+            RawPacket::OwnedVec(r) => r.as_slice(),
         }
     }
 }
@@ -179,10 +193,13 @@ pub enum PacketHandlerBuilder {
 }
 
 impl PacketHandlerBuilder {
-    pub fn build_with(&self, id: usize, if_index: u32, mac: MacAddr) -> PacketHandler {
+    pub fn build_with(&self, id: usize, if_index: u64, mac: MacAddr) -> PacketHandler {
         match self {
             PacketHandlerBuilder::Pcap(s) => PacketHandler::Pcap(s.clone()),
-            PacketHandlerBuilder::Npb(b) => PacketHandler::Npb(b.build_with(id, if_index, mac)),
+            // high 32 bits is ns_ino
+            PacketHandlerBuilder::Npb(b) => {
+                PacketHandler::Npb(b.build_with(id, if_index as u32, mac))
+            }
         }
     }
 

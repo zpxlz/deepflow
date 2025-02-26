@@ -14,11 +14,18 @@
  * limitations under the License.
  */
 
-use std::{env, error::Error, path::PathBuf, process::Command, str};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+    str,
+};
 
+use anyhow::Result;
 use chrono::prelude::*;
+use walkdir::WalkDir;
 
-fn get_branch() -> Result<String, Box<dyn Error>> {
+fn get_branch() -> Result<String> {
     if let Ok(branch) = env::var("GITHUB_REF_NAME") {
         return Ok(branch);
     }
@@ -60,7 +67,7 @@ fn get_branch() -> Result<String, Box<dyn Error>> {
 
 struct EnvCommand(&'static str, Vec<&'static str>);
 
-fn set_build_info() -> Result<(), Box<dyn Error>> {
+fn set_build_info() -> Result<()> {
     println!("cargo:rustc-env=AGENT_NAME=deepflow-agent-ce");
     println!("cargo:rustc-env=BRANCH={}", get_branch()?);
     println!(
@@ -79,7 +86,61 @@ fn set_build_info() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn set_build_libtrace() -> Result<(), Box<dyn Error>> {
+// libtrace scatters generated files in different folders, making it difficult to watch a single folder for changes
+//
+// rerun build script when one of the following file changes
+// - C source files, except for
+//   - generated bpf bytecode files (socket_trace_*.c / perf_profiler_*.c)
+//   - java agent so files and jattach bin
+// - Header files
+// - `src/ebpf/mod.rs` (to exlude rust sources in `samples` folder)
+// - Makefiles
+fn set_libtrace_rerun_files() -> Result<()> {
+    fn watched(path: &Path) -> bool {
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            match ext {
+                "c" => {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if name.starts_with("socket_trace_") || name.starts_with("perf_profiler_") {
+                            return false;
+                        }
+                        if name.starts_with("java_agent_so_") {
+                            return false;
+                        }
+                        if name == "deepflow_jattach_bin.c" {
+                            return false;
+                        }
+                        return true;
+                    }
+                }
+                "h" => return true,
+                _ => (),
+            }
+        }
+        if path == Path::new("src/ebpf/mods.rs") {
+            return true;
+        }
+        if let Some(name) = path.file_name() {
+            if name == "Makefile" {
+                return true;
+            }
+        }
+        false
+    }
+    let base_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    for entry in WalkDir::new(base_dir.join("src/ebpf")) {
+        let entry = entry?;
+        let relative_path = entry.path().strip_prefix(&base_dir)?;
+        if !watched(relative_path) {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", relative_path.display());
+    }
+    Ok(())
+}
+
+fn set_build_libtrace() -> Result<()> {
+    set_libtrace_rerun_files()?;
     let output = match env::var("CARGO_CFG_TARGET_ENV")?.as_str() {
         "gnu" => Command::new("sh").arg("-c")
             .arg("cd src/ebpf && make clean && make --no-print-directory && make tools --no-print-directory")
@@ -104,7 +165,7 @@ fn set_build_libtrace() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn set_linkage() -> Result<(), Box<dyn Error>> {
+fn set_linkage() -> Result<()> {
     let target_env = env::var("CARGO_CFG_TARGET_ENV")?;
     if target_env.as_str() == "musl" {
         #[cfg(target_arch = "x86_64")]
@@ -132,10 +193,10 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
             println!("cargo:rustc-link-lib=dylib=pthread");
             println!("cargo:rustc-link-lib=dylib=z");
             println!("cargo:rustc-link-lib=dylib=stdc++");
-            #[cfg(target_arch = "x86_64")]
-            println!("cargo:rustc-link-lib=static=pcap");
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(feature = "dylib_pcap")]
             println!("cargo:rustc-link-lib=dylib=pcap");
+            #[cfg(not(feature = "dylib_pcap"))]
+            println!("cargo:rustc-link-lib=static=pcap");
         }
         "musl" => {
             #[cfg(target_arch = "x86_64")]
@@ -158,8 +219,66 @@ fn set_linkage() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn compile_wasm_plugin_proto() -> Result<()> {
+    tonic_build::configure()
+        .build_server(false)
+        .emit_rerun_if_changed(false)
+        .out_dir("src/plugin/wasm")
+        .compile(&["src/plugin/WasmPluginApi.proto"], &["src/plugin"])?;
+    println!("cargo:rerun-if-changed=src/plugin/WasmPluginApi.proto");
+    Ok(())
+}
+
+fn make_pulsar_proto() -> Result<()> {
+    tonic_build::configure()
+        .field_attribute(".", "#[serde(skip_serializing_if = \"Option::is_none\")]")
+        .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+        .build_server(false)
+        .emit_rerun_if_changed(false)
+        .out_dir("src/flow_generator/protocol_logs/mq")
+        .compile(
+            &["src/flow_generator/protocol_logs/mq/PulsarApi.proto"],
+            &["src/flow_generator/protocol_logs/mq"],
+        )?;
+    println!("cargo:rerun-if-changed=src/flow_generator/protocol_logs/mq/PulsarApi.proto");
+
+    // remove `#[serde(skip_serializing_if = "Option::is_none")]` for non-optional fields
+    let filename = "src/flow_generator/protocol_logs/mq/pulsar.proto.rs";
+    let content = std::fs::read_to_string(filename)?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut new_lines = Vec::new();
+    new_lines.push(*lines.get(0).unwrap());
+    for a in lines.windows(2) {
+        if a[1].contains("skip_serializing_if") && !a[0].contains("optional") {
+            continue;
+        }
+        new_lines.push(a[1]);
+    }
+    std::fs::write(filename, new_lines.join("\n"))?;
+    Ok(())
+}
+
+fn make_brpc_proto() -> Result<()> {
+    tonic_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+        .build_server(false)
+        .emit_rerun_if_changed(false)
+        .out_dir("src/flow_generator/protocol_logs/rpc/brpc")
+        .compile(
+            &["src/flow_generator/protocol_logs/rpc/brpc/baidu_rpc_meta.proto"],
+            &["src/flow_generator/protocol_logs/rpc"],
+        )?;
+    println!(
+        "cargo:rerun-if-changed=src/flow_generator/protocol_logs/rpc/brpc/baidu_rpc_meta.proto"
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
     set_build_info()?;
+    compile_wasm_plugin_proto()?;
+    make_pulsar_proto()?;
+    make_brpc_proto()?;
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     if target_os.as_str() == "linux" {
         set_build_libtrace()?;

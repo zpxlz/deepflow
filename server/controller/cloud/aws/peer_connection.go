@@ -23,11 +23,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aws) getPeerConnections(region awsRegion) ([]model.PeerConnection, error) {
-	log.Debug("get peer connections starting")
+func (a *Aws) getPeerConnections(client *ec2.Client) ([]model.PeerConnection, error) {
+	log.Debug("get peer connections starting", logger.NewORGPrefix(a.orgID))
 	var peerConnections []model.PeerConnection
 
 	var retPeerConnections []types.VpcPeeringConnection
@@ -40,9 +40,9 @@ func (a *Aws) getPeerConnections(region awsRegion) ([]model.PeerConnection, erro
 		} else {
 			input = &ec2.DescribeVpcPeeringConnectionsInput{MaxResults: &maxResults, NextToken: &nextToken}
 		}
-		result, err := a.ec2Client.DescribeVpcPeeringConnections(context.TODO(), input)
+		result, err := client.DescribeVpcPeeringConnections(context.TODO(), input)
 		if err != nil {
-			log.Errorf("peer connection request aws api error: (%s)", err.Error())
+			log.Errorf("peer connection request aws api error: (%s)", err.Error(), logger.NewORGPrefix(a.orgID))
 			return []model.PeerConnection{}, err
 		}
 		retPeerConnections = append(retPeerConnections, result.VpcPeeringConnections...)
@@ -59,23 +59,23 @@ func (a *Aws) getPeerConnections(region awsRegion) ([]model.PeerConnection, erro
 			peerConnectionName = peerConnectionID
 		}
 		if pData.AccepterVpcInfo == nil || pData.RequesterVpcInfo == nil {
-			log.Debug("accepter or requester vpc info is nil")
+			log.Debug("accepter or requester vpc info is nil", logger.NewORGPrefix(a.orgID))
 			continue
 		}
 		if pData.Status.Code != types.VpcPeeringConnectionStateReasonCodeActive {
-			log.Infof("peer connections (%s) status (%s) invalid", peerConnectionName, pData.Status.Code)
+			log.Infof("peer connections (%s) status (%s) invalid", peerConnectionName, pData.Status.Code, logger.NewORGPrefix(a.orgID))
 			continue
 		}
 		peerConnections = append(peerConnections, model.PeerConnection{
-			Lcuuid:             common.GetUUID(peerConnectionID, uuid.Nil),
+			Lcuuid:             common.GetUUIDByOrgID(a.orgID, peerConnectionID),
 			Name:               peerConnectionName,
 			Label:              peerConnectionID,
-			RemoteVPCLcuuid:    common.GetUUID(a.getStringPointerValue(pData.AccepterVpcInfo.VpcId), uuid.Nil),
-			LocalVPCLcuuid:     common.GetUUID(a.getStringPointerValue(pData.RequesterVpcInfo.VpcId), uuid.Nil),
-			RemoteRegionLcuuid: a.getRegionLcuuid(common.GetUUID(a.getStringPointerValue(pData.AccepterVpcInfo.Region), uuid.Nil)),
-			LocalRegionLcuuid:  a.getRegionLcuuid(common.GetUUID(a.getStringPointerValue(pData.RequesterVpcInfo.Region), uuid.Nil)),
+			RemoteVPCLcuuid:    common.GetUUIDByOrgID(a.orgID, a.getStringPointerValue(pData.AccepterVpcInfo.VpcId)),
+			LocalVPCLcuuid:     common.GetUUIDByOrgID(a.orgID, a.getStringPointerValue(pData.RequesterVpcInfo.VpcId)),
+			RemoteRegionLcuuid: a.regionLcuuid,
+			LocalRegionLcuuid:  a.regionLcuuid,
 		})
 	}
-	log.Debug("get peer connections complete")
+	log.Debug("get peer connections complete", logger.NewORGPrefix(a.orgID))
 	return peerConnections, nil
 }

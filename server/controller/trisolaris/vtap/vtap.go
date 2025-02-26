@@ -17,7 +17,7 @@
 package vtap
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -30,12 +30,12 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/golang/protobuf/proto"
-	"github.com/op/go-logging"
 
+	"github.com/deepflowio/deepflow/message/agent"
 	"github.com/deepflowio/deepflow/message/trident"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	mysql_model "github.com/deepflowio/deepflow/server/controller/db/metadb/model" // FIXME: To avoid ambiguity, name the package either mysql_model or db_model.
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/config"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
@@ -43,9 +43,10 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/pushmanager"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils/atomicbool"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/vtap")
+var log = logger.MustGetLogger("trisolaris.vtap")
 
 type VTapInfo struct {
 	// key: ctrlIP+ctrlMac
@@ -70,7 +71,6 @@ type VTapInfo struct {
 	vtapGroupShortIDToLcuuid       map[string]string
 	vtapGroupLcuuidToConfiguration map[string]*VTapConfig
 	vtapGroupLcuuidToLocalConfig   map[string]string
-	vtapGroupLcuuidToEAHPEnabled   map[string]*int
 	noVTapTapPortsMac              mapset.Set
 	kvmVTapCtrlIPToTapPorts        map[string]mapset.Set
 	kcData                         *KubernetesCluster
@@ -92,32 +92,41 @@ type VTapInfo struct {
 	// 保存remote segment 只有专属采集器有，并且所有专属采集器数据一样
 	remoteSegments []*trident.Segment
 
+	// 保存new remote segment 只有专属采集器有，并且所有专属采集器数据一样
+	agentRemoteSegments []*agent.Segment
+
 	// vtapregister
 	registerMU        sync.Mutex
 	register          map[string]*VTapRegister
 	chVTapRegister    chan struct{}
 	chRegisterSuccess chan struct{}
 
-	vtaps            []*models.VTap
-	db               *gorm.DB
-	region           *string
-	defaultVTapGroup *string
+	vtaps                            []*mysql_model.VTap
+	db                               *gorm.DB
+	region                           *string
+	defaultVTapGroup                 *string
+	defaultVTapGroupLicenseFunctions *string
 
 	vTapIPs *atomic.Value // []*trident.VtapIp
 
 	localClusterID *string
 
-	processInfo *ProcessInfo
-	dbVTapIDs   mapset.Set
+	processInfo      *ProcessInfo
+	agentProcessInfo *AgentProcessInfo
+	dbVTapIDs        mapset.Set
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	ORGID
 }
 
-func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config) *VTapInfo {
-	return &VTapInfo{
+func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config, orgID int, pctx context.Context) *VTapInfo {
+	ctx, cancel := context.WithCancel(pctx)
+	vTapInfo := &VTapInfo{
 		vTapCaches:                     NewVTapCacheMap(),
 		vtapIDCaches:                   NewVTapIDCacheMap(),
 		kvmVTapCaches:                  NewKvmVTapCacheMap(),
 		metaData:                       metaData,
-		vTapPlatformData:               newVTapPlatformData(),
 		groupData:                      newGroupData(metaData),
 		vTapPolicyData:                 newVTapPolicyData(metaData),
 		lcuuidToRegionID:               make(map[string]int),
@@ -130,11 +139,10 @@ func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config) *
 		vtapGroupShortIDToLcuuid:       make(map[string]string),
 		vtapGroupLcuuidToConfiguration: make(map[string]*VTapConfig),
 		vtapGroupLcuuidToLocalConfig:   make(map[string]string),
-		vtapGroupLcuuidToEAHPEnabled:   make(map[string]*int),
 		noVTapTapPortsMac:              mapset.NewSet(),
 		kvmVTapCtrlIPToTapPorts:        make(map[string]mapset.Set),
 		pluginNameToUpdateTime:         make(map[string]uint32),
-		kcData:                         newKubernetesCluster(db),
+		kcData:                         newKubernetesCluster(db, metaData.ORGID),
 		isReady:                        atomicbool.NewBool(false),
 		isVTapChangedForPD:             atomicbool.NewBool(false),
 		isVTapChangedForSegment:        atomicbool.NewBool(false),
@@ -147,26 +155,41 @@ func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config) *
 		db:                             db,
 		config:                         cfg,
 		vTapIPs:                        &atomic.Value{},
-		processInfo:                    NewProcessInfo(db, cfg),
 		dbVTapIDs:                      mapset.NewSet(),
+		ORGID:                          ORGID(orgID),
+		ctx:                            ctx,
+		cancel:                         cancel,
 	}
+
+	vTapInfo.vTapPlatformData = newVTapPlatformData(orgID)
+	vTapInfo.processInfo = NewProcessInfo(db, cfg, orgID)
+	vTapInfo.agentProcessInfo = NewAgentProcessInfo(db, cfg, orgID)
+
+	return vTapInfo
 }
 
-func (v *VTapInfo) AddVTapCache(vtap *models.VTap) {
-	vTapCache := NewVTapCache(vtap)
-	vTapCache.init(v)
-	v.vTapPlatformData.setPlatformDataByVTap(v.metaData.GetPlatformDataOP(), vTapCache)
+func (v *VTapInfo) AddVTapCache(vtap *mysql_model.VTap) {
+	vTapCache := NewVTapCache(vtap, v)
+	vTapCache.init()
+	v.vTapPlatformData.setPlatformDataByVTap(v.metaData, vTapCache)
 	vTapCache.setVTapLocalSegments(v.GenerateVTapLocalSegments(vTapCache))
 	vTapCache.setVTapRemoteSegments(v.GetRemoteSegment(vTapCache))
+
+	vTapCache.setAgentLocalSegments(v.GenerateAgentLocalSegments(vTapCache))
+	vTapCache.setAgentRemoteSegments(v.GetAgentRemoteSegment(vTapCache))
+
 	v.vTapCaches.Add(vTapCache)
 	v.vtapIDCaches.Add(vTapCache)
 	if vTapCache.GetVTapType() == VTAP_TYPE_KVM {
 		v.kvmVTapCaches.Add(vTapCache)
 	}
-	log.Infof("add cache ctrl_ip: %s ctrl_mac: %s", vTapCache.GetCtrlIP(), vTapCache.GetCtrlMac())
+	log.Infof(v.Logf("add cache ctrl_ip: %s ctrl_mac: %s", vTapCache.GetCtrlIP(), vTapCache.GetCtrlMac()))
 }
 
 func (v *VTapInfo) GetVTapCache(key string) *VTapCache {
+	if v == nil {
+		return nil
+	}
 	return v.vTapCaches.Get(key)
 }
 
@@ -178,29 +201,29 @@ func (v *VTapInfo) DeleteVTapCache(key string) {
 		if vTapCache.GetVTapType() == VTAP_TYPE_KVM {
 			v.kvmVTapCaches.Delete(vTapCache.GetCtrlIP())
 		}
-		log.Infof("delete cache vtap %s", key)
+		log.Infof(v.Logf("delete cache vtap %s", key))
 	}
 }
 
-func (v *VTapInfo) UpdateVTapCache(key string, vtap *models.VTap) {
+func (v *VTapInfo) UpdateVTapCache(key string, vtap *mysql_model.VTap) {
 	vTapCache := v.GetVTapCache(key)
 	if vTapCache == nil {
-		log.Error("vtap no cache. ", key)
+		log.Error(v.Logf("vtap no cache. %s", key))
 		return
 	}
-	vTapCache.updateVTapCacheFromDB(vtap, v)
+	vTapCache.updateVTapCacheFromDB(vtap)
 }
 
 func (v *VTapInfo) loadRegion() string {
 	if v.config.NodeIP == "" {
-		log.Error("config NodeIP is null")
+		log.Error(v.Log("config NodeIP is null"))
 		return ""
 	}
 	ctrlIP := v.config.NodeIP
-	azConMgr := dbmgr.DBMgr[models.AZControllerConnection](v.db)
+	azConMgr := dbmgr.DBMgr[mysql_model.AZControllerConnection](v.db)
 	azConn, err := azConMgr.GetFromControllerIP(ctrlIP)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Errorf("controller (%s) az connection not in DB", ctrlIP)
+		log.Errorf(v.Logf("controller (%s) az connection not in DB", ctrlIP))
 		return ""
 	}
 
@@ -209,20 +232,21 @@ func (v *VTapInfo) loadRegion() string {
 }
 
 func (v *VTapInfo) loadDefaultVTapGroup() string {
-	defaultVTapGroup, err := dbmgr.DBMgr[models.VTapGroup](v.db).GetFromID(DEFAULT_VTAP_GROUP_ID)
+	defaultVTapGroup, err := dbmgr.DBMgr[mysql_model.VTapGroup](v.db).GetFromID(DEFAULT_VTAP_GROUP_ID)
 	if err != nil {
-		log.Errorf("no default vtap group, err(%s)", err)
+		log.Errorf(v.Logf("no default vtap group, err(%s)", err))
 		return ""
 	}
 
 	v.defaultVTapGroup = proto.String(defaultVTapGroup.Lcuuid)
+	v.defaultVTapGroupLicenseFunctions = proto.String(defaultVTapGroup.LicenseFunctions)
 	return defaultVTapGroup.Lcuuid
 }
 
 func (v *VTapInfo) loadVTapGroup() {
-	vtapGroups, err := dbmgr.DBMgr[models.VTapGroup](v.db).Gets()
+	vtapGroups, err := dbmgr.DBMgr[mysql_model.VTapGroup](v.db).Gets()
 	if err != nil {
-		log.Errorf("get vtap group failed, err(%s)", err)
+		log.Errorf(v.Logf("get vtap group failed, err(%s)", err))
 		return
 	}
 
@@ -287,12 +311,12 @@ func (v *VTapInfo) loadDeviceData() {
 				hypervNetworkHostIds.Add(hostDevice.ID)
 			}
 			vifs, ok := hostIDToVifs[hostDevice.ID]
-			if ok == false {
+			if !ok {
 				continue
 			}
 			vpcID := 0
 			for vif := range vifs.Iter() {
-				hVif := vif.(*models.VInterface)
+				hVif := vif.(*mysql_model.VInterface)
 				if network, ok := idToNetwork[hVif.NetworkID]; ok {
 					if vpcID < network.VPCID {
 						vpcID = network.VPCID
@@ -363,9 +387,9 @@ func (v *VTapInfo) loadTapPortsData() {
 
 func (v *VTapInfo) loadPlugins() {
 	pluginNameToUpdateTime := make(map[string]uint32)
-	plugins, err := dbmgr.DBMgr[models.Plugin](v.db).GetFields([]string{"name", "updated_at"})
+	plugins, err := dbmgr.DBMgr[mysql_model.Plugin](v.db).GetFields([]string{"name", "updated_at"})
 	if err != nil {
-		log.Error(err)
+		log.Error(v.Logf("%s", err))
 		return
 	}
 	for _, plugin := range plugins {
@@ -376,34 +400,27 @@ func (v *VTapInfo) loadPlugins() {
 }
 
 func (v *VTapInfo) loadConfigData() {
-	deafaultConfiguration := &models.RVTapGroupConfiguration{}
-	b, err := json.Marshal(DefaultVTapGroupConfig)
-	if err == nil {
-		err = json.Unmarshal(b, deafaultConfiguration)
-		if err != nil {
-			log.Error(err)
-		}
-	} else {
-		log.Error(err)
-	}
-
-	v.realDefaultConfig = NewVTapConfig(deafaultConfiguration)
-	dbDataCache := v.metaData.GetDBDataCache()
-	configs := dbDataCache.GetVTapGroupConfigurationsFromDB(v.db)
-	v.convertConfig(configs)
+	v.getAgentConfigs()
 	v.loadPlugins()
 }
 
 func (v *VTapInfo) loadKubernetesCluster() {
+	if v == nil {
+		return
+	}
 	v.kcData.loadAndCheck(v.config.ClearKubernetesTime)
 }
 
 func (v *VTapInfo) loadVTaps() {
-	vtaps, err := dbmgr.DBMgr[models.VTap](v.db).Gets()
+	vtaps, err := dbmgr.DBMgr[mysql_model.VTap](v.db).Gets()
 	if err != nil {
-		log.Error(err)
+		log.Error(v.Logf("%s", err))
 	}
 	v.vtaps = vtaps
+}
+
+func (v *VTapInfo) loadDefaultVtapConfig() {
+	v.realDefaultConfig = NewVTapConfig("")
 }
 
 func (v *VTapInfo) loadBaseData() {
@@ -455,8 +472,8 @@ func JudgeField(field string) bool {
 	return false
 }
 
-func DefaultFieldNone(filed string) bool {
-	for _, name := range []string{"CaptureBpf"} {
+func AllowEmptyField(filed string) bool {
+	for _, name := range []string{"TapInterfaceRegex"} {
 		if filed == name {
 			return true
 		}
@@ -465,69 +482,28 @@ func DefaultFieldNone(filed string) bool {
 	return false
 }
 
-func (v *VTapInfo) convertConfig(configs []*models.VTapGroupConfiguration) {
-	if configs == nil {
-		log.Error("no vtap configs data")
+func (v *VTapInfo) getAgentConfigs() {
+	// agent configs
+	agentConfigs := v.metaData.GetDBDataCache().GetAgentGroupUserConfigsFromDB(v.db)
+	if agentConfigs == nil {
+		log.Error(v.Log("no agent configs data"))
 		return
 	}
 
 	vtapGroupLcuuidToConfiguration := make(map[string]*VTapConfig)
-	vtapGroupLcuuidToLocalConfig := make(map[string]string)
-	vtapGroupLcuuidToEAHPEnabled := make(map[string]*int)
-	typeOfDefaultConfig := reflect.ValueOf(DefaultVTapGroupConfig).Elem()
-	for _, config := range configs {
-		if config.VTapGroupLcuuid == nil {
-			continue
-		}
-		vtapGroupLcuuidToEAHPEnabled[*config.VTapGroupLcuuid] = config.ExternalAgentHTTPProxyEnabled
-		if config.YamlConfig != nil {
-			vtapGroupLcuuidToLocalConfig[*config.VTapGroupLcuuid] = *config.YamlConfig
-		} else {
-			vtapGroupLcuuidToLocalConfig[*config.VTapGroupLcuuid] = ""
-		}
-		tapConfiguration := &models.VTapGroupConfiguration{}
-		typeOfVTapConfiguration := reflect.ValueOf(tapConfiguration).Elem()
-		tt := reflect.TypeOf(config).Elem()
-		tv := reflect.ValueOf(config).Elem()
-		for i := 0; i < tv.NumField(); i++ {
-			field := tt.Field(i)
-			if JudgeField(field.Name) == true {
-				typeOfVTapConfiguration.Field(i).Set(tv.Field(i))
-				continue
-			}
-			value := tv.Field(i)
-			defaultValue := typeOfDefaultConfig.Field(i)
-			if isBlank(value) == false {
-				typeOfVTapConfiguration.Field(i).Set(value)
-			} else {
-				typeOfVTapConfiguration.Field(i).Set(defaultValue)
-			}
-		}
-		// 转换结构体类型
-		rtapConfiguration := &models.RVTapGroupConfiguration{}
-		b, err := json.Marshal(tapConfiguration)
-		if err == nil {
-			err = json.Unmarshal(b, rtapConfiguration)
-			if err != nil {
-				log.Error(err)
-			}
-		} else {
-			log.Error(err)
-		}
-
-		vTapConfig := NewVTapConfig(rtapConfiguration)
-		if config.VTapGroupLcuuid != nil {
-			vtapGroupLcuuidToConfiguration[vTapConfig.VTapGroupLcuuid] = vTapConfig
-		}
+	for _, config := range agentConfigs {
+		vTapConfig := NewVTapConfig(config.Yaml)
+		vtapGroupLcuuidToConfiguration[config.AgentGroupLcuuid] = vTapConfig
 	}
 	v.vtapGroupLcuuidToConfiguration = vtapGroupLcuuidToConfiguration
-	v.vtapGroupLcuuidToLocalConfig = vtapGroupLcuuidToLocalConfig
-	v.vtapGroupLcuuidToEAHPEnabled = vtapGroupLcuuidToEAHPEnabled
 }
 
 func (v *VTapInfo) GetVTapConfigFromShortID(shortID string) *VTapConfig {
+	if v == nil {
+		return nil
+	}
 	lcuuid, ok := v.vtapGroupShortIDToLcuuid[shortID]
-	if ok == false {
+	if !ok {
 		return nil
 	}
 
@@ -535,12 +511,18 @@ func (v *VTapInfo) GetVTapConfigFromShortID(shortID string) *VTapConfig {
 }
 
 func (v *VTapInfo) GetVTapLocalConfig(vtapGroupLcuuid string) string {
+	if v == nil {
+		return ""
+	}
 	return v.vtapGroupLcuuidToLocalConfig[vtapGroupLcuuid]
 }
 
 func (v *VTapInfo) GetVTapLocalConfigByShortID(shortID string) string {
+	if v == nil {
+		return ""
+	}
 	lcuuid, ok := v.vtapGroupShortIDToLcuuid[shortID]
-	if ok == false {
+	if !ok {
 		return ""
 	}
 
@@ -551,19 +533,39 @@ func (v *VTapInfo) GetDefaultMaxEscapeSeconds() int {
 	return DefaultMaxEscapeSeconds
 }
 
+func (v *VTapInfo) GetDefaultMaxEscapeSecondsStr() string {
+	return DefaultMaxEscapeSecondsStr
+}
+
 func (v *VTapInfo) GetDefaultMaxMemory() int {
 	return DefaultMaxMemory
 }
 
 func (v *VTapInfo) GetVTapCacheIsReady() bool {
+	if v == nil {
+		return false
+	}
 	return v.isReady.IsSet()
 }
 
 func (v *VTapInfo) GetTapTypes() []*trident.TapType {
+	if v == nil {
+		return nil
+	}
 	return v.metaData.GetTapTypes()
 }
 
+func (v *VTapInfo) GetCaptureNetworkTypes() []*agent.CaptureNetworkType {
+	if v == nil {
+		return nil
+	}
+	return v.metaData.GetAgentMetaData().GetCaptureNetworkTypes()
+}
+
 func (v *VTapInfo) GetSkipInterface(c *VTapCache) []*trident.SkipInterface {
+	if v == nil {
+		return nil
+	}
 	if c.GetVTapType() == VTAP_TYPE_KVM {
 		launchServer := c.GetLaunchServer()
 		rawData := v.metaData.GetPlatformDataOP().GetRawData()
@@ -575,7 +577,25 @@ func (v *VTapInfo) GetSkipInterface(c *VTapCache) []*trident.SkipInterface {
 	return nil
 }
 
+func (v *VTapInfo) GetAgentSkipInterface(c *VTapCache) []*agent.SkipInterface {
+	if v == nil {
+		return nil
+	}
+	if c.GetVTapType() == VTAP_TYPE_KVM {
+		launchServer := c.GetLaunchServer()
+		rawData := v.metaData.GetAgentMetaData().GetPlatformDataOP().GetRawData()
+		if rawData != nil {
+			return rawData.GetSkipInterface(launchServer)
+		}
+	}
+
+	return nil
+}
+
 func (v *VTapInfo) GetContainers(vtapID int) []*trident.Container {
+	if v == nil {
+		return nil
+	}
 	rawData := v.metaData.GetPlatformDataOP().GetRawData()
 	if rawData != nil {
 		return rawData.GetContainers(vtapID)
@@ -584,39 +604,103 @@ func (v *VTapInfo) GetContainers(vtapID int) []*trident.Container {
 	return nil
 }
 
+func (v *VTapInfo) GetAgentContainers(vtapID int) []*agent.Container {
+	if v == nil {
+		return nil
+	}
+	rawData := v.metaData.GetAgentMetaData().GetPlatformDataOP().GetRawData()
+	if rawData != nil {
+		return rawData.GetContainers(vtapID)
+	}
+
+	return nil
+}
+
 func (v *VTapInfo) GetConfigTSDBIP() string {
+	if v == nil {
+		return ""
+	}
 	return v.config.TsdbIP
 }
 
 func (v *VTapInfo) GetSelfUpdateUrl() string {
+	if v == nil {
+		return ""
+	}
 	return v.config.SelfUpdateUrl
 }
 
-func (v *VTapInfo) GetTridentTypeForUnkonwVTap() uint16 {
-	return v.config.TridentTypeForUnkonwVtap
+func (v *VTapInfo) GetTridentTypeForUnknowVTap() uint16 {
+	if v == nil {
+		return 0
+	}
+	return v.config.TridentTypeForUnknowVtap
 }
 
 func (v *VTapInfo) GetGroupData() []byte {
+	if v == nil {
+		return nil
+	}
 	return v.groupData.getGroupData()
 }
 
 func (v *VTapInfo) GetGroupDataVersion() uint64 {
+	if v == nil {
+		return 0
+	}
 	return v.groupData.getGroupDataVersion()
 }
 
+func (v *VTapInfo) GetAgentGroupData() []byte {
+	if v == nil {
+		return nil
+	}
+	return v.groupData.getAgentGroupData()
+}
+
+func (v *VTapInfo) GetAgentGroupDataVersion() uint64 {
+	if v == nil {
+		return 0
+	}
+	return v.groupData.getAgentGroupDataVersion()
+}
+
 func (v *VTapInfo) GetVTapPolicyData(vtapID int, functions mapset.Set) []byte {
+	if v == nil {
+		return nil
+	}
 	return v.vTapPolicyData.getVTapPolicyData(vtapID, functions)
 }
 
 func (v *VTapInfo) GetVTapPolicyVersion(vtapID int, functions mapset.Set) uint64 {
+	if v == nil {
+		return 0
+	}
 	return v.vTapPolicyData.getVTapPolicyVersion(vtapID, functions)
 }
 
+func (v *VTapInfo) GetAgentPolicyData(vtapID int, functions mapset.Set) []byte {
+	if v == nil {
+		return nil
+	}
+	return v.vTapPolicyData.getAgentPolicyData(vtapID, functions)
+}
+
+func (v *VTapInfo) GetAgentPolicyVersion(vtapID int, functions mapset.Set) uint64 {
+	if v == nil {
+		return 0
+	}
+	return v.vTapPolicyData.getAgentPolicyVersion(vtapID, functions)
+}
+
 func (v *VTapInfo) IsTheSameCluster(clusterID string) bool {
+	if v == nil {
+		return false
+	}
 	return v.getLocalClusterID() == clusterID
 }
 
-func GetKey(vtap *models.VTap) string {
+func GetKey(vtap *mysql_model.VTap) string {
 	if vtap.CtrlMac == "" {
 		return vtap.CtrlIP
 	}
@@ -624,7 +708,7 @@ func GetKey(vtap *models.VTap) string {
 }
 
 func (v *VTapInfo) updateVTapInfo() {
-	dbKeyToVTap := make(map[string]*models.VTap)
+	dbKeyToVTap := make(map[string]*mysql_model.VTap)
 	dbKeys := mapset.NewSet()
 	dbVTapIDs := mapset.NewSet()
 	if v.vtaps != nil {
@@ -674,6 +758,9 @@ func (v *VTapInfo) GetKvmVTapCache(key string) *VTapCache {
 }
 
 func (v *VTapInfo) GetVTapIPs() []*trident.VtapIp {
+	if v == nil {
+		return nil
+	}
 	result, ok := v.vTapIPs.Load().([]*trident.VtapIp)
 	if ok {
 		return result
@@ -699,15 +786,27 @@ func (v *VTapInfo) generateVTapIP() {
 			EpcId:        proto.Uint32(uint32(cacheVTap.GetVPCID())),
 			Ip:           proto.String(cacheVTap.GetLaunchServer()),
 			PodClusterId: proto.Uint32(uint32(cacheVTap.GetPodClusterID())),
+			TeamId:       proto.Uint32(uint32(cacheVTap.GetTeamID())),
+			OrgId:        proto.Uint32(uint32(v.ORGID)),
 		}
 		vTapIPs = append(vTapIPs, data)
 	}
-	log.Debug(vTapIPs)
+	log.Debug(v.Logf("%s", vTapIPs))
 	v.updateVTapIPs(vTapIPs)
 }
 
 func (v *VTapInfo) GetProcessInfo() *ProcessInfo {
+	if v == nil {
+		return nil
+	}
 	return v.processInfo
+}
+
+func (v *VTapInfo) GetAgentProcessInfo() *AgentProcessInfo {
+	if v == nil {
+		return nil
+	}
+	return v.agentProcessInfo
 }
 
 func (v *VTapInfo) GenerateVTapCache() {
@@ -719,7 +818,10 @@ func (v *VTapInfo) GenerateVTapCache() {
 }
 
 func (v *VTapInfo) UpdateTSDBVTapInfo(cVTaps []*trident.CommunicationVtap, tsdbIP string) {
-	log.Debugf("tsdbIP: %s, vtaps: %s", tsdbIP, cVTaps)
+	log.Debugf(v.Logf("tsdbIP: %s, vtaps: %s", tsdbIP, cVTaps))
+	if v == nil {
+		return
+	}
 	for _, cVTap := range cVTaps {
 		vTapID := int(cVTap.GetVtapId())
 		if vTapID == 0 {
@@ -749,16 +851,15 @@ func (v *VTapInfo) IsCtrlMacInTapPorts(ctrlIP string, ctrlMac string) bool {
 
 func (v *VTapInfo) generateAllVTapPlatformData() {
 	v.vTapPlatformData.clearPlatformDataTypeCache()
-	platformDataOP := v.metaData.GetPlatformDataOP()
 	cacheKeys := v.vTapCaches.List()
 	for _, cacheKey := range cacheKeys {
 		cacheVTap := v.GetVTapCache(cacheKey)
 		if cacheVTap == nil {
 			continue
 		}
-		v.vTapPlatformData.setPlatformDataByVTap(platformDataOP, cacheVTap)
+		v.vTapPlatformData.setPlatformDataByVTap(v.metaData, cacheVTap)
 	}
-	log.Debug(v.vTapPlatformData)
+	log.Debug(v.Logf("%s", v.vTapPlatformData))
 }
 
 func (v *VTapInfo) getLocalClusterID() string {
@@ -773,24 +874,25 @@ func (v *VTapInfo) generateLocalClusterID() {
 	if v.getLocalClusterID() == "" {
 		clusterID, err := GetLocalClusterID()
 		if err != nil {
-			log.Error(err)
+			log.Error(v.Logf("%s", err))
 			return
 		}
 		v.localClusterID = proto.String(clusterID)
-		log.Infof("local cluster id: %s", v.getLocalClusterID())
+		log.Infof(v.Logf("local cluster id: %s", v.getLocalClusterID()))
 	}
 }
 
 func (v *VTapInfo) InitData() {
+	v.loadDefaultVtapConfig()
 	v.loadBaseData()
 	if v.vtaps != nil {
 		for _, vtap := range v.vtaps {
 			v.AddVTapCache(vtap)
 		}
 	} else {
-		log.Error("get vtap failed or no vtap data")
+		log.Error(v.Log("get vtap failed or no vtap data"))
 	}
-	log.Info("init generate all vtap platform data")
+	log.Info(v.Log("init generate all vtap platform data"))
 	// 最后生成romote segment
 	v.generateAllVTapRemoteSegements()
 	v.generateVTapIP()
@@ -799,15 +901,15 @@ func (v *VTapInfo) InitData() {
 }
 
 func (v *VTapInfo) generatePlatformDataAndSegment() {
-	log.Info("platform data changed generate all vtap platform data")
+	log.Info(v.Log("platform data changed generate all vtap platform data"))
 	v.generateAllVTapPlatformData()
-	log.Info("platform data changed generate all vtap segment")
+	log.Info(v.Log("platform data changed generate all vtap segment"))
 	v.generateAllVTapSegements()
-	pushmanager.Broadcast()
+	pushmanager.Broadcast(int(v.ORGID))
 }
 
 func (v *VTapInfo) monitorDataChanged() {
-	log.Info("start monitor Data changed")
+	log.Info(v.Log("start monitor Data changed"))
 	chDataChanged := v.metaData.GetPlatformDataOP().GetPlatformDataChangedCh()
 	for {
 		select {
@@ -818,11 +920,11 @@ func (v *VTapInfo) monitorDataChanged() {
 			case <-chDataChanged:
 				v.generatePlatformDataAndSegment()
 			default:
-				log.Info("vtap config changed generate all vtap platform data ")
+				log.Info(v.Log("vtap config changed generate all vtap platform data "))
 				v.generateAllVTapPlatformData()
 				select {
 				case <-v.chVTapChangedForSegment:
-					log.Info("vtap changed generate all vtap remote segment")
+					log.Info(v.Log("vtap changed generate all vtap remote segment"))
 					v.generateAllVTapRemoteSegements()
 				default:
 				}
@@ -832,19 +934,20 @@ func (v *VTapInfo) monitorDataChanged() {
 			case <-chDataChanged:
 				v.generatePlatformDataAndSegment()
 			default:
-				log.Info("vtap changed generate all vtap remote segment")
+				log.Info(v.Log("vtap changed generate all vtap remote segment"))
 				v.generateAllVTapRemoteSegements()
 				select {
 				case <-v.chVTapChangedForPD:
-					log.Info("vtap config changed generate all vtap platform data ")
+					log.Info(v.Log("vtap config changed generate all vtap platform data "))
 					v.generateAllVTapPlatformData()
 				default:
 				}
 			}
+		case <-v.ctx.Done():
+			log.Info(v.Log("exit monitor data changed"))
+			return
 		}
 	}
-
-	log.Info("exit monitor data changed")
 }
 
 func (v *VTapInfo) getVTapPodDomains(c *VTapCache) []string {
@@ -867,7 +970,7 @@ func (v *VTapInfo) getVTapPodDomains(c *VTapCache) []string {
 		for vmID := range vmIDs.Iter() {
 			id := vmID.(int)
 			podNodeID, ok := vmidToPodNodeID[id]
-			if ok == false {
+			if !ok {
 				continue
 			}
 			podNodeIDs = append(podNodeIDs, podNodeID)
@@ -887,7 +990,7 @@ func (v *VTapInfo) getVTapPodDomains(c *VTapCache) []string {
 		rawData := v.metaData.GetPlatformDataOP().GetRawData()
 		podNode := rawData.GetPodNode(c.GetLaunchServerID())
 		if podNode == nil {
-			log.Errorf("vtap(%s) not found launch_server pod_node(%s)", c.GetCtrlIP(), c.GetCtrlMac())
+			log.Errorf(v.Logf("vtap(%s) not found launch_server pod_node(%s)", c.GetCtrlIP(), c.GetCtrlMac()))
 			return result
 		}
 		if podNode.SubDomain == "" || podNode.Domain == podNode.SubDomain {
@@ -913,8 +1016,15 @@ func (v *VTapInfo) getVTapPodDomains(c *VTapCache) []string {
 	return result
 }
 
-func (v *VTapInfo) GetKubernetesClusterID(clusterID string, value string, force bool) string {
-	return v.kcData.getClusterID(clusterID, value, force)
+func (v *VTapInfo) GetKubernetesClusterID(clusterID string, value string, force bool, watchPolicy int) string {
+	if v == nil {
+		// force field is for compatibility old version agent
+		if force || (watchPolicy == int(KWP_WATCH_ONLY)) || (watchPolicy == int(AGENT_KWP_WATCH_ONLY)) {
+			return value
+		}
+		return ""
+	}
+	return v.kcData.getClusterID(clusterID, value, force || (watchPolicy == int(KWP_WATCH_ONLY)) || (watchPolicy == int(AGENT_KWP_WATCH_ONLY)))
 }
 
 func (v *VTapInfo) putChVTapChangedForPD() {
@@ -925,32 +1035,32 @@ func (v *VTapInfo) putChVTapChangedForPD() {
 }
 
 func (v *VTapInfo) updateCacheToDB() {
-	log.Info("update vtap cache to db")
+	log.Info(v.Log("update vtap cache to db"))
 	hostName := common.GetNodeName()
 	if len(hostName) == 0 {
-		log.Errorf("hostname is null")
+		log.Errorf(v.Log("hostname is null"))
 		return
 	}
 
-	controllerMgr := dbmgr.DBMgr[models.Controller](v.db)
+	controllerMgr := dbmgr.DBMgr[mysql_model.Controller](v.db)
 	options := controllerMgr.WithName(hostName)
 	controller, err := controllerMgr.GetByOption(options)
 	if err != nil {
-		log.Errorf("no controller(%s) in DB", hostName)
+		log.Errorf(v.Logf("no controller(%s) in DB", hostName))
 		return
 	}
 	config := v.config
 	if config.NodeIP == "" {
-		log.Error("config NodeIP is null")
+		log.Error(v.Log("config NodeIP is null"))
 		return
 	}
 	hostIP := config.NodeIP
-	updateVTaps := []*models.VTap{}
-	keytoDBVTap := make(map[string]*models.VTap)
+	updateVTaps := []*mysql_model.VTap{}
+	keytoDBVTap := make(map[string]*mysql_model.VTap)
 
-	dbVTaps, err := dbmgr.DBMgr[models.VTap](v.db).Gets()
+	dbVTaps, err := dbmgr.DBMgr[mysql_model.VTap](v.db).Gets()
 	if err != nil {
-		log.Error("get db vtap failed, ", err)
+		log.Error(v.Logf("get db vtap failed, %s", err))
 		return
 	}
 	for _, vtap := range dbVTaps {
@@ -963,7 +1073,7 @@ func (v *VTapInfo) updateCacheToDB() {
 			continue
 		}
 		dbVTap, ok := keytoDBVTap[cacheKey]
-		if ok == false {
+		if !ok {
 			continue
 		}
 		if dbVTap.Type == VTAP_TYPE_TUNNEL_DECAPSULATION {
@@ -1002,7 +1112,9 @@ func (v *VTapInfo) updateCacheToDB() {
 			dbVTap.Os = cacheVTap.GetOs()
 			dbVTap.KernelVersion = cacheVTap.GetKernelVersion()
 			dbVTap.ProcessName = cacheVTap.GetProcessName()
+			dbVTap.CurrentK8sImage = cacheVTap.GetCurrentK8SImage()
 			dbVTap.CtrlMac = cacheVTap.GetCtrlMac()
+			dbVTap.RawHostname = cacheVTap.GetVTapRawHostname()
 			cacheExceptions := cacheVTap.GetExceptions()
 			tridentExceptions := uint64(VTAP_TRIDENT_EXCEPTIONS_MASK) & uint64(cacheExceptions)
 			controllerException := uint64(VTAP_CONTROLLER_EXCEPTIONS_MASK) & uint64(dbVTap.Exceptions)
@@ -1040,25 +1152,25 @@ func (v *VTapInfo) updateCacheToDB() {
 				if dbVTap.State != VTAP_STATE_NOT_CONNECTED {
 					dbVTap.State = VTAP_STATE_NOT_CONNECTED
 					filterFlag = true
-					log.Infof("set vTap (%s) on (%s) to not connected", dbVTap.Name, dbVTap.LaunchServer)
+					log.Infof(v.Logf("set vTap (%s) on (%s) to not connected", dbVTap.Name, dbVTap.LaunchServer))
 				}
 			} else if dbVTap.State == VTAP_STATE_NOT_CONNECTED {
 				dbVTap.State = VTAP_STATE_NORMAL
 				filterFlag = true
-				log.Infof("set vTap (%s) on (%s) to normal", dbVTap.Name, dbVTap.LaunchServer)
+				log.Infof(v.Logf("set vTap (%s) on (%s) to normal", dbVTap.Name, dbVTap.LaunchServer))
 			}
 		}
 
-		if filterFlag == true {
+		if filterFlag {
 			updateVTaps = append(updateVTaps, dbVTap)
 		}
 	}
-	vTapmgr := dbmgr.DBMgr[models.VTap](v.db)
+	vTapmgr := dbmgr.DBMgr[mysql_model.VTap](v.db)
 	if len(updateVTaps) > 0 {
-		log.Infof("update vtap count(%d)", len(updateVTaps))
-		err = vTapmgr.UpdateBulk(updateVTaps)
+		log.Infof(v.Logf("update vtap count(%d)", len(updateVTaps)))
+		err = vTapmgr.AgentUpdateBulk(updateVTaps)
 		if err != nil {
-			log.Error(err)
+			log.Error(v.Logf("%s", err))
 		}
 	}
 }
@@ -1072,6 +1184,9 @@ func (v *VTapInfo) unsetVTapChangedForPD() {
 }
 
 func (v *VTapInfo) PutVTapCacheRefresh() {
+	if v == nil {
+		return
+	}
 	select {
 	case v.chVTapCacheRefresh <- struct{}{}:
 	default:
@@ -1087,12 +1202,29 @@ func (v *VTapInfo) getRegion() string {
 }
 
 func (v *VTapInfo) GetRegionIDByLcuuid(lcuuid string) int {
+	if v == nil {
+		return 0
+	}
 	return v.lcuuidToRegionID[lcuuid]
 }
 
 func (v *VTapInfo) getDefaultVTapGroup() string {
+	if v == nil {
+		return ""
+	}
 	if v.defaultVTapGroup != nil {
 		return *v.defaultVTapGroup
+	}
+
+	return ""
+}
+
+func (v *VTapInfo) getDefaultVTapGroupLicenseFunctions() string {
+	if v == nil {
+		return ""
+	}
+	if v.defaultVTapGroupLicenseFunctions != nil {
+		return *v.defaultVTapGroupLicenseFunctions
 	}
 
 	return ""
@@ -1107,8 +1239,8 @@ func (v *VTapInfo) getVTapAutoRegister() bool {
 }
 
 func (v *VTapInfo) Register(tapMode int, ctrlIP string, ctrlMac string,
-	hostIPs []string, host string, vTapGroupID string, agentUniqueIdentifier int) {
-	vTapRegister := newVTapRegister(tapMode, ctrlIP, ctrlMac, hostIPs, host, vTapGroupID, agentUniqueIdentifier)
+	hostIPs []string, host string, vTapGroupID string, agentUniqueIdentifier int, teamID int) {
+	vTapRegister := newVTapRegister(tapMode, ctrlIP, ctrlMac, hostIPs, host, vTapGroupID, agentUniqueIdentifier, v, teamID)
 	v.registerMU.Lock()
 	v.register[vTapRegister.getKey()] = vTapRegister
 	v.registerMU.Unlock()
@@ -1127,12 +1259,12 @@ func (v *VTapInfo) putChRegisterFisnish() {
 
 func (v *VTapInfo) StartRegister() {
 	if v.loadRegion() == "" {
-		log.Error("controller not found region")
+		log.Error(v.Logf("controller not found region"))
 		return
 	}
 	if v.getDefaultVTapGroup() == "" {
 		if v.loadDefaultVTapGroup() == "" {
-			log.Error("controller not found default vtap group")
+			log.Error(v.Logf("controller not found default vtap group"))
 			return
 		}
 	}
@@ -1143,7 +1275,7 @@ func (v *VTapInfo) StartRegister() {
 	var wg sync.WaitGroup
 	for _, r := range register {
 		wg.Add(1)
-		go r.registerVTap(v, wg.Done)
+		go r.registerVTap(wg.Done)
 	}
 	wg.Wait()
 }
@@ -1152,37 +1284,76 @@ func (v *VTapInfo) monitorVTapRegister() {
 	for {
 		select {
 		case <-v.chVTapRegister:
-			log.Info("start vtap register")
+			log.Info(v.Logf("start vtap register"))
 			v.StartRegister()
 			select {
 			case <-v.chRegisterSuccess:
 				v.putChVTapChangedForSegment()
 			default:
 			}
-			log.Info("end vtap register")
+			log.Info(v.Logf("end vtap register"))
+		case <-v.ctx.Done():
+			log.Info(v.Log("exit monitor vtap Register"))
+			return
+
 		}
 	}
 }
 
-func (v *VTapInfo) TimedRefreshVTapCache() {
-	v.InitData()
-	go v.monitorDataChanged()
-	go v.monitorVTapRegister()
-	go v.processInfo.TimedGenerateGPIDInfo()
+func (v *VTapInfo) timedRefreshVTapCache() {
 	interval := time.Duration(v.config.VTapCacheRefreshInterval)
 	tickerVTapCache := time.NewTicker(interval * time.Second).C
 	for {
 		select {
 		case <-tickerVTapCache:
-			log.Info("start generate vtap cache data from timed")
+			log.Info(v.Logf("start generate vtap cache data from timed"))
 			v.GenerateVTapCache()
 			v.processInfo.DeleteAgentExpiredData(v.dbVTapIDs)
-			log.Info("end generate vtap cache data from timed")
+			v.agentProcessInfo.DeleteAgentExpiredData(v.dbVTapIDs)
+			log.Info(v.Logf("end generate vtap cache data from timed"))
 		case <-v.chVTapCacheRefresh:
-			log.Info("start generate vtap cache data from rpc")
+			log.Info(v.Logf("start generate vtap cache data from rpc"))
 			v.GenerateVTapCache()
-			pushmanager.Broadcast()
-			log.Info("end generate vtap cache data from rpc")
+			pushmanager.Broadcast(v.GetORGID())
+			log.Info(v.Logf("end generate vtap cache data from rpc"))
+		case <-v.ctx.Done():
+			log.Info(v.Log("exit generate vtap cache data"))
+			return
 		}
 	}
+}
+
+func (v *VTapInfo) TimedGenerateGPIDInfo() {
+	v.processInfo.getDBData()
+	interval := time.Duration(v.config.GPIDRefreshInterval)
+	ticker := time.NewTicker(interval * time.Second).C
+	for {
+		select {
+		case <-ticker:
+			log.Info(v.Log("start generate gpid data from timed"))
+			v.processInfo.getDBData()
+			v.processInfo.generateData()
+			v.agentProcessInfo.UpdateAgentIdAndPIDToGPID(v.processInfo.agentIdAndPIDToGPID)
+			v.agentProcessInfo.UpdateRVData(v.processInfo.rvData)
+			v.agentProcessInfo.UpdateGrpcConns(v.processInfo.grpcConns)
+			v.agentProcessInfo.generateData()
+			log.Info(v.Log("end generate gpid data from timed"))
+		case <-v.ctx.Done():
+			log.Info(v.Log("exit generate gpid data"))
+			return
+		}
+	}
+}
+
+func (v *VTapInfo) Run() {
+	v.InitData()
+	go v.monitorDataChanged()
+	go v.monitorVTapRegister()
+	go v.TimedGenerateGPIDInfo()
+	go v.timedRefreshVTapCache()
+}
+
+func (v *VTapInfo) stop() {
+	v.cancel()
+	log.Info(v.Log("exit vtap info generate"))
 }

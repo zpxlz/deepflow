@@ -10,26 +10,11 @@ service Synchronizer {
     rpc Push(SyncRequest) returns (stream SyncResponse) {}
     rpc AnalyzerSync(SyncRequest) returns (SyncResponse) {}
     rpc Upgrade(UpgradeRequest) returns (stream UpgradeResponse) {}
-    rpc Query(NtpRequest) returns (NtpResponse) {}
-    rpc GenesisSync(GenesisSyncRequest) returns (GenesisSyncResponse) {}
-    rpc KubernetesAPISync(KubernetesAPISyncRequest) returns (KubernetesAPISyncResponse) {}
-    rpc PrometheusAPISync(PrometheusAPISyncRequest) returns (PrometheusAPISyncResponse) {}
-    rpc GetKubernetesClusterID(KubernetesClusterIDRequest) returns (KubernetesClusterIDResponse) {}
-    rpc GPIDSync(GPIDSyncRequest) returns (GPIDSyncResponse) {}
-    rpc ShareGPIDLocalData(ShareGPIDSyncRequests) returns (ShareGPIDSyncRequests) {}
-    rpc Plugin(PluginRequest) returns (stream PluginResponse) {}
     rpc GetPrometheusLabelIDs(PrometheusLabelRequest) returns (PrometheusLabelResponse) {}
     rpc GetPrometheusTargets(PrometheusTargetRequest) returns (PrometheusTargetResponse) {}
     rpc GetUniversalTagNameMaps(UniversalTagNameMapsRequest) returns (UniversalTagNameMapsResponse) {}
-}
-
-// debug service
-service Debug {
-    rpc DebugGPIDGlobalData(GPIDSyncRequest) returns (GPIDGlobalData) {}
-    rpc DebugGPIDVTapData(GPIDSyncRequest) returns (GPIDVTapData) {}
-    rpc DebugRealGlobalData(GPIDSyncRequest) returns (RealGlobalData) {}
-    rpc DebugRIPToVIP(GPIDSyncRequest) returns (RVData) {}
-    rpc DebugAgentCache(AgentCacheRequest) returns (AgentCacheResponse) {}
+    // because gRPC cannot be initiated by server, the req/resp of this rpc is reversed
+    rpc GetOrgIDs(OrgIDsRequest) returns (OrgIDsResponse) {}
 }
 
 enum State {
@@ -63,6 +48,7 @@ enum Exception {
     NPB_SOCKET_ERROR = 131072;
     INTEGRATION_SOCKET_ERROR = 262144;
     CGROUPS_CONFIG_ERROR = 524288;
+    SYSTEM_LOAD_CIRCUIT_BREAKER = 1048576;
     // 2^31及以下由采集器使用，采集器最大可用异常是2^31，顺序从前往后
     // 2^32及以上由控制器使用，顺序从后往前
 }
@@ -74,6 +60,12 @@ message CommunicationVtap {
 
 message TsdbReportInfo {
     optional string pcap_data_mount_path = 4;
+}
+
+enum KubernetesWatchPolicy {
+    KWP_NORMAL = 0;
+    KWP_WATCH_ONLY = 1;
+    KWP_WATCH_DISABLED = 2;
 }
 
 message SyncRequest {
@@ -88,14 +80,16 @@ message SyncRequest {
     optional uint64 version_platform_data = 9 [default = 0]; /* only platform data */
     optional uint64 version_acls = 10 [default = 0];
     optional uint64 version_groups = 11 [default = 0];
+    optional string current_k8s_image = 12;
 
     optional string ctrl_ip = 21;
-    optional string host = 22;      // 仅作为注册使用
+    optional string host = 22;      // 表示hostname，操作系统的原始主机名，注册和信息同步使用
     repeated string host_ips = 23;  // 仅作为注册使用
     optional string ctrl_mac = 25;
     optional string vtap_group_id_request = 26;  // 支持采集器自动加入组
     optional bool kubernetes_force_watch = 27 [default = false];
     optional AgentIdentifier agent_unique_identifier = 28 [default = IP_AND_MAC];
+    optional string team_id = 29;   // agent team identity
 
     repeated CommunicationVtap communication_vtaps = 31;  // 仅对数据节点有意义
 
@@ -106,10 +100,14 @@ message SyncRequest {
     optional string os = 35;
     optional string kernel_version = 36;
 
+    optional KubernetesWatchPolicy kubernetes_watch_policy = 41;
+
     optional TsdbReportInfo tsdb_report_info = 43;  // 仅对数据节点有意义
 
     optional string kubernetes_cluster_id = 45;    // 仅对容器类型的采集器有意义
     optional string kubernetes_cluster_name = 46;  // 仅对容器类型的采集器有意义
+
+    optional uint32 org_id = 50;  // only used by Ingester
 }
 
 enum Status {
@@ -180,6 +178,18 @@ enum DecapType {
     DECAP_TYPE_IPIP = 2;
     DECAP_TYPE_TENCENT = 3;
     DECAP_TYPE_GENEVE = 4;
+    DECAP_TYPE_VXLAN_NSH = 5;
+}
+
+enum SystemLoadMetric {
+    Load1 = 0;
+    Load5 = 1;
+    Load15 = 2;
+}
+
+enum SysMemoryMetric {
+    Free = 0;
+    Available = 1;
 }
 
 message Config {
@@ -187,7 +197,7 @@ message Config {
     optional uint32 max_cpus = 2 [default = 1];
     optional uint32 max_memory = 3 [default = 768];  // in MiB
     optional uint32 sync_interval = 4 [default = 60];
-    optional uint32 stats_interval = 5 [default = 60];
+    optional uint32 stats_interval = 5 [default = 10];
     optional uint64 global_pps_threshold = 6 [default = 200000];
 
     // capture network namespace regex besides root ns
@@ -199,14 +209,14 @@ message Config {
     // calico: cali.*
     // cilium: lxc.*
     // kube-ovn: [0-9a-f]+_h$
-    optional string tap_interface_regex = 8 [default = "^(tap.*|cali.*|veth.*|eth.*|en[osipx].*|lxc.*|lo|[0-9a-f]+_h)$"];
+    optional string tap_interface_regex = 8;
     optional string host = 9;  // override statsd host tag
     optional bool rsyslog_enabled = 10 [default = true];
     optional uint32 output_vlan = 11 [default = 0];
     optional uint32 mtu = 12 [default = 1500];
     optional uint64 npb_bps_threshold = 13 [default = 1000000000];
     optional bool collector_enabled = 14 [default = false];
-    // _ = 15; // deprecated
+    optional uint32 max_millicpus = 15 [default = 1000];  // in MilliCore, 1000 = 1 Core
     optional bool platform_enabled = 16 [default = false];
     optional bool kubernetes_api_enabled = 17 [default = false];
     optional uint64 server_tx_bandwidth_threshold = 18 [default = 0];  // bps
@@ -232,12 +242,15 @@ message Config {
 
     optional uint32 vtap_id = 40;  // 限制在64000
     optional common.TridentType trident_type = 41 [default = TT_UNKNOWN];
+    optional uint32 platform_sync_interval = 42 [default = 10];
+    optional uint32 team_id = 43 [default = 0];
+    optional uint32 organize_id = 44 [default = 0];
 
     optional SocketType collector_socket_type = 45 [default = TCP];
     // _ = 46; // deprecated
     optional SocketType npb_socket_type = 47 [default = RAW_UDP];
 
-    optional uint32 pcap_data_retention = 51 [default = 7];  // uint: day
+    optional uint32 pcap_data_retention = 51 [default = 7];  // deprecated, uint: day
     optional uint32 capture_packet_size = 52 [default = 65535];
     optional bool inactive_server_port_enabled = 53 [default = true];
     optional string capture_bpf = 54 [default = ""];
@@ -274,7 +287,7 @@ message Config {
     optional bool external_agent_http_proxy_enabled = 406 [default = true];  // 外部Agent数据HTTP代理开关
     optional uint32 external_agent_http_proxy_port = 407 [default = 38086];  // 外部Agent数据HTTP代理端口
     // _ = 408; // deprecated. 408 was once occupied by prometheus_http_api_address.
-    repeated string prometheus_http_api_addresses = 409;
+    // repeated string prometheus_http_api_addresses = 409; // 6.5 delete
 
     optional uint32 packet_sequence_flag = 410 [default = 0];
 
@@ -283,6 +296,11 @@ message Config {
     optional uint32 sys_free_memory_limit = 501 [default = 0];
     optional uint32 log_file_size = 502 [default = 1000];
     optional TapMode tap_mode = 503 [default = LOCAL];
+    optional float system_load_circuit_breaker_threshold = 504 [default = 1.0];
+    optional SystemLoadMetric system_load_circuit_breaker_metric = 505 [default = Load15];
+    optional float system_load_circuit_breaker_recover = 506 [default = 0.9];
+    optional string secret_key = 507; // secret key for dataplane
+    optional SysMemoryMetric sys_free_memory_metric = 508 [default = Free];
 
     optional string local_config = 510;  // 全量的配置文件内容
 }
@@ -325,6 +343,7 @@ enum AutoServiceType {
     AUTO_SERVICE_TYPE_VGATEWAY = 5;
     AUTO_SERVICE_TYPE_HOST = 6;
     AUTO_SERVICE_TYPE_DHCP_PORT = 9;
+    AUTO_SERVICE_TYPE_POD = 10;
     AUTO_SERVICE_TYPE_POD_SERVICE = 11;
     AUTO_SERVICE_TYPE_REDIS_INSTANCE = 12;
     AUTO_SERVICE_TYPE_RDS_INSTANCE = 13;
@@ -334,6 +353,8 @@ enum AutoServiceType {
 
     AUTO_SERVICE_TYPE_POD_GROUP = 101;
     AUTO_SERVICE_TYPE_SERVICE = 102;
+    AUTO_SERVICE_TYPE_POD_CLUSTER = 103;
+    AUTO_SERVICE_TYPE_CUSTOM_SERVICE = 104;
     AUTO_SERVICE_TYPE_PROCESS = 120;
     AUTO_SERVICE_TYPE_POD_GROUP_DEPLOYMENT = 130;
     AUTO_SERVICE_TYPE_POD_GROUP_STATEFULSET = 131;
@@ -391,6 +412,7 @@ enum ServiceType {
     LB_SERVICE = 4;             // (epc_id, ip, protocol, server_port)
     // NAT_SERVICE = 5;
     // RG_SERVICE = 6;
+    CUSTOM_SERVICE = 7;         // (epc_id, ip) or (epc_id, ip, server_port)
 }
 
 enum ServiceProtocol {
@@ -404,12 +426,13 @@ message ServiceInfo {
     optional uint32 id = 2;
     optional uint32 pod_cluster_id = 3 [default = 0];  // Availabel when type == POD_SERVICE_NODE
     optional uint32 pod_group_id = 4 [default = 0];    // Availabel when type == POD_SERVICE_POD_GROUP
-    optional uint32 epc_id = 5 [default = 0];          // Availabel when type in [POD_SERVICE_IP, LB_SERVICE]
-    repeated string ips = 6;                           // Available when type in [POD_SERVICE_IP, LB_SERVICE], list of IP addresses
+    optional uint32 epc_id = 5 [default = 0];          // Availabel when type in [POD_SERVICE_IP, LB_SERVICE, CUSTOM_SERVICE]
+    repeated string ips = 6;                           // Availabel when type in [POD_SERVICE_IP, LB_SERVICE, CUSTOM_SERVICE], list of IP addresses
     // 7: reserve for cidrs
     // 8: reserve for ip-ranges
     optional ServiceProtocol protocol = 9 [default = ANY];
-    repeated uint32 server_ports = 10;
+    // when type == CUSTOM_SERVICE, the length of `server_ports` is 0 or the length == len(`ips`)
+    repeated uint32 server_ports = 10;                // Availabel when type in [POD_SERVICE_IP, LB_SERVICE, CUSTOM_SERVICE], list of IP addresses
 }
 
 message Groups {
@@ -526,8 +549,10 @@ message PodIp {
 message VtapIp {
     optional uint32 vtap_id = 1;
     optional uint32 epc_id = 2;
-    optional string ip = 3;  // 采集器运行环境的IP
+    optional string ip = 3;             // 采集器运行环境的IP
     optional uint32 pod_cluster_id = 4;
+    optional uint32 team_id = 5;        // agent team id for ingester
+    optional uint32 org_id = 6;         // agent org id for ingester
 }
 
 message SkipInterface {
@@ -579,6 +604,7 @@ message SyncResponse {
 message UpgradeRequest {
     optional string ctrl_ip = 1;
     optional string ctrl_mac = 3;
+    optional string team_id = 4;    // agent team identity
 }
 message UpgradeResponse {
     optional Status status = 1;     // 调用是否成功
@@ -586,170 +612,13 @@ message UpgradeResponse {
     optional string md5 = 3;        // 文件MD5
     optional uint64 total_len = 4;  // 数据总长
     optional uint32 pkt_count = 5;  // 包总个数
-}
-
-message NtpRequest {
-    optional string ctrl_ip = 1;  // 请求端的控制口IP
-    optional bytes request = 10;  // 数据
-}
-
-message NtpResponse {
-    optional bytes response = 1;  // 数据
+    optional string k8s_image = 6;  // When k8s_image is not empty, ignore content
 }
 
 message PluginConfig {
     optional uint32 update_time = 1 [default = 0];  // latest epoch of all configured plugins
     repeated string wasm_plugins = 2;
     repeated string so_plugins = 3;
-}
-
-enum PluginType {
-    WASM = 1;
-    SO = 2;
-}
-
-message PluginRequest {
-    optional string ctrl_ip = 1;
-    optional string ctrl_mac = 2;
-    optional PluginType plugin_type = 3;
-    optional string plugin_name = 4;
-}
-
-message PluginResponse {
-    optional Status status = 1;                     // 调用是否成功
-    optional bytes content = 2;                     // 数据
-    optional string md5 = 3;                        // 文件MD5
-    optional uint64 total_len = 4;                  // 数据总长
-    optional uint32 pkt_count = 5;                  // 包总个数
-    optional uint32 update_time = 6 [default = 0];  // plugin update epoch
-}
-
-message GenesisPlatformData {
-    repeated Ip ips = 7;
-
-    optional bool platform_enabled = 10;
-    optional string raw_hostname = 11;
-    optional string raw_all_vm_xml = 12;
-    optional string raw_vm_states = 13;
-    optional string raw_ovs_interfaces = 14;
-    optional string raw_ovs_ports = 15;
-    optional string raw_brctl_show = 16;
-    optional string raw_vlan_config = 17;
-
-    repeated Lldp lldp_info = 20;
-
-    repeated string raw_ip_netns = 30;
-    repeated string raw_ip_addrs = 31;
-    repeated InterfaceInfo interfaces = 32;
-}
-
-message Ip {
-    optional uint32 last_seen = 2;
-    optional uint64 mac = 3;
-    optional bytes ip = 4;
-
-    optional string port_uuid = 9;
-}
-
-message Lldp {
-    optional string interface = 1;
-    optional string system_name = 2;
-    optional string management_address = 5;
-    optional string port_id = 10;
-    optional string port_description = 11;
-}
-
-message InterfaceInfo {
-    optional uint64 mac = 1;
-    // ip/masklen
-    repeated string ip = 2;
-    optional string name = 3;
-    optional string device_id = 4;
-
-    optional uint32 tap_index = 5;
-
-    optional string device_name = 6;
-
-    optional string netns = 7 [default = ""];
-    optional uint32 netns_id = 8 [default = 0];
-
-    optional string if_type = 9 [default = ""];
-}
-
-message Tag {
-    optional string key = 1;
-    optional string value = 2;
-}
-
-message ProcessInfo {
-    optional string name = 1;
-    optional uint64 pid = 2;
-    optional string process_name = 3;
-    optional string cmdline = 4;
-    optional string user = 5;
-    optional uint32 start_time = 6;
-    optional uint32 netns_id = 7 [default = 0];
-    optional string container_id = 8 [default = ""];
-    repeated Tag os_app_tags = 11;
-}
-
-message GenesisProcessData {
-    repeated ProcessInfo process_entries = 5;
-}
-
-message GenesisSyncRequest {
-    optional uint64 version = 1 [default = 0];
-
-    optional common.TridentType trident_type = 2;
-
-    optional string source_ip = 3;
-    optional uint32 vtap_id = 4;
-    optional string kubernetes_cluster_id = 5;  // 仅对容器类型的采集器有意义
-
-    optional string nat_ip = 6;
-
-    optional GenesisPlatformData platform_data = 9;
-    optional GenesisProcessData process_data = 10;
-}
-
-message GenesisSyncResponse {
-    optional uint64 version = 1 [default = 0];
-}
-
-message KubernetesAPISyncRequest {
-    optional string cluster_id = 1;
-    optional uint64 version = 2;
-    optional string error_msg = 3;
-    optional uint32 vtap_id = 4;
-    optional string source_ip = 5;
-    repeated common.KubernetesAPIInfo entries = 10;
-}
-
-message KubernetesAPISyncResponse {
-    optional uint64 version = 1;
-}
-
-message PrometheusAPISyncRequest {
-    optional string cluster_id = 1;
-    optional uint64 version = 2;
-    optional string error_msg = 3;
-    optional uint32 vtap_id = 4;
-    optional string source_ip = 5;
-    repeated common.PrometheusAPIInfo entries = 10;
-}
-
-message PrometheusAPISyncResponse {
-    optional uint64 version = 1;
-}
-
-message KubernetesClusterIDRequest {
-    optional string ca_md5 = 1;                    // md5 of /run/secrets/[kubernetes.io/serviceaccount/ca.crt
-    optional string kubernetes_cluster_name = 46;  // get that from deepflow-agent.yaml
-}
-
-message KubernetesClusterIDResponse {
-    optional string error_msg = 1;
-    optional string cluster_id = 2;
 }
 
 message Pcap {
@@ -772,132 +641,6 @@ enum RoleType {
     ROLE_SERVER = 2;
 }
 
-message GPIDSyncEntry {
-    optional ServiceProtocol protocol = 1 [default = ANY];  // ANY means compressed
-    // server side
-    optional uint32 epc_id_1 = 2 [default = 0];  // u16
-    optional uint32 ipv4_1 = 3 [default = 0];
-    optional uint32 port_1 = 4 [default = 0];  // u16
-    optional uint32 pid_1 = 5 [default = 0];   // pid or gpid
-    // client side
-    optional uint32 epc_id_0 = 6 [default = 0];  // u16
-    optional uint32 ipv4_0 = 7 [default = 0];
-    optional uint32 port_0 = 8 [default = 0];  // u16
-    optional uint32 pid_0 = 9 [default = 0];   // pid or gpid
-    // real ip (before or after NAT)
-    optional uint32 epc_id_real = 10 [default = 0];  // u16
-    optional uint32 ipv4_real = 11 [default = 0];
-    optional uint32 port_real = 12 [default = 0];            // u16
-    optional uint32 pid_real = 13 [default = 0];             // pid or gpid
-    optional RoleType role_real = 14 [default = ROLE_NONE];  // role of real ip, ROLE_NONE means compressed
-
-    // the net namespace index,  neither netns id nor netns inode
-    optional uint32 netns_idx = 15 [default = 0];  // u16
-}
-
-enum GPIDSyncCompressAlgorithm {
-    COMPRESS_ALRO_NONE = 0;
-    // Before assigning a value to an array, we use the following algorithm to
-    // compress the original data:
-    // 1) Data is sorted by the order of fields in the entry of the array. The
-    //    order of the fields is carefully designed. The more likely a field is
-    //    repeated, the higher its order will be.
-    // 2) For each entry, if one of its fields is equal to the corresponding
-    //    field of the previous entry, then its field is assigned a value of 0.
-    //    When a field in Protobuf have a default value of 0, this allows us
-    //    to achieve very efficient compression.
-    COMPRESS_ALGO_IGNORE_IF_EQUAL_TO_PREVIOUS = 1;
-}
-
-message GPIDSyncRequest {
-    optional string ctrl_ip = 1;
-    optional string ctrl_mac = 2;
-    optional uint32 vtap_id = 3;
-    optional GPIDSyncCompressAlgorithm entries_compress_algorithm = 4 [default = COMPRESS_ALRO_NONE];
-    repeated GPIDSyncEntry entries = 10;
-}
-
-message ShareGPIDSyncRequests {
-    optional string server_ip = 1;
-    repeated GPIDSyncRequest sync_requests = 2;
-}
-
-message GPIDSyncResponse {
-    optional GPIDSyncCompressAlgorithm entries_compress_algorithm = 1 [default = COMPRESS_ALRO_NONE];
-    repeated GPIDSyncEntry entries = 2;
-}
-
-message GlobalGPIDEntry {
-    optional ServiceProtocol protocol = 1 [default = ANY];  // ANY means compressed
-    // server side
-    optional uint32 agent_id_1 = 2 [default = 0];
-    optional uint32 epc_id_1 = 3 [default = 0];
-    optional uint32 ipv4_1 = 4 [default = 0];
-    optional uint32 port_1 = 5 [default = 0];
-    optional uint32 pid_1 = 6 [default = 0];
-    optional uint32 gpid_1 = 7 [default = 0];
-    // client side
-    optional uint32 agent_id_0 = 8 [default = 0];
-    optional uint32 epc_id_0 = 9 [default = 0];
-    optional uint32 ipv4_0 = 10 [default = 0];
-    optional uint32 port_0 = 11 [default = 0];
-    optional uint32 pid_0 = 12 [default = 0];
-    optional uint32 gpid_0 = 13 [default = 0];
-
-    optional uint32 netns_idx = 14 [default = 0];
-}
-
-message GPIDGlobalData {
-    repeated GlobalGPIDEntry entries = 1;
-}
-
-message RealClientToRealServer {
-    optional uint32 epc_id_0 = 1 [default = 0];
-    optional uint32 ipv4_0 = 2 [default = 0];
-    optional uint32 port_0 = 3 [default = 0];
-
-    optional uint32 epc_id_1 = 4 [default = 0];
-    optional uint32 ipv4_1 = 5 [default = 0];
-    optional uint32 port_1 = 6 [default = 0];
-
-    optional uint32 epc_id_real = 7 [default = 0];
-    optional uint32 ipv4_real = 8 [default = 0];
-    optional uint32 port_real = 9 [default = 0];
-    optional uint32 pid_real = 10 [default = 0];
-    optional uint32 agent_id_real = 11 [default = 0];
-}
-
-message RealGlobalData {
-    repeated RealClientToRealServer entries = 1;
-}
-
-message RipToVip {
-    optional ServiceProtocol protocol = 1 [default = ANY];  // ANY means compressed
-    optional uint32 epc_id = 2 [default = 0];
-    optional uint32 r_ipv4 = 3 [default = 0];
-    optional uint32 r_port = 4 [default = 0];
-    optional uint32 v_ipv4 = 5 [default = 0];
-    optional uint32 v_port = 6 [default = 0];
-}
-
-message RVData {
-    repeated RipToVip entries = 1;
-}
-
-message GPIDVTapData {
-    optional uint32 update_time = 1 [default = 0];
-    optional GPIDSyncRequest sync_request = 2;
-}
-
-message AgentCacheRequest {
-    optional string ctrl_ip = 1;
-    optional string ctrl_mac = 2;
-}
-
-message AgentCacheResponse {
-    optional bytes content = 1;  // json数据
-}
-
 message LabelRequest {
     optional string name = 1;
     optional string value = 2;
@@ -908,7 +651,7 @@ message LabelResponse {
     optional string value = 2;
     optional uint32 name_id = 3;
     optional uint32 value_id = 4;
-    optional uint32 app_label_column_index = 5;  // starting from 1, if it is 0, it means the label is the target label
+    optional uint32 app_label_column_index = 5;  // starting from 1, if it is 0, it means the label is the target label. When requesting all, response will not carry index
 }
 
 message MetricLabelRequest {
@@ -916,6 +659,8 @@ message MetricLabelRequest {
     optional uint32 pod_cluster_id = 2;
     optional uint32 epc_id = 3;
     repeated LabelRequest labels = 4;  // must contain instance and job label
+
+    optional uint32 org_id = 11;
 }
 
 message MetricLabelResponse {
@@ -924,6 +669,8 @@ message MetricLabelResponse {
     optional uint32 pod_cluster_id = 3;
     optional uint32 epc_id = 4;
     repeated LabelResponse label_ids = 5;
+
+    optional uint32 org_id = 11;
 }
 
 message TargetRequest {
@@ -931,6 +678,8 @@ message TargetRequest {
     optional string instance = 2;
     optional uint32 pod_cluster_id = 3;
     optional uint32 epc_id = 4;
+
+    optional uint32 org_id = 11;
 }
 
 message TargetResponse {
@@ -943,17 +692,33 @@ message TargetResponse {
     optional uint32 target_id = 7;              // when the Controller cannot determine the target_id, fill in 0
     repeated uint32 metric_ids = 8;             // when requesting all prometheus information, you need to carry the metric list related to the target
     repeated uint32 target_label_name_ids = 9;  // when the target labels change, it needs to be synchronized to Ingester regularly
+
+    optional uint32 org_id = 11;
 }
 
-// when the request content is empty, it means requesting all metric label and target information
 message PrometheusLabelRequest {
     repeated MetricLabelRequest request_labels = 1;
     repeated TargetRequest request_targets = 2;
+    // When the request content is empty except version, it means requesting all metric label and target information.
+
+    // the verson is used to identify whether the total data has changed due to expiration.
+    // if the version of the Controller is inconsistent with the requested version by Ingester, the Controller need to send the full amount of data.
+    // if they are consistent, there is no need to send the data.
+    optional uint32 version = 3;
 }
 
 message PrometheusLabelResponse {
     repeated MetricLabelResponse response_label_ids = 1;
     repeated TargetResponse response_target_ids = 2;
+
+    // when requesting all, the Controller need to carry the label value list and the version
+    repeated OrgLabelResponse org_response_labels = 3;
+    optional uint32 version = 4;
+}
+
+message OrgLabelResponse {
+    optional uint32 org_id = 1;
+    repeated LabelResponse response_labels = 2;
 }
 
 message PrometheusTargetRequest {
@@ -982,7 +747,9 @@ message IdNameMap {
     optional string name = 2;
 }
 
-message UniversalTagNameMapsRequest {}
+message UniversalTagNameMapsRequest {
+    optional uint32 org_id = 1;
+}
 
 message UniversalTagNameMapsResponse {
     optional uint32 version = 1;
@@ -999,4 +766,11 @@ message UniversalTagNameMapsResponse {
     repeated IdNameMap subnet_map = 12;
     repeated IdNameMap gprocess_map = 13;
     repeated IdNameMap vtap_map = 14;
+}
+
+message OrgIDsRequest {}
+
+message OrgIDsResponse {
+    repeated uint32 org_ids = 1;
+    optional uint32 update_time = 2;
 }

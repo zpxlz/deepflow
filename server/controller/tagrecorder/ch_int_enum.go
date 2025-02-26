@@ -17,69 +17,67 @@
 package tagrecorder
 
 import (
-	"strconv"
-	"strings"
-
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/querier/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/tag"
 )
 
 type ChIntEnum struct {
-	UpdaterBase[mysql.ChIntEnum, IntEnumTagKey]
+	UpdaterComponent[metadbmodel.ChIntEnum, IntEnumTagKey]
 }
 
 func NewChIntEnum() *ChIntEnum {
 	updater := &ChIntEnum{
-		UpdaterBase[mysql.ChIntEnum, IntEnumTagKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_INT_ENUM,
-		},
+		newUpdaterComponent[metadbmodel.ChIntEnum, IntEnumTagKey](
+			RESOURCE_TYPE_CH_INT_ENUM,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (e *ChIntEnum) generateNewData() (map[IntEnumTagKey]mysql.ChIntEnum, bool) {
+func (e *ChIntEnum) generateNewData(dbClient *metadb.DB) (map[IntEnumTagKey]metadbmodel.ChIntEnum, bool) {
 	sql := "show tag all_int_enum values from tagrecorder"
 	db := "tagrecorder"
 	table := "tagrecorder"
-	keyToItem := make(map[IntEnumTagKey]mysql.ChIntEnum)
+	keyToItem := make(map[IntEnumTagKey]metadbmodel.ChIntEnum)
 	respMap, err := tag.GetEnumTagValues(db, table, sql)
 	if err != nil {
-		log.Errorf("read failed: %v", err)
+		log.Errorf("read failed: %v", err, dbClient.LogPrefixORGID)
 	}
 
 	for name, tagValues := range respMap {
-		tagName := strings.TrimSuffix(name, "."+config.Cfg.Language)
 		for _, valueAndName := range tagValues {
 			tagValue := valueAndName.([]interface{})[0]
-			tagDisplayName := valueAndName.([]interface{})[1]
-			tagDescription := valueAndName.([]interface{})[2]
-			tagValueInt, err := strconv.Atoi(tagValue.(string))
-			if err == nil {
+			tagDisplayNameZH := valueAndName.([]interface{})[1]
+			tagDisplayNameEN := valueAndName.([]interface{})[2]
+			tagDescriptionZH := valueAndName.([]interface{})[3]
+			tagDescriptionEN := valueAndName.([]interface{})[4]
+			tagValueInt, ok := tagValue.(int)
+			if ok {
 				key := IntEnumTagKey{
-					TagName:  tagName,
+					TagName:  name,
 					TagValue: tagValueInt,
 				}
-				keyToItem[key] = mysql.ChIntEnum{
-					TagName:     tagName,
-					Value:       tagValueInt,
-					Name:        tagDisplayName.(string),
-					Description: tagDescription.(string),
+				keyToItem[key] = metadbmodel.ChIntEnum{
+					TagName:       name,
+					Value:         tagValueInt,
+					NameZH:        tagDisplayNameZH.(string),
+					NameEN:        tagDisplayNameEN.(string),
+					DescriptionZH: tagDescriptionZH.(string),
+					DescriptionEN: tagDescriptionEN.(string),
 				}
 			}
-
 		}
 	}
-
 	return keyToItem, true
 }
 
-func (e *ChIntEnum) generateKey(dbItem mysql.ChIntEnum) IntEnumTagKey {
+func (e *ChIntEnum) generateKey(dbItem metadbmodel.ChIntEnum) IntEnumTagKey {
 	return IntEnumTagKey{TagName: dbItem.TagName, TagValue: dbItem.Value}
 }
 
-func (e *ChIntEnum) generateUpdateInfo(oldItem, newItem mysql.ChIntEnum) (map[string]interface{}, bool) {
+func (e *ChIntEnum) generateUpdateInfo(oldItem, newItem metadbmodel.ChIntEnum) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.TagName != newItem.TagName {
 		updateInfo["tag_name"] = newItem.TagName
@@ -87,11 +85,17 @@ func (e *ChIntEnum) generateUpdateInfo(oldItem, newItem mysql.ChIntEnum) (map[st
 	if oldItem.Value != newItem.Value {
 		updateInfo["value"] = newItem.Value
 	}
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+	if oldItem.NameZH != newItem.NameZH {
+		updateInfo["name_zh"] = newItem.NameZH
 	}
-	if oldItem.Description != newItem.Description {
-		updateInfo["description"] = newItem.Description
+	if oldItem.NameEN != newItem.NameEN {
+		updateInfo["name_en"] = newItem.NameEN
+	}
+	if oldItem.DescriptionZH != newItem.DescriptionZH {
+		updateInfo["description_zh"] = newItem.DescriptionZH
+	}
+	if oldItem.DescriptionEN != newItem.DescriptionEN {
+		updateInfo["description_en"] = newItem.DescriptionEN
 	}
 	if len(updateInfo) > 0 {
 		return updateInfo, true

@@ -22,87 +22,88 @@ import (
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/libs/app"
+	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 )
 
 const (
-	EdgeCode    = zerodoc.IPPath | zerodoc.L3EpcIDPath
-	MainAddCode = zerodoc.RegionID | zerodoc.HostID | zerodoc.L3Device | zerodoc.SubnetID | zerodoc.PodNodeID | zerodoc.AZID | zerodoc.PodGroupID | zerodoc.PodNSID | zerodoc.PodID | zerodoc.PodClusterID | zerodoc.ServiceID | zerodoc.Resource
-	EdgeAddCode = zerodoc.RegionIDPath | zerodoc.HostIDPath | zerodoc.L3DevicePath | zerodoc.SubnetIDPath | zerodoc.PodNodeIDPath | zerodoc.AZIDPath | zerodoc.PodGroupIDPath | zerodoc.PodNSIDPath | zerodoc.PodIDPath | zerodoc.PodClusterIDPath | zerodoc.ServiceIDPath | zerodoc.ResourcePath
-	PortAddCode = zerodoc.IsKeyService
+	EdgeCode    = flow_metrics.IPPath | flow_metrics.L3EpcIDPath
+	MainAddCode = flow_metrics.RegionID | flow_metrics.HostID | flow_metrics.L3Device | flow_metrics.SubnetID | flow_metrics.PodNodeID | flow_metrics.AZID | flow_metrics.PodGroupID | flow_metrics.PodNSID | flow_metrics.PodID | flow_metrics.PodClusterID | flow_metrics.ServiceID | flow_metrics.Resource
+	EdgeAddCode = flow_metrics.RegionIDPath | flow_metrics.HostIDPath | flow_metrics.L3DevicePath | flow_metrics.SubnetIDPath | flow_metrics.PodNodeIDPath | flow_metrics.AZIDPath | flow_metrics.PodGroupIDPath | flow_metrics.PodNSIDPath | flow_metrics.PodIDPath | flow_metrics.PodClusterIDPath | flow_metrics.ServiceIDPath | flow_metrics.ResourcePath
+	PortAddCode = flow_metrics.IsKeyService
 
 	SIGNAL_SOURCE_OTEL = 4
 )
 
-func getPlatformInfos(t *zerodoc.Tag, platformData *grpc.PlatformInfoTable) (*grpc.Info, *grpc.Info) {
+func getPlatformInfos(t *flow_metrics.Tag, platformData *grpc.PlatformInfoTable) (*grpc.Info, *grpc.Info) {
 	var info, info1 *grpc.Info
 	if t.L3EpcID != datatype.EPC_FROM_INTERNET {
 		// if the GpId exists but the podId does not exist, first obtain the podId through the GprocessId table delivered by the Controller
 		if t.GPID != 0 && t.PodID == 0 {
-			vtapId, podId := platformData.QueryGprocessInfo(t.GPID)
-			if podId != 0 && vtapId == uint32(t.VTAPID) {
+			vtapId, podId := platformData.QueryGprocessInfo(t.OrgId, t.GPID)
+			if podId != 0 && vtapId == t.VTAPID {
 				t.PodID = podId
-				t.TagSource |= uint8(zerodoc.GpId)
+				t.TagSource |= uint8(flow_metrics.GpId)
 			}
 		}
 
 		// if podId exist, use vtapId + podId to match first
 		if t.PodID != 0 {
-			info = platformData.QueryPodIdInfo(t.PodID)
-			t.TagSource |= uint8(zerodoc.PodId)
+			info = platformData.QueryPodIdInfo(t.OrgId, t.PodID)
+			t.TagSource |= uint8(flow_metrics.PodId)
 		}
 
 		// If vtapId + podId cannot be matched, finally use Mac/EpcIP to match resources
 		if info == nil {
 			if t.MAC != 0 {
-				t.TagSource |= uint8(zerodoc.Mac)
-				info = platformData.QueryMacInfo(t.MAC | uint64(t.L3EpcID)<<48)
+				t.TagSource |= uint8(flow_metrics.Mac)
+				info = platformData.QueryMacInfo(t.OrgId, t.MAC|uint64(t.L3EpcID)<<48)
 				if info == nil {
-					t.TagSource |= uint8(zerodoc.EpcIP)
-					info = common.RegetInfoFromIP(t.IsIPv6 == 1, t.IP6, t.IP, t.L3EpcID, platformData)
+					t.TagSource |= uint8(flow_metrics.EpcIP)
+					info = common.RegetInfoFromIP(t.OrgId, t.IsIPv4 == 0, t.IP6, t.IP, t.L3EpcID, platformData)
 				}
-			} else if t.IsIPv6 != 0 {
-				t.TagSource |= uint8(zerodoc.EpcIP)
-				info = platformData.QueryIPV6Infos(t.L3EpcID, t.IP6)
+			} else if t.IsIPv4 == 0 {
+				t.TagSource |= uint8(flow_metrics.EpcIP)
+				info = platformData.QueryIPV6Infos(t.OrgId, t.L3EpcID, t.IP6)
 			} else {
-				t.TagSource |= uint8(zerodoc.EpcIP)
-				info = platformData.QueryIPV4Infos(t.L3EpcID, t.IP)
+				t.TagSource |= uint8(flow_metrics.EpcIP)
+				info = platformData.QueryIPV4Infos(t.OrgId, t.L3EpcID, t.IP)
 			}
 		}
 	}
 
 	if t.Code&EdgeCode == EdgeCode && t.L3EpcID1 != datatype.EPC_FROM_INTERNET {
 		if t.GPID1 != 0 && t.PodID1 == 0 {
-			vtapId, podId := platformData.QueryGprocessInfo(t.GPID1)
-			if podId != 0 && vtapId == uint32(t.VTAPID) {
+			vtapId, podId := platformData.QueryGprocessInfo(t.OrgId, t.GPID1)
+			if podId != 0 && vtapId == t.VTAPID {
 				t.PodID1 = podId
-				t.TagSource1 |= uint8(zerodoc.GpId)
+				t.TagSource1 |= uint8(flow_metrics.GpId)
 			}
 
 		}
 
 		if t.PodID1 != 0 {
-			info1 = platformData.QueryPodIdInfo(t.PodID1)
-			t.TagSource1 |= uint8(zerodoc.PodId)
+			info1 = platformData.QueryPodIdInfo(t.OrgId, t.PodID1)
+			t.TagSource1 |= uint8(flow_metrics.PodId)
 		}
 
 		if info1 == nil {
 			if t.MAC1 != 0 {
-				t.TagSource1 |= uint8(zerodoc.Mac)
-				info1 = platformData.QueryMacInfo(t.MAC1 | uint64(t.L3EpcID1)<<48)
+				t.TagSource1 |= uint8(flow_metrics.Mac)
+				info1 = platformData.QueryMacInfo(t.OrgId, t.MAC1|uint64(t.L3EpcID1)<<48)
 				if info1 == nil {
-					t.TagSource1 |= uint8(zerodoc.EpcIP)
-					info1 = common.RegetInfoFromIP(t.IsIPv6 == 1, t.IP61, t.IP1, t.L3EpcID1, platformData)
+					t.TagSource1 |= uint8(flow_metrics.EpcIP)
+					info1 = common.RegetInfoFromIP(t.OrgId, t.IsIPv4 == 0, t.IP61, t.IP1, t.L3EpcID1, platformData)
 				}
-			} else if t.IsIPv6 != 0 {
-				t.TagSource1 |= uint8(zerodoc.EpcIP)
-				info1 = platformData.QueryIPV6Infos(t.L3EpcID1, t.IP61)
+			} else if t.IsIPv4 == 0 {
+				t.TagSource1 |= uint8(flow_metrics.EpcIP)
+				info1 = platformData.QueryIPV6Infos(t.OrgId, t.L3EpcID1, t.IP61)
 			} else {
-				t.TagSource1 |= uint8(zerodoc.EpcIP)
-				info1 = platformData.QueryIPV4Infos(t.L3EpcID1, t.IP1)
+				t.TagSource1 |= uint8(flow_metrics.EpcIP)
+				info1 = platformData.QueryIPV4Infos(t.OrgId, t.L3EpcID1, t.IP1)
 			}
 		}
 	}
@@ -110,19 +111,19 @@ func getPlatformInfos(t *zerodoc.Tag, platformData *grpc.PlatformInfoTable) (*gr
 	return info, info1
 }
 
-func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) error {
-	t := doc.Tagger.(*zerodoc.Tag)
+func DocumentExpand(doc app.Document, platformData *grpc.PlatformInfoTable) error {
+	t := doc.Tags()
 	t.SetID("") // 由于需要修改Tag增删Field，清空ID避免字段脏
 
 	// vtap_acl 分钟级数据不用填充
-	if doc.Meter.ID() == zerodoc.ACL_ID &&
+	if doc.Meter().ID() == flow_metrics.ACL_ID &&
 		t.DatabaseSuffixID() == 1 { // 只有acl后缀
 		return nil
 	}
 
-	myRegionID := uint16(platformData.QueryRegionID())
+	myRegionID := uint16(platformData.QueryRegionID(t.OrgId))
 
-	if t.Code&zerodoc.ServerPort == zerodoc.ServerPort {
+	if t.Code&flow_metrics.ServerPort == flow_metrics.ServerPort {
 		t.Code |= PortAddCode
 	}
 
@@ -138,7 +139,7 @@ func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) err
 		t.RegionID1 = uint16(info1.RegionID)
 		t.HostID1 = uint16(info1.HostID)
 		t.L3DeviceID1 = info1.DeviceID
-		t.L3DeviceType1 = zerodoc.DeviceType(info1.DeviceType)
+		t.L3DeviceType1 = flow_metrics.DeviceType(info1.DeviceType)
 		t.SubnetID1 = uint16(info1.SubnetID)
 		t.PodNodeID1 = info1.PodNodeID
 		t.PodNSID1 = uint16(info1.PodNSID)
@@ -148,11 +149,11 @@ func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) err
 		t.PodID1 = info1.PodID
 		t.PodClusterID1 = uint16(info1.PodClusterID)
 		if common.IsPodServiceIP(t.L3DeviceType1, t.PodID1, t.PodNodeID1) {
-			t.ServiceID1 = platformData.QueryService(t.PodID1, t.PodNodeID1, uint32(t.PodClusterID1), t.PodGroupID1, t.L3EpcID1, t.IsIPv6 == 1, t.IP1, t.IP61, t.Protocol, t.ServerPort)
+			t.ServiceID1 = platformData.QueryPodService(t.OrgId, t.PodID1, t.PodNodeID1, uint32(t.PodClusterID1), t.PodGroupID1, t.L3EpcID1, t.IsIPv4 == 0, t.IP1, t.IP61, t.Protocol, t.ServerPort)
 		}
 		if info == nil {
 			var ip0 net.IP
-			if t.IsIPv6 != 0 {
+			if t.IsIPv4 == 0 {
 				ip0 = t.IP6
 			} else {
 				ip0 = utils.IpFromUint32(t.IP)
@@ -162,24 +163,26 @@ func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) err
 				t.RegionID = t.RegionID1
 				t.SubnetID = t.SubnetID1
 				t.AZID = t.AZID1
-				t.TagSource |= uint8(zerodoc.Peer)
+				t.TagSource |= uint8(flow_metrics.Peer)
 			}
 		}
-		if myRegionID != 0 && t.RegionID1 != 0 {
-			if t.TAPSide == zerodoc.Server && t.RegionID1 != myRegionID { // 对于双端 的统计值，需要去掉 tap_side 对应的一侧与自身region_id 不匹配的内容。
-				platformData.AddOtherRegion()
+		// under multiple Orgs, the Analyzer needs to store data from multiple Regions and only verifies whether the Region of the Default Org is correct.
+		if ckdb.IsDefaultOrgID(t.OrgId) && myRegionID != 0 && t.RegionID1 != 0 {
+			if t.TAPSide == flow_metrics.Server && t.RegionID1 != myRegionID { // 对于双端 的统计值，需要去掉 observation_point 对应的一侧与自身region_id 不匹配的内容。
+				platformData.AddOtherRegion(t.OrgId)
 				return fmt.Errorf("My regionID is %d, but document regionID1 is %d", myRegionID, t.RegionID1)
 			}
 		}
 	}
-	t.AutoInstanceID1, t.AutoInstanceType1 = common.GetAutoInstance(t.PodID1, t.GPID1, t.PodNodeID1, t.L3DeviceID1, uint8(t.L3DeviceType1), t.L3EpcID1)
-	t.AutoServiceID1, t.AutoServiceType1 = common.GetAutoService(t.ServiceID1, t.PodGroupID1, t.GPID1, t.PodNodeID1, t.L3DeviceID1, uint8(t.L3DeviceType1), podGroupType1, t.L3EpcID1)
+	t.AutoInstanceID1, t.AutoInstanceType1 = common.GetAutoInstance(t.PodID1, t.GPID1, t.PodNodeID1, t.L3DeviceID1, uint32(t.SubnetID1), uint8(t.L3DeviceType1), t.L3EpcID1)
+	customSeriviceID1 := platformData.QueryCustomService(t.OrgId, t.L3EpcID1, t.IsIPv4 == 0, t.IP1, t.IP61, t.ServerPort)
+	t.AutoServiceID1, t.AutoServiceType1 = common.GetAutoService(customSeriviceID1, t.ServiceID1, t.PodGroupID1, t.GPID1, uint32(t.PodClusterID1), t.L3DeviceID1, uint32(t.SubnetID1), uint8(t.L3DeviceType1), podGroupType1, t.L3EpcID1)
 
 	if info != nil {
 		t.RegionID = uint16(info.RegionID)
 		t.HostID = uint16(info.HostID)
 		t.L3DeviceID = info.DeviceID
-		t.L3DeviceType = zerodoc.DeviceType(info.DeviceType)
+		t.L3DeviceType = flow_metrics.DeviceType(info.DeviceType)
 		t.SubnetID = uint16(info.SubnetID)
 		t.PodNodeID = info.PodNodeID
 		t.PodNSID = uint16(info.PodNSID)
@@ -191,15 +194,15 @@ func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) err
 		if common.IsPodServiceIP(t.L3DeviceType, t.PodID, t.PodNodeID) {
 			//for a single-side table (vtap_xxx_port), if ServerPort is valid, it needs to match the serviceID
 			if t.ServerPort > 0 && t.Code&EdgeCode == 0 {
-				t.ServiceID = platformData.QueryService(t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, t.Protocol, t.ServerPort)
+				t.ServiceID = platformData.QueryPodService(t.OrgId, t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv4 == 0, t.IP, t.IP6, t.Protocol, t.ServerPort)
 				// for the 0-side of the double-side table (vtap_xxx_edge_port) or serverPort is invalid, if it is PodServiceIP, then need to match the serviceID
 			} else if common.IsPodServiceIP(t.L3DeviceType, t.PodID, 0) { //On the 0 side, if it is just Pod Node, there is no need to match the service
-				t.ServiceID = platformData.QueryService(t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, t.Protocol, 0)
+				t.ServiceID = platformData.QueryPodService(t.OrgId, t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv4 == 0, t.IP, t.IP6, t.Protocol, 0)
 			}
 		}
 		if info1 == nil && (t.Code&EdgeCode == EdgeCode) {
 			var ip1 net.IP
-			if t.IsIPv6 != 0 {
+			if t.IsIPv4 == 0 {
 				ip1 = t.IP61
 			} else {
 				ip1 = utils.IpFromUint32(t.IP1)
@@ -209,30 +212,36 @@ func DocumentExpand(doc *app.Document, platformData *grpc.PlatformInfoTable) err
 				t.RegionID1 = t.RegionID
 				t.SubnetID1 = t.SubnetID
 				t.AZID1 = t.AZID
-				t.TagSource1 |= uint8(zerodoc.Peer)
+				t.TagSource1 |= uint8(flow_metrics.Peer)
 			}
 		}
-
-		if myRegionID != 0 && t.RegionID != 0 {
-			if t.Code&EdgeCode == EdgeCode { // 对于双端 的统计值，需要去掉 tap_side 对应的一侧与自身region_id 不匹配的内容。
-				if t.TAPSide == zerodoc.Client && t.RegionID != myRegionID {
-					platformData.AddOtherRegion()
+		// under multiple Orgs, the Analyzer needs to store data from multiple Regions and only verifies whether the Region of the Default Org is correct.
+		if ckdb.IsDefaultOrgID(t.OrgId) && myRegionID != 0 && t.RegionID != 0 {
+			if t.Code&EdgeCode == EdgeCode { // 对于双端 的统计值，需要去掉 observation_point 对应的一侧与自身region_id 不匹配的内容。
+				if t.TAPSide == flow_metrics.Client && t.RegionID != myRegionID {
+					platformData.AddOtherRegion(t.OrgId)
 					return fmt.Errorf("My regionID is %d, but document regionID is %d", myRegionID, t.RegionID)
 				}
 			} else { // 对于单端的统计值，需要去掉与自身region_id不匹配的内容
 				if t.RegionID != myRegionID {
-					platformData.AddOtherRegion()
+					platformData.AddOtherRegion(t.OrgId)
 					return fmt.Errorf("My regionID is %d, but document regionID is %d", myRegionID, t.RegionID)
 				}
 			}
 		}
 	}
-	t.AutoInstanceID, t.AutoInstanceType = common.GetAutoInstance(t.PodID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), t.L3EpcID)
-	t.AutoServiceID, t.AutoServiceType = common.GetAutoService(t.ServiceID, t.PodGroupID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), podGroupType, t.L3EpcID)
+	t.AutoInstanceID, t.AutoInstanceType = common.GetAutoInstance(t.PodID, t.GPID, t.PodNodeID, t.L3DeviceID, uint32(t.SubnetID), uint8(t.L3DeviceType), t.L3EpcID)
+	serverPort := uint16(0)
+	//for a single-side table (network,application), it needs to match the cuustomServiceID with ServerPort
+	if t.Code&EdgeCode == 0 {
+		serverPort = t.ServerPort
+	}
+	customServiceID := platformData.QueryCustomService(t.OrgId, t.L3EpcID, t.IsIPv4 == 0, t.IP, t.IP6, serverPort)
+	t.AutoServiceID, t.AutoServiceType = common.GetAutoService(customServiceID, t.ServiceID, t.PodGroupID, t.GPID, uint32(t.PodClusterID), t.L3DeviceID, uint32(t.SubnetID), uint8(t.L3DeviceType), podGroupType, t.L3EpcID)
 
 	if t.SignalSource == SIGNAL_SOURCE_OTEL {
 		// only show OTel data for services as 'server side'
-		if t.TAPSide == zerodoc.ServerApp && t.ServerPort == 0 {
+		if t.TAPSide == flow_metrics.ServerApp && t.ServerPort == 0 {
 			t.ServerPort = 65535
 		}
 

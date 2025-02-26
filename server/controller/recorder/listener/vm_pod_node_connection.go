@@ -18,7 +18,7 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
@@ -33,7 +33,7 @@ func NewVMPodNodeConnection(c *cache.Cache) *VMPodNodeConnection {
 	}
 }
 
-func (c *VMPodNodeConnection) OnUpdaterAdded(addedDBItems []*mysql.VMPodNodeConnection) {
+func (c *VMPodNodeConnection) OnUpdaterAdded(addedDBItems []*metadbmodel.VMPodNodeConnection) {
 	c.cache.AddVMPodNodeConnections(addedDBItems)
 }
 

@@ -20,34 +20,51 @@ const PERMISSION_TYPE_NUM = 3
 const DB_NAME_FLOW_LOG = "flow_log"
 const DB_NAME_FLOW_METRICS = "flow_metrics"
 const DB_NAME_EXT_METRICS = "ext_metrics"
-const DB_NAME_DEEPFLOW_SYSTEM = "deepflow_system"
+const DB_NAME_DEEPFLOW_SYSTEM = "deepflow_system" // Abandoned
+const DB_NAME_DEEPFLOW_ADMIN = "deepflow_admin"
+const DB_NAME_DEEPFLOW_TENANT = "deepflow_tenant"
 const DB_NAME_EVENT = "event"
 const DB_NAME_PROFILE = "profile"
 const DB_NAME_PROMETHEUS = "prometheus"
 const DB_NAME_FLOW_TAG = "flow_tag"
+const DB_NAME_APPLICATION_LOG = "application_log"
+const TABLE_NAME_VTAP_ACL = "traffic_policy"
+const TABLE_NAME_TRACE_TREE = "trace_tree"
+const TABLE_NAME_SPAN_WITH_TRACE_ID = "span_with_trace_id"
 const IndexTypeIncremetalId = "incremental-id"
 const FormatHex = "hex"
 const TagServerChPrefix = "服务端"
 const TagClientChPrefix = "客户端"
 const TagServerEnPrefix = "Server"
 const TagClientEnPrefix = "Client"
+const LanguageEN = "en"
+
+const (
+	NATIVE_FIELD_TYPE_TAG    = 1
+	NATIVE_FIELD_TYPE_METRIC = 2
+	NATIVE_FIELD_CATEGORY    = "Custom"
+)
 
 var DB_TABLE_MAP = map[string][]string{
 	DB_NAME_FLOW_LOG:        []string{"l4_flow_log", "l7_flow_log", "l4_packet", "l7_packet"},
-	DB_NAME_FLOW_METRICS:    []string{"vtap_flow_port", "vtap_flow_edge_port", "vtap_app_port", "vtap_app_edge_port", "vtap_acl"},
+	DB_NAME_FLOW_METRICS:    []string{"network", "network_map", "application", "application_map", "traffic_policy"},
 	DB_NAME_EXT_METRICS:     []string{"ext_common"},
-	DB_NAME_DEEPFLOW_SYSTEM: []string{"deepflow_system_common"},
-	DB_NAME_EVENT:           []string{"event", "perf_event", "alarm_event"},
+	DB_NAME_DEEPFLOW_ADMIN:  []string{"deepflow_server"},
+	DB_NAME_DEEPFLOW_TENANT: []string{"deepflow_collector"},
+	DB_NAME_EVENT:           []string{"event", "perf_event", "alert_event"},
 	DB_NAME_PROFILE:         []string{"in_process"},
 	DB_NAME_PROMETHEUS:      []string{"samples"},
+	DB_NAME_APPLICATION_LOG: []string{"log"},
 }
 
 var SHOW_TAG_VALUE_MAP = map[string][]string{
-	"ip_resource_map": []string{"ip", "subnet", "region", "az", "host", "chost", "vpc", "router", "dhcpgw", "lb", "lb_listener", "natgw", "redis", "rds", "pod_cluster", "pod_ns", "pod_node", "pod_ingress", "pod_service", "pod_group", "pod"},
 	"pod_ns_map":      []string{"pod_ns", "pod_cluster"},
 	"pod_group_map":   []string{"pod_group", "pod_cluster", "pod_ns"},
 	"pod_service_map": []string{"pod_service", "pod_cluster", "pod_ns"},
 	"pod_map":         []string{"pod", "pod_cluster", "pod_ns", "pod_node", "pod_service", "pod_group"},
-	"chost_map":       []string{"chost", "host", "vpc"},
-	"gprocess_map":    []string{"gprocess", "chost", "vpc"},
+	"chost_map":       []string{"chost", "host", "l3_epc", "chost_ip", "chost_hostname", "subnet"},
+	"gprocess_map":    []string{"gprocess", "chost", "l3_epc"},
+	"pod_ingress_map": []string{"pod_cluster", "pod_ns", "pod_ingress"},
+	"pod_node_map":    []string{"pod_cluster", "pod_node"},
+	"subnet_map":      []string{"l3_epc", "subnet"},
 }

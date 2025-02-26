@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type PodNamespace struct {
-	OperatorBase[mysql.PodNamespace]
+	OperatorBase[*metadbmodel.PodNamespace, metadbmodel.PodNamespace]
 }
 
 func NewPodNamespace() *PodNamespace {
 	operater := &PodNamespace{
-		OperatorBase[mysql.PodNamespace]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.PodNamespace](
+			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *PodNamespace) setDBItemID(dbItem *mysql.PodNamespace, id int) {
-	dbItem.ID = id
 }

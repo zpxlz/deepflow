@@ -17,10 +17,10 @@
 use chrono::prelude::DateTime;
 use chrono::FixedOffset;
 use chrono::Utc;
-use std::ffi::CString;
 use socket_tracer::ebpf::*;
 use std::convert::TryInto;
-use std::env::set_var;
+use std::env;
+use std::ffi::CString;
 use std::fmt::Write;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -85,7 +85,7 @@ fn flow_info(sd: *mut SK_BPF_DATA) -> String {
 
 fn date_time(ts: u64) -> String {
     // Creates a new SystemTime from the specified number of whole seconds
-    let d = UNIX_EPOCH + Duration::from_micros(ts);
+    let d = UNIX_EPOCH + Duration::from_nanos(ts);
     // Create DateTime from SystemTime
     let time = DateTime::<Utc>::from(d);
     let china_timezone = FixedOffset::east(8 * 3600);
@@ -197,10 +197,10 @@ extern "C" fn debug_callback(_data: *mut c_char, len: c_int) {
             // Handle the case where conversion to a Rust string fails
             eprintln!("Error: Unable to convert C string to Rust string");
         }
-    }	
+    }
 }
 
-extern "C" fn socket_trace_callback(sd: *mut SK_BPF_DATA) {
+extern "C" fn socket_trace_callback(_: *mut c_void, sd: *mut SK_BPF_DATA) {
     unsafe {
         let mut proto_tag = String::from("");
         if sk_proto_safe(sd) == SOCK_DATA_OTHER {
@@ -221,18 +221,36 @@ extern "C" fn socket_trace_callback(sd: *mut SK_BPF_DATA) {
             proto_tag.push_str("KAFKA");
         } else if sk_proto_safe(sd) == SOCK_DATA_MQTT {
             proto_tag.push_str("MQTT");
+        } else if sk_proto_safe(sd) == SOCK_DATA_AMQP {
+            proto_tag.push_str("AMQP");
+        } else if sk_proto_safe(sd) == SOCK_DATA_NATS {
+            proto_tag.push_str("NATS");
+        } else if sk_proto_safe(sd) == SOCK_DATA_PULSAR {
+            proto_tag.push_str("PULSAR");
         } else if sk_proto_safe(sd) == SOCK_DATA_DUBBO {
             proto_tag.push_str("DUBBO");
         } else if sk_proto_safe(sd) == SOCK_DATA_SOFARPC {
             proto_tag.push_str("SOFARPC");
         } else if sk_proto_safe(sd) == SOCK_DATA_FASTCGI {
             proto_tag.push_str("FASTCGI");
+        } else if sk_proto_safe(sd) == SOCK_DATA_BRPC {
+            proto_tag.push_str("BRPC");
+        } else if sk_proto_safe(sd) == SOCK_DATA_TARS {
+            proto_tag.push_str("TARS");
+        } else if sk_proto_safe(sd) == SOCK_DATA_SOME_IP {
+            proto_tag.push_str("SomeIP");
         } else if sk_proto_safe(sd) == SOCK_DATA_MONGO {
             proto_tag.push_str("MONGO");
         } else if sk_proto_safe(sd) == SOCK_DATA_TLS {
             proto_tag.push_str("TLS");
         } else if sk_proto_safe(sd) == SOCK_DATA_ORACLE {
             proto_tag.push_str("ORACLE");
+        } else if sk_proto_safe(sd) == SOCK_DATA_OPENWIRE {
+            proto_tag.push_str("OPENWIRE");
+        } else if sk_proto_safe(sd) == SOCK_DATA_ZMTP {
+            proto_tag.push_str("ZMTP");
+        } else if sk_proto_safe(sd) == SOCK_DATA_ROCKETMQ {
+            proto_tag.push_str("ROCKETMQ");
         } else {
             proto_tag.push_str("UNSPEC");
         }
@@ -240,7 +258,7 @@ extern "C" fn socket_trace_callback(sd: *mut SK_BPF_DATA) {
         println!("+ --------------------------------- +");
         if sk_proto_safe(sd) == SOCK_DATA_HTTP1 {
             let data = sk_data_str_safe(sd);
-            println!("{} <{}> RECONFIRM {} DIR {} TYPE {} PID {} THREAD_ID {} COROUTINE_ID {} CONTAINER_ID {} SOURCE {} ROLE {} COMM {} {} LEN {} SYSCALL_LEN {} SOCKET_ID 0x{:x} TRACE_ID 0x{:x} TCP_SEQ {} DATA_SEQ {} TimeStamp {}\n{}", 
+            println!("{} <{}> RECONFIRM {} DIR {} TYPE {} PID {} THREAD_ID {} COROUTINE_ID {} CONTAINER_ID {} SOURCE {} ROLE {} COMM {} {} LEN {} SYSCALL_LEN {} SOCKET_ID 0x{:x} TRACE_ID 0x{:x} TCP_SEQ {} DATA_SEQ {} TLS {} TimeStamp {}\n{}",
                      date_time((*sd).timestamp),
                      proto_tag,
                      (*sd).need_reconfirm,
@@ -260,11 +278,12 @@ extern "C" fn socket_trace_callback(sd: *mut SK_BPF_DATA) {
                      (*sd).syscall_trace_id_call,
                      (*sd).tcp_seq,
                      (*sd).cap_seq,
+                     (*sd).is_tls,
                      (*sd).timestamp,
                      data);
         } else {
             let data: Vec<u8> = sk_data_bytes_safe(sd);
-            println!("{} <{}> RECONFIRM {} DIR {} TYPE {} PID {} THREAD_ID {} COROUTINE_ID {} CONTAINER_ID {} SOURCE {} ROLE {} COMM {} {} LEN {} SYSCALL_LEN {} SOCKET_ID 0x{:x} TRACE_ID 0x{:x} TCP_SEQ {} DATA_SEQ {} TimeStamp {}",
+            println!("{} <{}> RECONFIRM {} DIR {} TYPE {} PID {} THREAD_ID {} COROUTINE_ID {} CONTAINER_ID {} SOURCE {} ROLE {} COMM {} {} LEN {} SYSCALL_LEN {} SOCKET_ID 0x{:x} TRACE_ID 0x{:x} TCP_SEQ {} DATA_SEQ {} TLS {} TimeStamp {}",
                      date_time((*sd).timestamp),
                      proto_tag,
                      (*sd).need_reconfirm,
@@ -284,6 +303,7 @@ extern "C" fn socket_trace_callback(sd: *mut SK_BPF_DATA) {
                      (*sd).syscall_trace_id_call,
                      (*sd).tcp_seq,
                      (*sd).cap_seq,
+                     (*sd).is_tls,
                      (*sd).timestamp);
             if (*sd).source == 2 {
                 print_uprobe_http2_info((*sd).cap_data, (*sd).cap_len);
@@ -340,9 +360,9 @@ fn cp_process_name_safe(cp: *mut stack_profile_data) -> String {
 #[allow(dead_code)]
 extern "C" fn continuous_profiler_callback(cp: *mut stack_profile_data) {
     unsafe {
-        process_stack_trace_data_for_flame_graph(cp);
-        increment_counter((*cp).count, 1);
-        increment_counter(1, 0);
+        //process_stack_trace_data_for_flame_graph(cp);
+        //increment_counter((*cp).count, 1);
+        //increment_counter(1, 0);
         //let data = cp_data_str_safe(cp);
         //println!("\n+ --------------------------------- +");
         //println!("{} PID {} START-TIME {} NETNS-ID {} U-STACKID {} K-STACKID {} COMM {} CPU {} COUNT {} LEN {} \n  - {}",
@@ -370,10 +390,12 @@ fn get_counter(counter_type: u32) -> u32 {
 }
 
 fn main() {
-    set_var("RUST_LOG", "info");
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "info")
+    }
     env_logger::builder()
-      .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
-      .init();
+        .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+        .init();
 
     let log_file = CString::new("/var/log/deepflow-ebpf.log".as_bytes()).unwrap();
     let log_file_c = log_file.as_c_str();
@@ -383,11 +405,20 @@ fn main() {
         enable_ebpf_protocol(SOCK_DATA_DUBBO as c_int);
         enable_ebpf_protocol(SOCK_DATA_SOFARPC as c_int);
         enable_ebpf_protocol(SOCK_DATA_FASTCGI as c_int);
+        enable_ebpf_protocol(SOCK_DATA_BRPC as c_int);
+        enable_ebpf_protocol(SOCK_DATA_TARS as c_int);
+        enable_ebpf_protocol(SOCK_DATA_SOME_IP as c_int);
         enable_ebpf_protocol(SOCK_DATA_MYSQL as c_int);
         enable_ebpf_protocol(SOCK_DATA_POSTGRESQL as c_int);
         enable_ebpf_protocol(SOCK_DATA_REDIS as c_int);
         enable_ebpf_protocol(SOCK_DATA_KAFKA as c_int);
         enable_ebpf_protocol(SOCK_DATA_MQTT as c_int);
+        enable_ebpf_protocol(SOCK_DATA_AMQP as c_int);
+        enable_ebpf_protocol(SOCK_DATA_OPENWIRE as c_int);
+        enable_ebpf_protocol(SOCK_DATA_ZMTP as c_int);
+        enable_ebpf_protocol(SOCK_DATA_ROCKETMQ as c_int);
+        enable_ebpf_protocol(SOCK_DATA_NATS as c_int);
+        enable_ebpf_protocol(SOCK_DATA_PULSAR as c_int);
         enable_ebpf_protocol(SOCK_DATA_DNS as c_int);
         enable_ebpf_protocol(SOCK_DATA_MONGO as c_int);
         enable_ebpf_protocol(SOCK_DATA_TLS as c_int);
@@ -436,7 +467,7 @@ fn main() {
                     ::std::process::exit(1);
                 }
         */
- 
+
         set_protocol_ports_bitmap(
             SOCK_DATA_HTTP1 as c_int,
             CString::new("1-65535".as_bytes())
@@ -467,6 +498,27 @@ fn main() {
         );
         set_protocol_ports_bitmap(
             SOCK_DATA_FASTCGI as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_BRPC as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_TARS as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_SOME_IP as c_int,
             CString::new("1-65535".as_bytes())
                 .unwrap()
                 .as_c_str()
@@ -508,6 +560,41 @@ fn main() {
                 .as_ptr(),
         );
         set_protocol_ports_bitmap(
+            SOCK_DATA_AMQP as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_OPENWIRE as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_NATS as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_PULSAR as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
+            SOCK_DATA_ZMTP as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
             SOCK_DATA_DNS as c_int,
             CString::new("53".as_bytes()).unwrap().as_c_str().as_ptr(),
         );
@@ -519,11 +606,21 @@ fn main() {
                 .as_ptr(),
         );
         set_protocol_ports_bitmap(
+            SOCK_DATA_ROCKETMQ as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
             SOCK_DATA_TLS as c_int,
             CString::new("443".as_bytes()).unwrap().as_c_str().as_ptr(),
         );
 
-       if running_socket_tracer(
+	// dpdk enable
+	// set_dpdk_trace_enabled(true);
+
+        if running_socket_tracer(
             socket_trace_callback, /* Callback interface rust -> C */
             1, /* Number of worker threads, indicating how many user-space threads participate in data processing */
             128, /* Number of page frames occupied by kernel-shared memory, must be a power of 2. Used for perf data transfer */
@@ -536,6 +633,28 @@ fn main() {
             println!("running_socket_tracer() error.");
             ::std::process::exit(1);
         }
+
+        let feature: c_int = FEATURE_UPROBE_GOLANG;
+        let pids: [c_int; 3] = [101, 202, 303];
+        let num: c_int = pids.len() as c_int;
+        let result = set_feature_pids(feature, pids.as_ptr(), num);
+        println!("Result {}", result);
+
+        // Test for dpdk
+        //set_dpdk_cmd_name(
+        //    CString::new("l2fwd".as_bytes()).unwrap().as_c_str().as_ptr
+        //);
+        //// i40e_recv_pkts, virtio_recv_pkts
+        //// i40e_xmit_pkts, virtio_xmit_pkts, virtio_recv_mergeable_pkts
+        //set_dpdk_hooks(
+        //    DPDK_HOOK_TYPE_RECV as c_int,
+        //    CString::new("rte_eth_rx_burst,virtio_recv_mergeable_pkts".
+        //);
+        //set_dpdk_hooks(
+        //    DPDK_HOOK_TYPE_XMIT as c_int,
+        //    CString::new("virtio_xmit_pkts".as_bytes()).unwrap().as_c_s
+        //);
+        //dpdk_trace_start();
 
         // test data limit max
         set_data_limit_max(10000);
@@ -557,7 +676,8 @@ fn main() {
         //    ::std::process::exit(1);
         //}
 
-        //set_profiler_regex(
+        //set_feature_regex(
+        //    ebpf::FEATURE_PROFILE_ONCPU,
         //    CString::new(
         //        "^(java|nginx|profiler|telegraf|mysqld|.*deepflow.*|socket_tracer)$".as_bytes(),
         //    )

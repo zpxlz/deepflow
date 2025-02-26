@@ -19,22 +19,23 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddSubDomain(dbItem *mysql.SubDomain, seq int) {
+func (b *DataSet) AddSubDomain(dbItem *metadbmodel.SubDomain, seq int) {
 	b.SubDomains[dbItem.Lcuuid] = &SubDomain{
 		DiffBase: DiffBase{
 			Sequence: seq,
 			Lcuuid:   dbItem.Lcuuid,
 		},
+		Name: dbItem.Name,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN, b.SubDomains[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN, b.SubDomains[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteSubDomain(lcuuid string) {
 	delete(b.SubDomains, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_SUB_DOMAIN_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type SubDomain struct {

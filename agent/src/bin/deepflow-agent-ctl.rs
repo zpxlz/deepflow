@@ -173,8 +173,9 @@ struct EbpfArgs {
     ///
     /// App Protocol: All(0), Other(1),
     ///   HTTP1(20), HTTP2(21), Dubbo(40), SofaRPC(43),
-    ///   MySQL(60), PostGreSQL(61), Oracle(62), Redis(80),
-    ///   Kafka(100), MQTT(101), DNS(120), TLS(121),
+    ///   MySQL(60), PostGreSQL(61), Oracle(62),
+    ///   Redis(80), MongoDB(81), Memcached(82),
+    ///   Kafka(100), MQTT(101), RocketMQ(107), DNS(120), TLS(121),
     ///
     /// eg: deepflow-agent-ctl ebpf datadump --proto 20
     #[clap(long, parse(try_from_str), default_value_t = 0)]
@@ -228,7 +229,7 @@ impl fmt::Display for Resource {
         match *self {
             Resource::No | Resource::Node | Resource::Nodes => write!(f, "nodes"),
             Resource::Ns | Resource::Namespace | Resource::Namespaces => write!(f, "namespaces"),
-            Resource::Svc | Resource::Service | Resource::Services => write!(f, "namespaces"),
+            Resource::Svc | Resource::Service | Resource::Services => write!(f, "services"),
             Resource::Deploy | Resource::Deployment | Resource::Deployments => {
                 write!(f, "deployments")
             }
@@ -264,7 +265,7 @@ struct RpcCmd {
 enum RpcData {
     Config,
     Platform,
-    TapTypes,
+    CaptureNetworkTypes,
     Cidr,
     Groups,
     Acls,
@@ -372,15 +373,15 @@ impl Controller {
 
                     let beacon: Beacon =
                         decode_from_std_read(&mut &buf[length..n], config::standard())?;
-                    if !vtap_map.contains(&beacon.vtap_id) {
+                    if !vtap_map.contains(&beacon.agent_id) {
                         println!(
                             "{:<14} {:<28} {:<45} {}",
-                            beacon.vtap_id,
+                            beacon.agent_id,
                             beacon.hostname,
                             a.ip(),
                             a.port()
                         );
-                        vtap_map.insert(beacon.vtap_id);
+                        vtap_map.insert(beacon.agent_id);
                     }
                 }
                 Err(e) => return Err(anyhow!("{}", e)),
@@ -398,7 +399,7 @@ impl Controller {
             RpcData::Acls => RpcMessage::Acls(None),
             RpcData::Config => RpcMessage::Config(None),
             RpcData::Platform => RpcMessage::PlatformData(None),
-            RpcData::TapTypes => RpcMessage::TapTypes(None),
+            RpcData::CaptureNetworkTypes => RpcMessage::CaptureNetworkTypes(None),
             RpcData::Cidr => RpcMessage::Cidr(None),
             RpcData::Groups => RpcMessage::Groups(None),
             RpcData::Segments => RpcMessage::Segments(None),
@@ -412,11 +413,13 @@ impl Controller {
         client.send_to(msg)?;
 
         loop {
-            let resp = client.recv::<RpcMessage>()?;
+            let Ok(resp) = client.recv::<RpcMessage>() else {
+                continue;
+            };
             match resp {
                 RpcMessage::Acls(v)
                 | RpcMessage::PlatformData(v)
-                | RpcMessage::TapTypes(v)
+                | RpcMessage::CaptureNetworkTypes(v)
                 | RpcMessage::Cidr(v)
                 | RpcMessage::Groups(v)
                 | RpcMessage::Segments(v) => match v {
@@ -452,7 +455,9 @@ impl Controller {
             println!("available queues: ");
 
             loop {
-                let res = client.recv::<QueueMessage>()?;
+                let Ok(res) = client.recv::<QueueMessage>() else {
+                    continue;
+                };
                 match res {
                     QueueMessage::Names(e) => match e {
                         Some(e) => {
@@ -481,7 +486,9 @@ impl Controller {
             };
             client.send_to(msg)?;
 
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             match res {
                 QueueMessage::Fin => {
                     println!("turn off all queues successful");
@@ -498,7 +505,9 @@ impl Controller {
                 msg: QueueMessage::Off(s.clone()),
             };
             client.send_to(msg)?;
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             match res {
                 QueueMessage::Fin => {
                     println!("turn off queue={} successful", s);
@@ -522,14 +531,18 @@ impl Controller {
             };
             client.send_to(msg)?;
 
-            let res = client.recv::<QueueMessage>()?;
+            let Ok(res) = client.recv::<QueueMessage>() else {
+                return Ok(());
+            };
             if let QueueMessage::Err(e) = res {
                 return Err(anyhow!(e));
             }
             println!("loading queue item...");
             let mut seq = 0;
             loop {
-                let res = client.recv::<QueueMessage>()?;
+                let Ok(res) = client.recv::<QueueMessage>() else {
+                    continue;
+                };
                 match res {
                     QueueMessage::Send(e) => {
                         println!("MSG-{} {}", seq, e);
@@ -572,7 +585,9 @@ impl Controller {
             println!("Interface Index \t MAC address");
 
             loop {
-                let res = client.recv::<PlatformMessage>()?;
+                let Ok(res) = client.recv::<PlatformMessage>() else {
+                    continue;
+                };
                 match res {
                     PlatformMessage::MacMappings(e) => {
                         match e {
@@ -605,7 +620,9 @@ impl Controller {
                 };
                 client.send_to(msg)?;
                 loop {
-                    let res = client.recv::<PlatformMessage>()?;
+                    let Ok(res) = client.recv::<PlatformMessage>() else {
+                        continue;
+                    };
                     match res {
                         PlatformMessage::Version(v) => {
                             /*
@@ -630,7 +647,9 @@ impl Controller {
             client.send_to(msg)?;
             let mut decoder = ZlibDecoder::new(vec![]);
             loop {
-                let res = client.recv::<PlatformMessage>()?;
+                let Ok(res) = client.recv::<PlatformMessage>() else {
+                    continue;
+                };
                 match res {
                     PlatformMessage::Watcher(v) => {
                         /*
@@ -665,7 +684,9 @@ impl Controller {
                 })?;
 
                 loop {
-                    let res = client.recv::<PolicyMessage>()?;
+                    let Ok(res) = client.recv::<PolicyMessage>() else {
+                        continue;
+                    };
                     match res {
                         PolicyMessage::Context(c) => println!("{}", c),
                         PolicyMessage::Done => return Ok(()),
@@ -685,7 +706,9 @@ impl Controller {
 
                 let mut count = 1;
                 loop {
-                    let res = client.recv::<PolicyMessage>()?;
+                    let Ok(res) = client.recv::<PolicyMessage>() else {
+                        continue;
+                    };
                     match res {
                         PolicyMessage::Title(t) => {
                             println!("{}", t);
@@ -708,7 +731,9 @@ impl Controller {
                     msg: PolicyMessage::Analyzing(args.id.unwrap_or_default()),
                 })?;
 
-                let res = client.recv::<PolicyMessage>()?;
+                let Ok(res) = client.recv::<PolicyMessage>() else {
+                    return Ok(());
+                };
                 match res {
                     PolicyMessage::Context(c) => println!("{}", c),
                     _ => unreachable!(),
@@ -741,7 +766,9 @@ impl Controller {
         }
 
         loop {
-            let res = client.recv::<EbpfMessage>()?;
+            let Ok(res) = client.recv::<EbpfMessage>() else {
+                continue;
+            };
             match res {
                 EbpfMessage::Context((seq, c)) => {
                     println!("SEQ {}: {}", seq, String::from_utf8_lossy(&c))

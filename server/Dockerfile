@@ -7,10 +7,11 @@ RUN apk update && \
     apk add tzdata
 
 COPY ./server.yaml /etc/
-RUN mkdir /etc/mysql
-COPY ./controller/db/mysql/migration/rawsql /etc/mysql
+RUN mkdir -p /etc/metadb/schema
+COPY ./controller/db/metadb/migrator/schema /etc/metadb/schema/
 COPY ./controller/cloud/filereader/manual_data_samples.yaml /etc/
 COPY ./querier/db_descriptions /etc/db_descriptions/
+COPY ./controller/cloud/kubernetes_gather/lua /bin/
 ARG TARGETARCH 
 
 RUN --mount=target=/tmp-mount \

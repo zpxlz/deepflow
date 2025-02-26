@@ -38,23 +38,22 @@ use tokio::{runtime::Runtime, task::JoinHandle};
 
 use super::resource_watcher::{
     default_resources, supported_resources, GenericResourceWatcher, GroupVersion, Resource,
-    Watcher, WatcherConfig,
+    ResourceWatcherFactory, SelectedGv, Watcher, WatcherConfig,
 };
 use crate::{
-    config::{handler::PlatformAccess, KubernetesResourceConfig},
+    config::{handler::PlatformAccess, ApiResources},
     error::{Error, Result},
     exception::ExceptionHandler,
-    platform::kubernetes::resource_watcher::ResourceWatcherFactory,
     rpc::Session,
     trident::AgentId,
     utils::{
-        environment::{running_in_container, running_in_only_watch_k8s_mode},
+        environment::{running_in_container, KubeWatchPolicy},
         stats,
     },
 };
 use public::proto::{
+    agent::{Exception, KubernetesApiSyncRequest},
     common::KubernetesApiInfo,
-    trident::{Exception, KubernetesApiSyncRequest},
 };
 
 /*
@@ -197,9 +196,19 @@ impl ApiWatcher {
             return;
         }
 
-        if (!self.context.config.load().kubernetes_api_enabled && !running_in_only_watch_k8s_mode())
-            || !running_in_container()
-        {
+        let wp = KubeWatchPolicy::get();
+        debug!("kubernetes watch policy is {wp:?}");
+        let enabled = match wp {
+            KubeWatchPolicy::Normal => self.context.config.load().kubernetes_api_enabled,
+            KubeWatchPolicy::WatchOnly => true,
+            KubeWatchPolicy::WatchDisabled => {
+                if self.context.config.load().kubernetes_api_enabled {
+                    warn!("kubernetes watcher is enabled but K8S_WATCH_POLICY=watch-disabled");
+                }
+                false
+            }
+        };
+        if !enabled || !running_in_container() {
             return;
         }
 
@@ -244,7 +253,7 @@ impl ApiWatcher {
 
     async fn discover_resources(
         client: &Client,
-        resource_config: &Vec<KubernetesResourceConfig>,
+        resource_config: &Vec<ApiResources>,
         err_msgs: &Arc<Mutex<Vec<String>>>,
     ) -> Result<Vec<Resource>> {
         let mut resources = default_resources();
@@ -287,7 +296,10 @@ impl ApiWatcher {
             };
             let sr = &supported_resources[index];
             if r.group == "" && r.version == "" {
-                resources.push(sr.clone());
+                resources.push(Resource {
+                    field_selector: r.field_selector.clone(),
+                    ..sr.clone()
+                });
                 continue;
             }
             if r.version == "" {
@@ -307,6 +319,7 @@ impl ApiWatcher {
                 } else {
                     resources.push(Resource {
                         group_versions: gv,
+                        field_selector: r.field_selector.clone(),
                         ..sr.clone()
                     });
                 }
@@ -324,7 +337,8 @@ impl ApiWatcher {
                 continue;
             };
             resources.push(Resource {
-                selected_gv: Some(sr.group_versions[index]),
+                selected_gv: SelectedGv::Specified(sr.group_versions[index]),
+                field_selector: r.field_selector.clone(),
                 ..sr.clone()
             });
         }
@@ -357,7 +371,7 @@ impl ApiWatcher {
                 "found {} api in group core/{}",
                 api_resource.name, core_version
             );
-            resources[index].selected_gv = Some(GroupVersion {
+            resources[index].selected_gv = SelectedGv::Inferred(GroupVersion {
                 group: "core",
                 version: core_version,
             });
@@ -442,23 +456,25 @@ impl ApiWatcher {
                                 "found {} api in group {}",
                                 resource_name, version.group_version
                             );
-                            if resource.selected_gv.is_none() {
-                                resource.selected_gv = Some(*gv);
-                            } else {
-                                let selected = &resource.selected_gv.as_ref().unwrap();
-                                if &gv != selected {
+                            match &resource.selected_gv {
+                                SelectedGv::None => {
+                                    resource.selected_gv = SelectedGv::Inferred(*gv)
+                                }
+                                SelectedGv::Inferred(selected) if gv != selected => {
                                     // must exist
                                     let prev_index = resource
                                         .group_versions
                                         .iter()
-                                        .position(|g| &g == selected)
+                                        .position(|g| g == selected)
                                         .unwrap();
                                     // prior
                                     if gv_index < prev_index {
                                         debug!("use more suitable {} api in {}", resource_name, gv);
-                                        resource.selected_gv = Some(*gv);
+                                        resource.selected_gv = SelectedGv::Inferred(*gv);
                                     }
                                 }
+                                // do nothing if a group version is specified in agent config
+                                _ => (),
                             }
                         }
                     }
@@ -476,15 +492,16 @@ impl ApiWatcher {
         for r in resources.iter_mut() {
             if r.selected_gv.is_none() {
                 warn!("resource {} not found, use defaults", r.name);
-                r.selected_gv = Some(r.group_versions[0]);
+                r.selected_gv = SelectedGv::Inferred(r.group_versions[0]);
             }
         }
 
         for r in resources.iter() {
             info!(
-                "will query resource {} from {}",
+                "will query resource {} from {} with field_selector `{}`",
                 r.name,
-                r.selected_gv.unwrap()
+                r.selected_gv.unwrap(),
+                r.field_selector,
             );
         }
 
@@ -492,7 +509,7 @@ impl ApiWatcher {
     }
 
     async fn set_up(
-        resource_config: &Vec<KubernetesResourceConfig>,
+        resource_config: &Vec<ApiResources>,
         runtime: &Runtime,
         apiserver_version: &Arc<Mutex<Info>>,
         err_msgs: &Arc<Mutex<Vec<String>>>,
@@ -538,7 +555,7 @@ impl ApiWatcher {
         for r in resources {
             let key = WatcherKey {
                 name: r.name,
-                group: r.selected_gv.as_ref().unwrap().group,
+                group: r.selected_gv.unwrap().group,
             };
             if let Some(watcher) =
                 watcher_factory.new_watcher(r, namespace, stats_collector, watcher_config)
@@ -643,11 +660,13 @@ impl ApiWatcher {
         }
         let mut msg = {
             let config_guard = context.config.load();
+            let id = agent_id.read();
             KubernetesApiSyncRequest {
                 cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
                 version: pb_version,
-                vtap_id: Some(config_guard.vtap_id as u32),
-                source_ip: Some(agent_id.read().ip.to_string()),
+                agent_id: Some(config_guard.agent_id as u32),
+                source_ip: Some(id.ip.to_string()),
+                team_id: Some(id.team_id.clone()),
                 error_msg: Some(
                     err_msgs
                         .lock()
@@ -776,14 +795,18 @@ impl ApiWatcher {
                 Ok(r) => break r,
                 Err(e) => {
                     warn!("{}", e);
-                    let config_guard = context.config.load();
-                    let msg = KubernetesApiSyncRequest {
-                        cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
-                        version: Some(context.version.load(Ordering::SeqCst)),
-                        vtap_id: Some(config_guard.vtap_id as u32),
-                        source_ip: Some(agent_id.read().ip.to_string()),
-                        error_msg: Some(e.to_string()),
-                        entries: vec![],
+                    let msg = {
+                        let config_guard = context.config.load();
+                        let id = agent_id.read();
+                        KubernetesApiSyncRequest {
+                            cluster_id: Some(config_guard.kubernetes_cluster_id.to_string()),
+                            version: Some(context.version.load(Ordering::SeqCst)),
+                            agent_id: Some(config_guard.agent_id as u32),
+                            source_ip: Some(id.ip.to_string()),
+                            team_id: Some(id.team_id.clone()),
+                            error_msg: Some(e.to_string()),
+                            entries: vec![],
+                        }
                     };
                     if let Err(e) = context
                         .runtime

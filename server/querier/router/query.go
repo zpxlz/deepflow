@@ -42,8 +42,17 @@ func executeQuery() gin.HandlerFunc {
 		args := common.QuerierParams{}
 		args.Context = c.Request.Context()
 		args.Debug = c.Query("debug")
+		args.UseQueryCache, _ = strconv.ParseBool(c.DefaultQuery("use_query_cache", "false"))
+		args.SimpleSql, _ = strconv.ParseBool(c.DefaultQuery("simple_sql", "false"))
+		args.QueryCacheTTL = c.Query("query_cache_ttl")
 		args.QueryUUID = c.Query("query_uuid")
 		args.NoPreWhere, _ = strconv.ParseBool(c.DefaultQuery("no_prewhere", "false"))
+		args.ORGID = c.Request.Header.Get(common.HEADER_KEY_X_ORG_ID)
+		args.Language = c.Request.Header.Get(common.HEADER_KEY_LANGUAGE)
+		// if no org_id in header, set default org id
+		if args.ORGID == "" {
+			args.ORGID = common.DEFAULT_ORG_ID
+		}
 		if args.QueryUUID == "" {
 			query_uuid := uuid.New()
 			args.QueryUUID = query_uuid.String()
@@ -57,7 +66,16 @@ func executeQuery() gin.HandlerFunc {
 			args.DB, _ = json["db"].(string)
 			args.Sql, _ = json["sql"].(string)
 		}
-		result, debug, err := service.Execute(&args)
+
+		result := map[string]interface{}{}
+		debug := map[string]interface{}{}
+		var err error
+		// simple sql
+		if args.SimpleSql {
+			result, debug, err = service.SimpleExecute(&args)
+		} else {
+			result, debug, err = service.Execute(&args)
+		}
 		if err == nil && args.Debug != "true" {
 			debug = nil
 		}

@@ -30,7 +30,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/common"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
 )
 
 const (
@@ -46,12 +50,12 @@ func TestSuite(t *testing.T) {
 	if _, err := os.Stat(TEST_DB_FILE); err == nil {
 		os.Remove(TEST_DB_FILE)
 	}
-	mysql.Db = GetDB()
+	metadb.DefaultDB = GetDB()
 	suite.Run(t, new(SuiteTest))
 }
 
 func (t *SuiteTest) SetupSuite() {
-	t.db = mysql.Db
+	t.db = metadb.DefaultDB
 	for _, val := range getMySQLModels() {
 		t.db.AutoMigrate(val)
 	}
@@ -82,17 +86,17 @@ func GetDB() *gorm.DB {
 
 func getMySQLModels() []interface{} {
 	return []interface{}{
-		&mysql.Domain{}, &mysql.AZ{}, &mysql.SubDomain{}, &mysql.Host{}, &mysql.VM{},
-		&mysql.VPC{}, &mysql.Network{}, &mysql.Subnet{}, &mysql.VRouter{}, &mysql.RoutingTable{},
-		&mysql.DHCPPort{}, &mysql.VInterface{}, &mysql.WANIP{}, &mysql.LANIP{}, &mysql.FloatingIP{},
-		&mysql.SecurityGroup{}, &mysql.SecurityGroupRule{}, &mysql.VMSecurityGroup{}, &mysql.LB{},
-		&mysql.LBListener{}, &mysql.LBTargetServer{}, &mysql.NATGateway{}, &mysql.NATRule{},
-		&mysql.NATVMConnection{}, &mysql.LBVMConnection{}, &mysql.CEN{}, &mysql.PeerConnection{},
-		&mysql.RDSInstance{}, &mysql.RedisInstance{},
-		&mysql.PodCluster{}, &mysql.PodNode{}, &mysql.PodNamespace{}, &mysql.VMPodNodeConnection{},
-		&mysql.PodIngress{}, &mysql.PodIngressRule{}, &mysql.PodIngressRuleBackend{},
-		&mysql.PodService{}, &mysql.PodServicePort{}, &mysql.PodGroup{}, &mysql.PodGroupPort{},
-		&mysql.PodReplicaSet{}, &mysql.Pod{}, &mysql.AZControllerConnection{}, &mysql.Controller{},
+		&metadbmodel.Domain{}, &metadbmodel.AZ{}, &metadbmodel.SubDomain{}, &metadbmodel.Host{}, &metadbmodel.VM{},
+		&metadbmodel.VPC{}, &metadbmodel.Network{}, &metadbmodel.Subnet{}, &metadbmodel.VRouter{}, &metadbmodel.RoutingTable{},
+		&metadbmodel.DHCPPort{}, &metadbmodel.VInterface{}, &metadbmodel.WANIP{}, &metadbmodel.LANIP{}, &metadbmodel.FloatingIP{},
+		&metadbmodel.LB{},
+		&metadbmodel.LBListener{}, &metadbmodel.LBTargetServer{}, &metadbmodel.NATGateway{}, &metadbmodel.NATRule{},
+		&metadbmodel.NATVMConnection{}, &metadbmodel.LBVMConnection{}, &metadbmodel.CEN{}, &metadbmodel.PeerConnection{},
+		&metadbmodel.RDSInstance{}, &metadbmodel.RedisInstance{},
+		&metadbmodel.PodCluster{}, &metadbmodel.PodNode{}, &metadbmodel.PodNamespace{}, &metadbmodel.VMPodNodeConnection{},
+		&metadbmodel.PodIngress{}, &metadbmodel.PodIngressRule{}, &metadbmodel.PodIngressRuleBackend{},
+		&metadbmodel.PodService{}, &metadbmodel.PodServicePort{}, &metadbmodel.PodGroup{}, &metadbmodel.PodGroupPort{},
+		&metadbmodel.PodReplicaSet{}, &metadbmodel.Pod{}, &metadbmodel.AZControllerConnection{}, &metadbmodel.Controller{},
 	}
 }
 
@@ -102,324 +106,309 @@ func randID() int {
 }
 
 func (t *SuiteTest) TestDeleteDomain() {
-	domain := mysql.Domain{Base: mysql.Base{Lcuuid: uuid.NewString()}}
+	domain := metadbmodel.Domain{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}}
 	t.db.Create(&domain)
-	r := t.db.Create(&mysql.AZ{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r := t.db.Create(&metadbmodel.AZ{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.SubDomain{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.SubDomain{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.Host{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.Host{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VM{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.VM{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VPC{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.VPC{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 	networkID := randID()
-	r = t.db.Create(&mysql.Network{Base: mysql.Base{ID: networkID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.Network{Base: metadbmodel.Base{ID: networkID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.Subnet{Base: mysql.Base{Lcuuid: uuid.NewString()}, NetworkID: networkID})
+	r = t.db.Create(&metadbmodel.Subnet{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, NetworkID: networkID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 	vRouterID := randID()
-	r = t.db.Create(&mysql.VRouter{Base: mysql.Base{ID: vRouterID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.VRouter{Base: metadbmodel.Base{ID: vRouterID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.RoutingTable{Base: mysql.Base{Lcuuid: uuid.NewString()}, VRouterID: vRouterID})
+	r = t.db.Create(&metadbmodel.RoutingTable{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, VRouterID: vRouterID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.DHCPPort{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.DHCPPort{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VInterface{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.VInterface{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.WANIP{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.WANIP{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LANIP{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.LANIP{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.FloatingIP{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.FloatingIP{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	sgID := randID()
-	r = t.db.Create(&mysql.SecurityGroup{Base: mysql.Base{ID: sgID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.LB{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.SecurityGroupRule{Base: mysql.Base{Lcuuid: uuid.NewString()}, SecurityGroupID: sgID})
+	r = t.db.Create(&metadbmodel.LBListener{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VMSecurityGroup{Base: mysql.Base{Lcuuid: uuid.NewString()}, SecurityGroupID: sgID})
+	r = t.db.Create(&metadbmodel.LBTargetServer{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LB{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.NATGateway{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LBListener{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.NATRule{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LBTargetServer{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.NATVMConnection{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.NATGateway{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.LBVMConnection{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.NATRule{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.CEN{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.NATVMConnection{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PeerConnection{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LBVMConnection{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.RDSInstance{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.CEN{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.RedisInstance{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PeerConnection{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodCluster{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.RDSInstance{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodNode{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.RedisInstance{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodNamespace{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodCluster{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
-	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodNode{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
-	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodNamespace{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
-	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VMPodNodeConnection{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.VMPodNodeConnection{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 	podIngressID := randID()
-	r = t.db.Create(&mysql.PodIngress{Base: mysql.Base{ID: podIngressID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodIngress{Base: metadbmodel.Base{ID: podIngressID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodIngressRule{Base: mysql.Base{Lcuuid: uuid.NewString()}, PodIngressID: podIngressID})
+	r = t.db.Create(&metadbmodel.PodIngressRule{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, PodIngressID: podIngressID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodIngressRuleBackend{Base: mysql.Base{Lcuuid: uuid.NewString()}, PodIngressID: podIngressID})
+	r = t.db.Create(&metadbmodel.PodIngressRuleBackend{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, PodIngressID: podIngressID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 	podServiceID := randID()
-	r = t.db.Create(&mysql.PodService{Base: mysql.Base{ID: podServiceID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodService{Base: metadbmodel.Base{ID: podServiceID, Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodServicePort{Base: mysql.Base{Lcuuid: uuid.NewString()}, PodServiceID: podServiceID})
+	r = t.db.Create(&metadbmodel.PodServicePort{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, PodServiceID: podServiceID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodGroupPort{Base: mysql.Base{Lcuuid: uuid.NewString()}, PodServiceID: podServiceID})
+	r = t.db.Create(&metadbmodel.PodGroupPort{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, PodServiceID: podServiceID})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodGroup{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodGroup{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodReplicaSet{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.PodReplicaSet{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.Pod{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
+	r = t.db.Create(&metadbmodel.Pod{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domain.Lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 
-	DeleteDomain(domain.Lcuuid)
+	DeleteDomainByNameOrUUID(domain.Lcuuid, &metadb.DB{DB: t.db, ORGID: common.DEFAULT_ORG_ID}, &httpcommon.UserInfo{}, &config.ControllerConfig{})
 
-	var azs []mysql.AZ
+	var azs []metadbmodel.AZ
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&azs)
 	assert.Equal(t.T(), len(azs), 0)
-	var subDomains []mysql.SubDomain
+	var subDomains []metadbmodel.SubDomain
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&subDomains)
 	assert.Equal(t.T(), len(subDomains), 0)
-	var vpcs []mysql.VPC
+	var vpcs []metadbmodel.VPC
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&vpcs)
 	assert.Equal(t.T(), len(vpcs), 0)
-	var hosts []mysql.Host
+	var hosts []metadbmodel.Host
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&hosts)
 	assert.Equal(t.T(), len(hosts), 0)
-	var vms []mysql.VM
+	var vms []metadbmodel.VM
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&vms)
 	assert.Equal(t.T(), len(vms), 0)
-	var networks []mysql.Network
+	var networks []metadbmodel.Network
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&networks)
 	assert.Equal(t.T(), len(networks), 0)
-	var subnets []mysql.Subnet
+	var subnets []metadbmodel.Subnet
 	t.db.Unscoped().Where("vl2id = ?", networkID).Find(&subnets)
 	assert.Equal(t.T(), len(subnets), 0)
-	var vRouters []mysql.VRouter
+	var vRouters []metadbmodel.VRouter
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&vRouters)
 	assert.Equal(t.T(), len(vRouters), 0)
-	var routingRules []mysql.RoutingTable
+	var routingRules []metadbmodel.RoutingTable
 	t.db.Unscoped().Where("vnet_id = ?", vRouterID).Find(&routingRules)
 	assert.Equal(t.T(), len(routingRules), 0)
-	var dhcpPorts []mysql.DHCPPort
+	var dhcpPorts []metadbmodel.DHCPPort
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&dhcpPorts)
 	assert.Equal(t.T(), len(dhcpPorts), 0)
-	var fIPs []mysql.FloatingIP
+	var fIPs []metadbmodel.FloatingIP
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&fIPs)
 	assert.Equal(t.T(), len(fIPs), 0)
-	var vifs []mysql.VInterface
+	var vifs []metadbmodel.VInterface
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&vifs)
 	assert.Equal(t.T(), len(vifs), 0)
-	var wanIPs []mysql.WANIP
+	var wanIPs []metadbmodel.WANIP
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&wanIPs)
 	assert.Equal(t.T(), len(wanIPs), 0)
-	var lanIPs []mysql.LANIP
+	var lanIPs []metadbmodel.LANIP
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&lanIPs)
 	assert.Equal(t.T(), len(lanIPs), 0)
-	var sgs []mysql.SecurityGroup
-	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&sgs)
-	assert.Equal(t.T(), len(sgs), 0)
-	var sgRules []mysql.SecurityGroupRule
-	t.db.Unscoped().Where("sg_id = ?", sgID).Find(&sgRules)
-	assert.Equal(t.T(), len(sgRules), 0)
-	var vmSGs []mysql.VMSecurityGroup
-	t.db.Unscoped().Where("sg_id = ?", sgID).Find(&vmSGs)
 	assert.Equal(t.T(), len(vmSGs), 0)
-	var nats []mysql.NATGateway
+	var nats []metadbmodel.NATGateway
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&nats)
 	assert.Equal(t.T(), len(nats), 0)
-	var natRules []mysql.NATRule
+	var natRules []metadbmodel.NATRule
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&natRules)
 	assert.Equal(t.T(), len(natRules), 0)
-	var natVMs []mysql.NATVMConnection
+	var natVMs []metadbmodel.NATVMConnection
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&natVMs)
 	assert.Equal(t.T(), len(natVMs), 0)
-	var lbs []mysql.LB
+	var lbs []metadbmodel.LB
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&lbs)
 	assert.Equal(t.T(), len(lbs), 0)
-	var lbListeners []mysql.LBListener
+	var lbListeners []metadbmodel.LBListener
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&lbListeners)
 	assert.Equal(t.T(), len(lbListeners), 0)
-	var lbTSs []mysql.LBTargetServer
+	var lbTSs []metadbmodel.LBTargetServer
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&lbTSs)
 	assert.Equal(t.T(), len(lbTSs), 0)
-	var lbVMs []mysql.LBVMConnection
+	var lbVMs []metadbmodel.LBVMConnection
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&lbVMs)
 	assert.Equal(t.T(), len(lbVMs), 0)
-	var pns []mysql.PeerConnection
+	var pns []metadbmodel.PeerConnection
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&pns)
 	assert.Equal(t.T(), len(pns), 0)
-	var cens []mysql.CEN
+	var cens []metadbmodel.CEN
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&cens)
 	assert.Equal(t.T(), len(cens), 0)
-	var podClusters []mysql.PodCluster
+	var podClusters []metadbmodel.PodCluster
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podClusters)
 	assert.Equal(t.T(), len(podClusters), 0)
-	var podNodes []mysql.PodNode
+	var podNodes []metadbmodel.PodNode
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podNodes)
 	assert.Equal(t.T(), len(podNodes), 0)
-	var vmPodNodes []mysql.VMPodNodeConnection
+	var vmPodNodes []metadbmodel.VMPodNodeConnection
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&vmPodNodes)
 	assert.Equal(t.T(), len(vmPodNodes), 0)
-	var podNamespaces []mysql.PodNamespace
+	var podNamespaces []metadbmodel.PodNamespace
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podNamespaces)
 	assert.Equal(t.T(), len(podNamespaces), 0)
-	var podServices []mysql.PodService
+	var podServices []metadbmodel.PodService
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podServices)
 	assert.Equal(t.T(), len(podServices), 0)
-	var podServicePorts []mysql.PodServicePort
+	var podServicePorts []metadbmodel.PodServicePort
 	t.db.Unscoped().Where("pod_service_id = ?", podServiceID).Find(&podServicePorts)
 	assert.Equal(t.T(), len(podServicePorts), 0)
-	var podGroupPorts []mysql.PodGroupPort
+	var podGroupPorts []metadbmodel.PodGroupPort
 	t.db.Unscoped().Where("pod_service_id = ?", podServiceID).Find(&podGroupPorts)
 	assert.Equal(t.T(), len(podGroupPorts), 0)
-	var podIngresses []mysql.PodIngress
+	var podIngresses []metadbmodel.PodIngress
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podIngresses)
 	assert.Equal(t.T(), len(podIngresses), 0)
-	var podIngressRules []mysql.PodIngressRule
+	var podIngressRules []metadbmodel.PodIngressRule
 	t.db.Unscoped().Where("pod_ingress_id = ?", podIngressID).Find(&podIngressRules)
 	assert.Equal(t.T(), len(podIngressRules), 0)
-	var podIngressRuleBkends []mysql.PodIngressRuleBackend
+	var podIngressRuleBkends []metadbmodel.PodIngressRuleBackend
 	t.db.Unscoped().Where("pod_ingress_id = ?", podIngressID).Find(&podIngressRuleBkends)
 	assert.Equal(t.T(), len(podIngressRuleBkends), 0)
-	var podGroups []mysql.PodGroup
+	var podGroups []metadbmodel.PodGroup
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podGroups)
 	assert.Equal(t.T(), len(podGroups), 0)
-	var podRSs []mysql.PodReplicaSet
+	var podRSs []metadbmodel.PodReplicaSet
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&podRSs)
 	assert.Equal(t.T(), len(podRSs), 0)
-	var pods []mysql.Pod
+	var pods []metadbmodel.Pod
 	t.db.Unscoped().Where("domain = ?", domain.Lcuuid).Find(&pods)
 	assert.Equal(t.T(), len(pods), 0)
 }
 
 func (t *SuiteTest) TestDeleteSubDomain() {
 	lcuuid := uuid.NewString()
-	subDomain := mysql.SubDomain{Base: mysql.Base{Lcuuid: lcuuid}}
+	subDomain := metadbmodel.SubDomain{Base: metadbmodel.Base{Lcuuid: lcuuid}}
 	t.db.Create(&subDomain)
-	podCluster := mysql.PodCluster{Base: mysql.Base{Lcuuid: lcuuid}}
+	podCluster := metadbmodel.PodCluster{Base: metadbmodel.Base{Lcuuid: lcuuid}}
 	t.db.Create(&podCluster)
-	r := t.db.Create(&mysql.Network{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r := t.db.Create(&metadbmodel.Network{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.Subnet{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.Subnet{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VInterface{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.VInterface{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.WANIP{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.WANIP{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.LANIP{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.LANIP{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodCluster{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodCluster{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodNode{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodNode{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodNamespace{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodNamespace{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.VMPodNodeConnection{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.VMPodNodeConnection{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodIngress{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodIngress{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodIngressRule{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodIngressRule{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodIngressRuleBackend{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodIngressRuleBackend{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodService{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodService{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodServicePort{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodServicePort{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodGroupPort{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodGroupPort{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodGroup{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodGroup{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.PodReplicaSet{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.PodReplicaSet{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
-	r = t.db.Create(&mysql.Pod{Base: mysql.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
+	r = t.db.Create(&metadbmodel.Pod{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, SubDomain: lcuuid})
 	assert.Equal(t.T(), r.RowsAffected, int64(1))
 
-	DeleteSubDomain(lcuuid)
+	DeleteSubDomain(lcuuid, &metadb.DB{DB: t.db, ORGID: common.DEFAULT_ORG_ID}, &httpcommon.UserInfo{}, &config.ControllerConfig{})
 
-	var networks []mysql.Network
+	var networks []metadbmodel.Network
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&networks)
 	assert.Equal(t.T(), len(networks), 0)
-	var subnets []mysql.Subnet
+	var subnets []metadbmodel.Subnet
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&subnets)
 	assert.Equal(t.T(), len(subnets), 0)
-	var vifs []mysql.VInterface
+	var vifs []metadbmodel.VInterface
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&vifs)
 	assert.Equal(t.T(), len(vifs), 0)
-	var wanIPs []mysql.WANIP
+	var wanIPs []metadbmodel.WANIP
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&wanIPs)
 	assert.Equal(t.T(), len(wanIPs), 0)
-	var lanIPs []mysql.LANIP
+	var lanIPs []metadbmodel.LANIP
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&lanIPs)
 	assert.Equal(t.T(), len(lanIPs), 0)
-	var podClusters []mysql.PodCluster
+	var podClusters []metadbmodel.PodCluster
 	t.db.Unscoped().Where("lcuuid = ?", lcuuid).Find(&podClusters)
 	assert.Equal(t.T(), len(podClusters), 0)
-	var podNodes []mysql.PodNode
+	var podNodes []metadbmodel.PodNode
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podNodes)
 	assert.Equal(t.T(), len(podNodes), 0)
-	var vmPodNodes []mysql.VMPodNodeConnection
+	var vmPodNodes []metadbmodel.VMPodNodeConnection
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&vmPodNodes)
 	assert.Equal(t.T(), len(vmPodNodes), 0)
-	var podNamespaces []mysql.PodNamespace
+	var podNamespaces []metadbmodel.PodNamespace
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podNamespaces)
 	assert.Equal(t.T(), len(podNamespaces), 0)
-	var podServices []mysql.PodService
+	var podServices []metadbmodel.PodService
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podServices)
 	assert.Equal(t.T(), len(podServices), 0)
-	var podServicePorts []mysql.PodServicePort
+	var podServicePorts []metadbmodel.PodServicePort
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podServicePorts)
 	assert.Equal(t.T(), len(podServicePorts), 0)
-	var podGroupPorts []mysql.PodGroupPort
+	var podGroupPorts []metadbmodel.PodGroupPort
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podGroupPorts)
 	assert.Equal(t.T(), len(podGroupPorts), 0)
-	var podIngresses []mysql.PodIngress
+	var podIngresses []metadbmodel.PodIngress
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podIngresses)
 	assert.Equal(t.T(), len(podIngresses), 0)
-	var podIngressRules []mysql.PodIngressRule
+	var podIngressRules []metadbmodel.PodIngressRule
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podIngressRules)
 	assert.Equal(t.T(), len(podIngressRules), 0)
-	var podIngressRuleBkends []mysql.PodIngressRuleBackend
+	var podIngressRuleBkends []metadbmodel.PodIngressRuleBackend
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podIngressRuleBkends)
 	assert.Equal(t.T(), len(podIngressRuleBkends), 0)
-	var podGroups []mysql.PodGroup
+	var podGroups []metadbmodel.PodGroup
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podGroups)
 	assert.Equal(t.T(), len(podGroups), 0)
-	var podRSs []mysql.PodReplicaSet
+	var podRSs []metadbmodel.PodReplicaSet
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&podRSs)
 	assert.Equal(t.T(), len(podRSs), 0)
-	var pods []mysql.Pod
+	var pods []metadbmodel.Pod
 	t.db.Unscoped().Where("sub_domain = ?", lcuuid).Find(&pods)
 	assert.Equal(t.T(), len(pods), 0)
 }
 
 func (t *SuiteTest) TestDeleteSoftDeletedResource() {
 	domainLcuuid := uuid.NewString()
-	t.db.Create(&mysql.AZ{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: domainLcuuid})
-	t.db.Create(&mysql.AZ{Base: mysql.Base{Lcuuid: uuid.NewString()}, Domain: uuid.NewString()})
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.AZ{})
-	var azs []mysql.AZ
+	t.db.Create(&metadbmodel.AZ{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: domainLcuuid})
+	t.db.Create(&metadbmodel.AZ{Base: metadbmodel.Base{Lcuuid: uuid.NewString()}, Domain: uuid.NewString()})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.AZ{})
+	var azs []metadbmodel.AZ
 	t.db.Find(&azs)
 	assert.Equal(t.T(), 0, len(azs))
 	t.db.Unscoped().Find(&azs)
@@ -427,7 +416,7 @@ func (t *SuiteTest) TestDeleteSoftDeletedResource() {
 	t.db.Unscoped().Where("domain = ?", domainLcuuid).Find(&azs)
 	assert.Equal(t.T(), 1, len(azs))
 
-	cleanSoftDeletedResource(domainLcuuid)
+	cleanSoftDeletedResource(&metadb.DB{DB: t.db, ORGID: common.DEFAULT_ORG_ID}, domainLcuuid)
 	t.db.Unscoped().Find(&azs)
 	assert.Equal(t.T(), 1, len(azs))
 	t.db.Unscoped().Where("domain = ?", domainLcuuid).Find(&azs)
@@ -439,13 +428,13 @@ func (t *SuiteTest) TestDeleteSoftDeletedResource() {
 // 	regionLcuuid := "ffffffff-ffff-ffff-ffff-ffffffffffff"
 // 	normalControllerIP := "1.1.1.1"
 // 	unnormalControllerIP := "1.1.1.2"
-// 	t.db.Create(&mysql.AZControllerConnection{Region: regionLcuuid, ControllerIP: normalControllerIP, Lcuuid: uuid.NewString()})
-// 	t.db.Create(&mysql.AZControllerConnection{Region: regionLcuuid, ControllerIP: unnormalControllerIP, Lcuuid: uuid.NewString()})
-// 	t.db.Create(&mysql.Controller{IP: normalControllerIP, State: 2, Lcuuid: uuid.NewString()})
-// 	t.db.Create(&mysql.Controller{IP: unnormalControllerIP, State: 1, Lcuuid: uuid.NewString()})
-// 	t.db.Create(&mysql.Domain{Base: mysql.Base{Lcuuid: domainLcuuid}, ControllerIP: unnormalControllerIP, Config: `{"region_uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff"}`})
-// 	CheckAndAllocateDomainController()
-// 	var domain mysql.Domain
+// 	t.db.Create(&metadbmodel.AZControllerConnection{Region: regionLcuuid, ControllerIP: normalControllerIP, Lcuuid: uuid.NewString()})
+// 	t.db.Create(&metadbmodel.AZControllerConnection{Region: regionLcuuid, ControllerIP: unnormalControllerIP, Lcuuid: uuid.NewString()})
+// 	t.db.Create(&metadbmodel.Controller{IP: normalControllerIP, State: 2, Lcuuid: uuid.NewString()})
+// 	t.db.Create(&metadbmodel.Domainller{IP: unnormalControllerIP, State: 1, Lcuuid: uuid.NewString()})
+// 	t.db.Create(&metadbmodel.Domain{Base: metadbmodel.Base{Lcuuid: domainLcuuid}, ControllerIP: unnormalControllerIP, Config: `{"region_uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff"}`})
+// 	CheckAndAllmysqlmodel.Domainontroller()
+// 	var domain metadbmodel.Domain
 // 	t.db.Where("lcuuid = ?", domainLcuuid).Find(&domain)
 // 	assert.Equal(t.T(), normalControllerIP, domain.ControllerIP)
 // }

@@ -19,93 +19,85 @@ package aliyun
 import (
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
+	ecs "github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+	resmanager "github.com/aliyun/alibaba-cloud-sdk-go/services/resourcemanager"
 	simplejson "github.com/bitly/go-simplejson"
-	logging "github.com/op/go-logging"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	cloudconfig "github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.aliyun")
+var log = logger.MustGetLogger("cloud.aliyun")
 
 type Aliyun struct {
+	orgID          int
+	teamID         int
 	uuid           string
 	uuidGenerate   string
-	regionUuid     string
+	regionLcuuid   string
 	secretID       string
 	secretKey      string
 	regionName     string
 	httpTimeout    int
-	includeRegions []string
-	excludeRegions []string
+	includeRegions map[string]bool
 	vpcIDToLcuuids map[string]string
 
-	// 以下两个字段的作用：消除公有云的无资源的区域和可用区
-	regionLcuuidToResourceNum map[string]int
-	azLcuuidToResourceNum     map[string]int
+	// 消除公有云的无资源可用区使用
+	azLcuuidToResourceNum map[string]int
 
 	debugger *cloudcommon.Debugger
 }
 
-func NewAliyun(domain mysql.Domain, cfg cloudconfig.CloudConfig) (*Aliyun, error) {
+func NewAliyun(orgID int, domain metadbmodel.Domain, cfg cloudconfig.CloudConfig) (*Aliyun, error) {
 	config, err := simplejson.NewJson([]byte(domain.Config))
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
 	secretID, err := config.Get("secret_id").String()
 	if err != nil {
-		log.Error("secret_id must be specified")
+		log.Error("secret_id must be specified", logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
 	secretKey, err := config.Get("secret_key").String()
 	if err != nil {
-		log.Error("secret_key must be specified")
+		log.Error("secret_key must be specified", logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 	decryptSecretKey, err := common.DecryptSecretKey(secretKey)
 	if err != nil {
-		log.Error("decrypt secret_key failed (%s)", err.Error())
+		log.Error("decrypt secret_key failed (%s)", err.Error(), logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
-	excludeRegionsStr := config.Get("exclude_regions").MustString()
-	excludeRegions := []string{}
-	if excludeRegionsStr != "" {
-		excludeRegions = strings.Split(excludeRegionsStr, ",")
-		sort.Strings(excludeRegions)
-	}
-	includeRegionsStr := config.Get("include_regions").MustString()
-	includeRegions := []string{}
-	if includeRegionsStr != "" {
-		includeRegions = strings.Split(includeRegionsStr, ",")
-		sort.Strings(includeRegions)
+	regionLcuuid := config.Get("region_uuid").MustString()
+	if regionLcuuid == "" {
+		regionLcuuid = common.DEFAULT_REGION
 	}
 
 	return &Aliyun{
-		uuid: domain.Lcuuid,
+		orgID:  orgID,
+		teamID: domain.TeamID,
+		uuid:   domain.Lcuuid,
 		// TODO: display_name后期需要修改为uuid_generate
 		uuidGenerate: domain.DisplayName,
-		regionUuid:   config.Get("region_uuid").MustString(),
+		regionLcuuid: regionLcuuid,
 		secretID:     secretID,
 		secretKey:    decryptSecretKey,
 		// TODO: 后期需要修改为从配置文件读取
 		regionName:     "cn-beijing",
-		excludeRegions: excludeRegions,
-		includeRegions: includeRegions,
+		includeRegions: cloudcommon.UniqRegions(config.Get("include_regions").MustString()),
 		httpTimeout:    cfg.HTTPTimeout,
 
-		regionLcuuidToResourceNum: make(map[string]int),
-		azLcuuidToResourceNum:     make(map[string]int),
+		azLcuuidToResourceNum: make(map[string]int),
 
 		vpcIDToLcuuids: map[string]string{},
 
@@ -122,18 +114,10 @@ func (a *Aliyun) CheckAuth() error {
 	return err
 }
 
-func (a *Aliyun) getRegionLcuuid(lcuuid string) string {
-	if a.regionUuid != "" {
-		return a.regionUuid
-	} else {
-		return lcuuid
-	}
-}
-
 func (a *Aliyun) checkRequiredAttributes(json *simplejson.Json, attributes []string) error {
 	for _, attribute := range attributes {
 		if _, ok := json.CheckGet(attribute); !ok {
-			log.Infof("get attribute (%s) failed", attribute)
+			log.Infof("get attribute (%s) failed", attribute, logger.NewORGPrefix(a.orgID))
 			return errors.New(fmt.Sprintf("get attribute (%s) failed", attribute))
 		}
 	}
@@ -147,12 +131,9 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 	var networks []model.Network
 	var subnets []model.Subnet
 	var vms []model.VM
-	var vmSecurityGroups []model.VMSecurityGroup
 	var vinterfaces []model.VInterface
 	var ips []model.IP
 	var floatingIPs []model.FloatingIP
-	var securityGroups []model.SecurityGroup
-	var securityGroupRules []model.SecurityGroupRule
 	var vrouters []model.VRouter
 	var routingTables []model.RoutingTable
 	var natGateways []model.NATGateway
@@ -167,17 +148,61 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 
 	regions, err := a.getRegions()
 	if err != nil {
-		log.Error("get region data failed")
+		log.Error("get region data failed", logger.NewORGPrefix(a.orgID))
 		return resource, err
 	}
+
+	var hasVM bool
+	regionToRGIDs := map[string][]string{}
 	for _, region := range regions {
-		log.Infof("get region (%s) data starting", region.Name)
+		vmResponses, err := a.getVMResponse(region.Label, ecs.CreateDescribeInstancesRequest())
+		if err != nil {
+			log.Errorf("check instance count error: %s", err.Error(), logger.NewORGPrefix(a.orgID))
+			return resource, err
+		}
+		for _, vmResponse := range vmResponses {
+			if len(vmResponse.Get("Instance").MustArray()) != 0 {
+				hasVM = true
+				break
+			}
+		}
+		if hasVM {
+			break
+		}
+	}
+	if !hasVM {
+		log.Debug("get instance resource", logger.NewORGPrefix(a.orgID))
+		resRequest := resmanager.CreateListResourcesRequest()
+		resRequest.SetScheme("https")
+		resRequest.ResourceType = "instance"
+		resResponses, err := a.getResourceResponse(a.regionName, resRequest)
+		if err != nil {
+			log.Errorf("get resource group info error: %s", err.Error(), logger.NewORGPrefix(a.orgID))
+			return resource, err
+		}
+		for _, responses := range resResponses {
+			resources := responses.Get("Resource")
+			for r := range resources.MustArray() {
+				res := resources.GetIndex(r)
+				regionID := res.Get("RegionId").MustString()
+				rgID := res.Get("ResourceGroupId").MustString()
+				if regionID == "" || rgID == "" {
+					log.Warningf("list resources instance RegionId (%s) or ResourceGroupId (%s) is null", regionID, rgID, logger.NewORGPrefix(a.orgID))
+					continue
+				}
+				regionToRGIDs[regionID] = append(regionToRGIDs[regionID], rgID)
+			}
+		}
+	}
+
+	for _, region := range regions {
+		log.Infof("get region (%s) data starting", region.Name, logger.NewORGPrefix(a.orgID))
 		a.vpcIDToLcuuids = map[string]string{}
 
 		// 可用区
 		tmpAZs, err := a.getAZs(region)
 		if err != nil {
-			log.Errorf("get region (%s) az data failed", region.Name)
+			log.Errorf("get region (%s) az data failed", region.Name, logger.NewORGPrefix(a.orgID))
 			return resource, err
 		}
 		azs = append(azs, tmpAZs...)
@@ -185,7 +210,7 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 		// VPC
 		tmpVPCs, err := a.getVPCs(region)
 		if err != nil {
-			log.Errorf("get region (%s) vpc data failed", region.Name)
+			log.Errorf("get region (%s) vpc data failed", region.Name, logger.NewORGPrefix(a.orgID))
 			return resource, err
 		}
 		vpcs = append(vpcs, tmpVPCs...)
@@ -193,20 +218,19 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 		// 子网及网段
 		tmpNetworks, tmpSubnets, err := a.getNetworks(region)
 		if err != nil {
-			log.Errorf("get region (%s) vpc data failed", region.Name)
+			log.Errorf("get region (%s) vpc data failed", region.Name, logger.NewORGPrefix(a.orgID))
 			return resource, err
 		}
 		networks = append(networks, tmpNetworks...)
 		subnets = append(subnets, tmpSubnets...)
 
 		// VM及相关资源
-		tmpVMs, tmpVMSecurityGroups, tmpVInterfaces, tmpIPs, tmpFloatingIPs, vmLcuuidToVPCLcuuid, err := a.getVMs(region)
+		tmpVMs, tmpVInterfaces, tmpIPs, tmpFloatingIPs, vmLcuuidToVPCLcuuid, err := a.getVMs(region, regionToRGIDs[region.Label])
 		if err != nil {
-			log.Errorf("get region (%s) vm data failed", region.Name)
+			log.Errorf("get region (%s) vm data failed", region.Name, logger.NewORGPrefix(a.orgID))
 			return resource, err
 		}
 		vms = append(vms, tmpVMs...)
-		vmSecurityGroups = append(vmSecurityGroups, tmpVMSecurityGroups...)
 		vinterfaces = append(vinterfaces, tmpVInterfaces...)
 		ips = append(ips, tmpIPs...)
 		floatingIPs = append(floatingIPs, tmpFloatingIPs...)
@@ -214,7 +238,7 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 		// VM接口信息
 		tmpVInterfaces, tmpIPs, tmpFloatingIPs, tmpNATRules, err := a.getVMPorts(region)
 		if err != nil {
-			log.Errorf("get region (%s) port data failed", region.Name)
+			log.Errorf("get region (%s) port data failed", region.Name, logger.NewORGPrefix(a.orgID))
 			return resource, err
 		}
 		vinterfaces = append(vinterfaces, tmpVInterfaces...)
@@ -222,41 +246,20 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 		floatingIPs = append(floatingIPs, tmpFloatingIPs...)
 		natRules = append(natRules, tmpNATRules...)
 
-		// 安全组及规则
-		tmpSecurityGroups, tmpSecurityGroupRules, err := a.getSecurityGroups(region)
-		if err != nil {
-			log.Errorf("get region (%s) security_group data failed", region.Name)
-			return resource, err
-		}
-		securityGroups = append(securityGroups, tmpSecurityGroups...)
-		securityGroupRules = append(securityGroupRules, tmpSecurityGroupRules...)
-
 		// 路由表及规则
-		tmpVRouters, tmpRoutingTables, err := a.getRouterAndTables(region)
-		if err != nil {
-			log.Errorf("get region (%s) router data failed", region.Name)
-			return resource, err
-		}
+		tmpVRouters, tmpRoutingTables := a.getRouterAndTables(region)
 		vrouters = append(vrouters, tmpVRouters...)
 		routingTables = append(routingTables, tmpRoutingTables...)
 
 		// NAT网关及规则
-		tmpNATGateways, tmpNATRules, tmpVInterfaces, tmpIPs, err := a.getNatGateways(region)
-		if err != nil {
-			log.Errorf("get region (%s) nat_gateway data failed", region.Name)
-			return resource, err
-		}
+		tmpNATGateways, tmpNATRules, tmpVInterfaces, tmpIPs := a.getNatGateways(region)
 		natGateways = append(natGateways, tmpNATGateways...)
 		natRules = append(natRules, tmpNATRules...)
 		vinterfaces = append(vinterfaces, tmpVInterfaces...)
 		ips = append(ips, tmpIPs...)
 
 		// 负载均衡器及规则
-		tmpLBs, tmpLBListeners, tmpLBTargetServers, tmpVInterfaces, tmpIPs, err := a.getLoadBalances(region, vmLcuuidToVPCLcuuid)
-		if err != nil {
-			log.Errorf("get region (%s) load_balance data failed", region.Label)
-			return resource, err
-		}
+		tmpLBs, tmpLBListeners, tmpLBTargetServers, tmpVInterfaces, tmpIPs := a.getLoadBalances(region, vmLcuuidToVPCLcuuid)
 		lbs = append(lbs, tmpLBs...)
 		lbListeners = append(lbListeners, tmpLBListeners...)
 		lbTargetServers = append(lbTargetServers, tmpLBTargetServers...)
@@ -264,55 +267,34 @@ func (a *Aliyun) GetCloudData() (model.Resource, error) {
 		ips = append(ips, tmpIPs...)
 
 		// 云企业网
-		cens, err = a.getCens(region)
-		if err != nil {
-			log.Errorf("get region (%s) cen data failed", region.Label)
-			return resource, err
-		}
+		cens = append(cens, a.getCens(region)...)
 
 		// Redis
-		tmpRedisInstances, tmpVInterfaces, tmpIPs, err := a.getRedisInstances(region)
-		if err != nil {
-			log.Errorf("get region (%s) redis data failed", region.Name)
-			return resource, err
-		}
+		tmpRedisInstances, tmpVInterfaces, tmpIPs := a.getRedisInstances(region)
 		redisInstances = append(redisInstances, tmpRedisInstances...)
 		vinterfaces = append(vinterfaces, tmpVInterfaces...)
 		ips = append(ips, tmpIPs...)
 
 		// RDS
-		tmpRDSInstances, tmpVInterfaces, tmpIPs, err := a.getRDSInstances(region)
-		if err != nil {
-			log.Errorf("get region (%s) rds data failed", region.Name)
-			return resource, err
-		}
+		tmpRDSInstances, tmpVInterfaces, tmpIPs := a.getRDSInstances(region)
 		rdsInstances = append(rdsInstances, tmpRDSInstances...)
 		vinterfaces = append(vinterfaces, tmpVInterfaces...)
 		ips = append(ips, tmpIPs...)
 
 		// 附属容器集群
-		sDomains, err := a.getSubDomains(region)
-		if err != nil {
-			log.Error("get sub_domain data failed")
-			return resource, err
-		}
-		subDomains = append(subDomains, sDomains...)
+		subDomains = append(subDomains, a.getSubDomains(region)...)
 
-		log.Infof("get region (%s) data completed", region.Name)
+		log.Infof("get region (%s) data completed", region.Name, logger.NewORGPrefix(a.orgID))
 	}
 
-	resource.Regions = cloudcommon.EliminateEmptyRegions(regions, a.regionLcuuidToResourceNum)
 	resource.AZs = cloudcommon.EliminateEmptyAZs(azs, a.azLcuuidToResourceNum)
 	resource.VPCs = vpcs
 	resource.Networks = networks
 	resource.Subnets = subnets
 	resource.VMs = vms
-	resource.VMSecurityGroups = vmSecurityGroups
 	resource.VInterfaces = vinterfaces
 	resource.IPs = ips
 	resource.FloatingIPs = floatingIPs
-	resource.SecurityGroups = securityGroups
-	resource.SecurityGroupRules = securityGroupRules
 	resource.VRouters = vrouters
 	resource.RoutingTables = routingTables
 	resource.NATGateways = natGateways

@@ -28,8 +28,12 @@ use std::time::Duration;
 pub use collector::{Collector, L7Collector};
 
 use bitflags::bitflags;
+use log::info;
 
-use crate::{common::endpoint::EPC_FROM_INTERNET, utils::possible_host::PossibleHost};
+use crate::{
+    common::endpoint::EPC_INTERNET,
+    utils::{possible_host::PossibleHost, stats},
+};
 
 use self::l7_quadruple_generator::L7QuadrupleGeneratorThread;
 use self::types::{MiniFlow, PeerInfo};
@@ -48,32 +52,60 @@ pub fn round_to_minute(t: Duration) -> Duration {
     Duration::from_secs(t.as_secs() / SECONDS_IN_MINUTE * SECONDS_IN_MINUTE)
 }
 
-pub fn check_active(now: u64, possible_host: &mut PossibleHost, flow: &MiniFlow) -> (bool, bool) {
+pub fn check_active(
+    now: u64,
+    possible_host: &mut Option<PossibleHost>,
+    flow: &MiniFlow,
+) -> (bool, bool) {
     (
         check_active_host(now, possible_host, &flow.peers[0], &flow.flow_key.ip_src),
         check_active_host(now, possible_host, &flow.peers[1], &flow.flow_key.ip_dst),
     )
 }
 
+pub fn reset_delay_seconds(delay_seconds: u64) -> u64 {
+    if (SECONDS_IN_MINUTE..SECONDS_IN_MINUTE * 2).contains(&delay_seconds) {
+        delay_seconds
+    } else if delay_seconds < SECONDS_IN_MINUTE {
+        info!(
+            "delay_seconds {} < {}, reset delay_seconds to {}.",
+            delay_seconds, SECONDS_IN_MINUTE, SECONDS_IN_MINUTE
+        );
+        SECONDS_IN_MINUTE
+    } else {
+        info!(
+            "delay_seconds {} >= {}, reset delay_seconds to {}.",
+            delay_seconds,
+            SECONDS_IN_MINUTE * 2,
+            SECONDS_IN_MINUTE * 2 - 1
+        );
+        SECONDS_IN_MINUTE * 2 - 1
+    }
+}
+
 pub fn check_active_host(
     now: u64,
-    possible_host: &mut PossibleHost,
+    possible_host: &mut Option<PossibleHost>,
     flow_metric: &PeerInfo,
     ip: &IpAddr,
 ) -> bool {
-    if flow_metric.is_active_host || flow_metric.l3_epc_id == EPC_FROM_INTERNET {
+    if flow_metric.is_active_host || flow_metric.l3_epc_id == EPC_INTERNET {
         // 有EPC并且是Device, L3Epc是过平台数据获取的，无需添加到PossibleHost中
         return flow_metric.is_active_host;
     }
     if flow_metric.is_device {
         return true;
     }
-    if flow_metric.has_packets {
-        // 有EPC无Device的场景是通过CIDR获取的，这里需要加入的PossibleHost中
-        possible_host.add(now, ip, flow_metric.l3_epc_id);
-        true
+    if let Some(possible_host) = possible_host {
+        if flow_metric.has_packets {
+            // 有EPC无Device的场景是通过CIDR获取的，这里需要加入的PossibleHost中
+            possible_host.add(now, ip, flow_metric.l3_epc_id);
+            true
+        } else {
+            possible_host.check(ip, flow_metric.l3_epc_id)
+        }
     } else {
-        possible_host.check(ip, flow_metric.l3_epc_id)
+        false
     }
 }
 
@@ -199,3 +231,21 @@ impl L7CollectorThread {
 
 const FLOW_METRICS_PEER_SRC: usize = 0;
 const FLOW_METRICS_PEER_DST: usize = 1;
+
+struct QgStats {
+    id: usize,
+    kind: &'static str,
+}
+
+impl stats::Module for QgStats {
+    fn name(&self) -> &'static str {
+        "quadruple_generator"
+    }
+
+    fn tags(&self) -> Vec<stats::StatsOption> {
+        vec![
+            stats::StatsOption::Tag("index", self.id.to_string()),
+            stats::StatsOption::Tag("kind", self.kind.to_owned()),
+        ]
+    }
+}

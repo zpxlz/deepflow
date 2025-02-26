@@ -24,6 +24,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (q *QingCloud) GetLoadBalances() (
@@ -37,7 +38,7 @@ func (q *QingCloud) GetLoadBalances() (
 	var retIPs []model.IP
 	var retLBVMConnections []model.LBVMConnection
 
-	log.Info("get lbs starting")
+	log.Info("get lbs starting", logger.NewORGPrefix(q.orgID))
 
 	lbIdToVPCLcuuid := make(map[string]string)
 	lbIdToIP := make(map[string]string)
@@ -45,7 +46,7 @@ func (q *QingCloud) GetLoadBalances() (
 		regionVPCLcuuid, ok := q.regionIdToDefaultVPCLcuuid[regionId]
 		if !ok {
 			err := errors.New(fmt.Sprintf("(%s) default vpc not found", regionId))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, nil, nil, nil, nil, err
 		}
 
@@ -56,7 +57,7 @@ func (q *QingCloud) GetLoadBalances() (
 		}
 		response, err := q.GetResponse("DescribeLoadBalancers", "loadbalancer_set", kwargs)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, nil, nil, nil, nil, err
 		}
 
@@ -71,7 +72,7 @@ func (q *QingCloud) GetLoadBalances() (
 				}
 
 				lbId := lb.Get("loadbalancer_id").MustString()
-				lbLcuuid := common.GenerateUUID(lbId)
+				lbLcuuid := common.GenerateUUIDByOrgID(q.orgID, lbId)
 				lbName := lb.Get("loadbalancer_name").MustString()
 				if lbName == "" {
 					lbName = lbId
@@ -79,12 +80,12 @@ func (q *QingCloud) GetLoadBalances() (
 				vxnetId := lb.Get("vxnet_id").MustString()
 				vpcLcuuid, ok := q.VxnetIdToVPCLcuuid[vxnetId]
 				if !ok {
-					log.Debugf("lb (%s) vxnetId (%s) vpc not found", lbId, vxnetId)
+					log.Debugf("lb (%s) vxnetId (%s) vpc not found", lbId, vxnetId, logger.NewORGPrefix(q.orgID))
 					vpcLcuuid = regionVPCLcuuid
 				}
 				subnetLcuuid, ok := q.VxnetIdToSubnetLcuuid[vxnetId]
 				if !ok {
-					log.Debugf("lb (%s) vxnetId (%s) subnet not found", lbId, vxnetId)
+					log.Debugf("lb (%s) vxnetId (%s) subnet not found", lbId, vxnetId, logger.NewORGPrefix(q.orgID))
 					subnetLcuuid = ""
 				}
 
@@ -110,9 +111,9 @@ func (q *QingCloud) GetLoadBalances() (
 							continue
 						}
 						retLBVMConnections = append(retLBVMConnections, model.LBVMConnection{
-							Lcuuid:   common.GenerateUUID(lbLcuuid + instanceId),
+							Lcuuid:   common.GenerateUUIDByOrgID(q.orgID, lbLcuuid+instanceId),
 							LBLcuuid: lbLcuuid,
-							VMLcuuid: common.GenerateUUID(instanceId),
+							VMLcuuid: common.GenerateUUIDByOrgID(q.orgID, instanceId),
 						})
 					}
 				}
@@ -134,8 +135,8 @@ func (q *QingCloud) GetLoadBalances() (
 
 				// 添加VIP接口
 				if vip != "" && subnetLcuuid != "" {
-					vinterfaceLcuuid := common.GenerateUUID(lbLcuuid + vip)
-					networkLcuuid := common.GenerateUUID(vxnetId)
+					vinterfaceLcuuid := common.GenerateUUIDByOrgID(q.orgID, lbLcuuid+vip)
+					networkLcuuid := common.GenerateUUIDByOrgID(q.orgID, vxnetId)
 					retVInterfaces = append(retVInterfaces, model.VInterface{
 						Lcuuid:        vinterfaceLcuuid,
 						Type:          common.VIF_TYPE_LAN,
@@ -147,7 +148,7 @@ func (q *QingCloud) GetLoadBalances() (
 						RegionLcuuid:  regionLcuuid,
 					})
 					retIPs = append(retIPs, model.IP{
-						Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + vip),
+						Lcuuid:           common.GenerateUUIDByOrgID(q.orgID, vinterfaceLcuuid+vip),
 						VInterfaceLcuuid: vinterfaceLcuuid,
 						IP:               vip,
 						SubnetLcuuid:     subnetLcuuid,
@@ -156,7 +157,7 @@ func (q *QingCloud) GetLoadBalances() (
 				}
 				// 添加外网IP及接口
 				if len(eips) > 0 {
-					vinterfaceLcuuid := common.GenerateUUID(lbLcuuid)
+					vinterfaceLcuuid := common.GenerateUUIDByOrgID(q.orgID, lbLcuuid)
 					retVInterfaces = append(retVInterfaces, model.VInterface{
 						Lcuuid:        vinterfaceLcuuid,
 						Type:          common.VIF_TYPE_WAN,
@@ -169,7 +170,7 @@ func (q *QingCloud) GetLoadBalances() (
 					})
 					for _, eip := range eips {
 						retIPs = append(retIPs, model.IP{
-							Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + eip),
+							Lcuuid:           common.GenerateUUIDByOrgID(q.orgID, vinterfaceLcuuid+eip),
 							VInterfaceLcuuid: vinterfaceLcuuid,
 							IP:               eip,
 							RegionLcuuid:     regionLcuuid,
@@ -191,7 +192,7 @@ func (q *QingCloud) GetLoadBalances() (
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	log.Info("get lbs complete")
+	log.Info("get lbs complete", logger.NewORGPrefix(q.orgID))
 	return retLBs, retLBListeners, retLBTargetServers, retVInterfaces, retIPs, retLBVMConnections, nil
 
 }
@@ -202,7 +203,12 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 	var retLBListeners []model.LBListener
 	var retLBTargetServers []model.LBTargetServer
 
-	log.Info("get lb listener and target_servers starting")
+	if q.DisableSyncLBListener {
+		log.Infof("config disable sync lb listener is (%t)", q.DisableSyncLBListener, logger.NewORGPrefix(q.orgID))
+		return retLBListeners, retLBTargetServers, nil
+	}
+
+	log.Info("get lb listener and target_servers starting", logger.NewORGPrefix(q.orgID))
 
 	for regionId := range q.RegionIdToLcuuid {
 		kwargs := []*Param{
@@ -215,7 +221,7 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 			"DescribeLoadBalancerListeners", "loadbalancer_listener_set", kwargs,
 		)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, err
 		}
 
@@ -238,20 +244,20 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 				}
 				vpcLcuuid, ok := lbIdToVPCLcuuid[lbId]
 				if !ok {
-					log.Debugf("lb_listener (%s) lb (%s) not found", listenerId, lbId)
+					log.Debugf("lb_listener (%s) lb (%s) not found", listenerId, lbId, logger.NewORGPrefix(q.orgID))
 					continue
 				}
 				lbIP, ok := lbIdToIP[lbId]
 				if !ok {
-					log.Debugf("lb_listener (%s) lb (%s) no ip", listenerId, lbId)
+					log.Debugf("lb_listener (%s) lb (%s) no ip", listenerId, lbId, logger.NewORGPrefix(q.orgID))
 					continue
 				}
 
-				listenerLcuuid := common.GenerateUUID(listenerId)
+				listenerLcuuid := common.GenerateUUIDByOrgID(q.orgID, listenerId)
 				listenerProtocol := strings.ToUpper(listener.Get("listener_protocol").MustString())
 				retLBListeners = append(retLBListeners, model.LBListener{
 					Lcuuid:   listenerLcuuid,
-					LBLcuuid: common.GenerateUUID(lbId),
+					LBLcuuid: common.GenerateUUIDByOrgID(q.orgID, lbId),
 					IPs:      lbIP,
 					Name:     listenerName,
 					Label:    listenerId,
@@ -268,7 +274,7 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 					"DescribeLoadBalancerBackends", "loadbalancer_backend_set", kwargs,
 				)
 				if err != nil {
-					log.Error(err)
+					log.Error(err, logger.NewORGPrefix(q.orgID))
 					return nil, nil, err
 				}
 
@@ -291,19 +297,19 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 							if _, ok := q.vmIdToVPCLcuuid[resourceId]; !ok {
 								log.Debugf(
 									"lb (%s) listener (%s) target_server (%s) not found",
-									lbId, listenerId, resourceId,
+									lbId, listenerId, resourceId, logger.NewORGPrefix(q.orgID),
 								)
 								continue
 							}
 							serverType = common.LB_SERVER_TYPE_VM
-							vmLcuuid = common.GenerateUUID(resourceId)
+							vmLcuuid = common.GenerateUUIDByOrgID(q.orgID, resourceId)
 							ip = server.Get("private_ip").MustString()
 						}
 						retLBTargetServers = append(retLBTargetServers, model.LBTargetServer{
-							Lcuuid: common.GenerateUUID(
+							Lcuuid: common.GenerateUUIDByOrgID(q.orgID,
 								server.Get("loadbalancer_backend_id").MustString(),
 							),
-							LBLcuuid:         common.GenerateUUID(lbId),
+							LBLcuuid:         common.GenerateUUIDByOrgID(q.orgID, lbId),
 							LBListenerLcuuid: listenerLcuuid,
 							Type:             serverType,
 							VMLcuuid:         vmLcuuid,
@@ -317,6 +323,6 @@ func (q *QingCloud) getLBListenerAndTargetServers(
 			}
 		}
 	}
-	log.Info("get lb listener and target_servers complete")
+	log.Info("get lb listener and target_servers complete", logger.NewORGPrefix(q.orgID))
 	return retLBListeners, retLBTargetServers, nil
 }

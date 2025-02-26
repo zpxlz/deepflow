@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodIngressRuleBackend struct {
-	UpdaterBase[cloudmodel.PodIngressRuleBackend, mysql.PodIngressRuleBackend, *diffbase.PodIngressRuleBackend]
+	UpdaterBase[
+		cloudmodel.PodIngressRuleBackend,
+		*diffbase.PodIngressRuleBackend,
+		*metadbmodel.PodIngressRuleBackend,
+		metadbmodel.PodIngressRuleBackend,
+		*message.PodIngressRuleBackendAdd,
+		message.PodIngressRuleBackendAdd,
+		*message.PodIngressRuleBackendUpdate,
+		message.PodIngressRuleBackendUpdate,
+		*message.PodIngressRuleBackendFieldsUpdate,
+		message.PodIngressRuleBackendFieldsUpdate,
+		*message.PodIngressRuleBackendDelete,
+		message.PodIngressRuleBackendDelete]
 }
 
 func NewPodIngressRuleBackend(wholeCache *cache.Cache, cloudData []cloudmodel.PodIngressRuleBackend) *PodIngressRuleBackend {
 	updater := &PodIngressRuleBackend{
-		UpdaterBase[cloudmodel.PodIngressRuleBackend, mysql.PodIngressRuleBackend, *diffbase.PodIngressRuleBackend]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_BACKEND_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPodIngressRuleBackend(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PodIngressRuleBackends,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodIngressRuleBackend,
+			*diffbase.PodIngressRuleBackend,
+			*metadbmodel.PodIngressRuleBackend,
+			metadbmodel.PodIngressRuleBackend,
+			*message.PodIngressRuleBackendAdd,
+			message.PodIngressRuleBackendAdd,
+			*message.PodIngressRuleBackendUpdate,
+			message.PodIngressRuleBackendUpdate,
+			*message.PodIngressRuleBackendFieldsUpdate,
+			message.PodIngressRuleBackendFieldsUpdate,
+			*message.PodIngressRuleBackendDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_BACKEND_EN,
+			wholeCache,
+			db.NewPodIngressRuleBackend().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PodIngressRuleBackends,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,45 +73,46 @@ func (b *PodIngressRuleBackend) getDiffBaseByCloudItem(cloudItem *cloudmodel.Pod
 	return
 }
 
-func (b *PodIngressRuleBackend) generateDBItemToAdd(cloudItem *cloudmodel.PodIngressRuleBackend) (*mysql.PodIngressRuleBackend, bool) {
+func (b *PodIngressRuleBackend) generateDBItemToAdd(cloudItem *cloudmodel.PodIngressRuleBackend) (*metadbmodel.PodIngressRuleBackend, bool) {
 	podIngressRuleID, exists := b.cache.ToolDataSet.GetPodIngressRuleIDByLcuuid(cloudItem.PodIngressRuleLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN, cloudItem.PodIngressRuleLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_BACKEND_EN, cloudItem.Lcuuid,
-		))
+		), b.metadata.LogPrefixes)
 		return nil, false
 	}
 	podIngressID, exists := b.cache.ToolDataSet.GetPodIngressIDByLcuuid(cloudItem.PodIngressLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, cloudItem.PodIngressLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_BACKEND_EN, cloudItem.Lcuuid,
-		))
+		), b.metadata.LogPrefixes)
 		return nil, false
 	}
 	podServiceID, exists := b.cache.ToolDataSet.GetPodServiceIDByLcuuid(cloudItem.PodServiceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_BACKEND_EN, cloudItem.Lcuuid,
-		))
+		), b.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.PodIngressRuleBackend{
+	dbItem := &metadbmodel.PodIngressRuleBackend{
 		Path:             cloudItem.Path,
 		Port:             cloudItem.Port,
 		PodServiceID:     podServiceID,
 		PodIngressID:     podIngressID,
 		PodIngressRuleID: podIngressRuleID,
 		SubDomain:        cloudItem.SubDomainLcuuid,
+		Domain:           b.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
 // 保留接口
-func (b *PodIngressRuleBackend) generateUpdateInfo(diffBase *diffbase.PodIngressRuleBackend, cloudItem *cloudmodel.PodIngressRuleBackend) (map[string]interface{}, bool) {
-	return nil, false
+func (b *PodIngressRuleBackend) generateUpdateInfo(diffBase *diffbase.PodIngressRuleBackend, cloudItem *cloudmodel.PodIngressRuleBackend) (*message.PodIngressRuleBackendFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

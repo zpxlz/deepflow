@@ -19,7 +19,7 @@ package event
 import (
 	"testing"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
@@ -30,7 +30,7 @@ import (
 func TestHost_ProduceByAdd(t *testing.T) {
 	dataSet := tool.NewDataSet()
 	type args struct {
-		items []*mysql.Host
+		items []*metadbmodel.Host
 	}
 	tests := []struct {
 		name     string
@@ -43,9 +43,9 @@ func TestHost_ProduceByAdd(t *testing.T) {
 			name: "add success",
 			h:    NewHost(dataSet, NewEventQueue()),
 			args: args{
-				items: []*mysql.Host{
+				items: []*metadbmodel.Host{
 					{
-						Base: mysql.Base{ID: 1},
+						Base: metadbmodel.Base{ID: 1},
 						Name: "host",
 					},
 				},
@@ -58,7 +58,7 @@ func TestHost_ProduceByAdd(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.h.ProduceByAdd(tt.args.items)
 
-			e := tt.h.EventManagerBase.Queue.Get().(*eventapi.ResourceEvent)
+			e := tt.h.ManagerComponent.Queue.Get().(*eventapi.ResourceEvent)
 			assert.Equal(t, tt.wantID, e.InstanceID)
 			assert.Equal(t, tt.wantName, e.InstanceName)
 		})
@@ -88,10 +88,10 @@ func TestHost_ProduceByDelete(t *testing.T) {
 				lcuuids: []string{"host_lcuuid"},
 			},
 			prepare: func(cache *cache.Cache) {
-				cache.AddRegion(&mysql.Region{Base: mysql.Base{ID: 1, Lcuuid: "region_lcuuid"}})
-				cache.AddAZ(&mysql.AZ{Base: mysql.Base{ID: 2, Lcuuid: "az_lcuuid"}})
-				cache.AddHost(&mysql.Host{
-					Base: mysql.Base{
+				cache.AddRegion(&metadbmodel.Region{Base: metadbmodel.Base{ID: 1, Lcuuid: "region_lcuuid"}})
+				cache.AddAZ(&metadbmodel.AZ{Base: metadbmodel.Base{ID: 2, Lcuuid: "az_lcuuid"}})
+				cache.AddHost(&metadbmodel.Host{
+					Base: metadbmodel.Base{
 						ID:     1,
 						Lcuuid: "host_lcuuid",
 					},
@@ -110,7 +110,7 @@ func TestHost_ProduceByDelete(t *testing.T) {
 			tt.h = NewHost(tt.cache.ToolDataSet, NewEventQueue())
 			tt.h.ProduceByDelete(tt.args.lcuuids)
 
-			e := tt.h.EventManagerBase.Queue.Get().(*eventapi.ResourceEvent)
+			e := tt.h.ManagerComponent.Queue.Get().(*eventapi.ResourceEvent)
 			assert.Equal(t, tt.wantID, e.InstanceID)
 			assert.Equal(t, tt.wantName, e.InstanceName)
 		})

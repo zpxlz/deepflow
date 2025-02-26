@@ -20,49 +20,51 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/service/common"
-	"github.com/deepflowio/deepflow/server/controller/model"
 	"gorm.io/gorm"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
+	"github.com/deepflowio/deepflow/server/controller/model"
 )
 
-func CreatePlugin(pluginCreate *mysql.Plugin) (*model.Plugin, error) {
-	var pluginFirst mysql.Plugin
-	if err := mysql.Db.Where("name = ?", pluginCreate.Name).First(&pluginFirst).Error; err != nil {
+func CreatePlugin(db *metadb.DB, pluginCreate *metadbmodel.Plugin) (*model.Plugin, error) {
+	var pluginFirst metadbmodel.Plugin
+	if err := db.Where("name = ?", pluginCreate.Name).First(&pluginFirst).Error; err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, NewError(httpcommon.SERVER_ERROR,
+			return nil, response.ServiceError(httpcommon.SERVER_ERROR,
 				fmt.Sprintf("fail to query plugin by name(%s), error: %s", pluginCreate.Name, err))
 		}
 
-		if err = mysql.Db.Create(&pluginCreate).Error; err != nil {
+		if err = db.Create(&pluginCreate).Error; err != nil {
 			return nil, err
 		}
-		plugines, _ := GetPlugin(map[string]interface{}{"name": pluginCreate.Name})
+		plugines, _ := GetPlugin(db, map[string]interface{}{"name": pluginCreate.Name})
 		return &plugines[0], nil
 	}
 
 	// update by name and type
-	if err := mysql.Db.Model(&mysql.Plugin{}).Where("name = ?", pluginCreate.Name).
+	if err := db.Model(&metadbmodel.Plugin{}).Where("name = ?", pluginCreate.Name).
 		Updates(pluginCreate).Error; err != nil {
 		return nil, err
 	}
 
-	plugins, _ := GetPlugin(map[string]interface{}{"name": pluginCreate.Name})
+	plugins, _ := GetPlugin(db, map[string]interface{}{"name": pluginCreate.Name})
 	return &plugins[0], nil
 }
 
-func GetPlugin(filter map[string]interface{}) ([]model.Plugin, error) {
-	var plugins []mysql.Plugin
-	db := mysql.Db
+func GetPlugin(db *metadb.DB, filter map[string]interface{}) ([]model.Plugin, error) {
+	var plugins []metadbmodel.Plugin
+	queryDB := db.DB
 	if _, ok := filter["name"]; ok {
-		db = db.Where("name = ?", filter["name"])
+		queryDB = queryDB.Where("name = ?", filter["name"])
 	}
 	if _, ok := filter["type"]; ok {
-		db = db.Where("type = ?", filter["type"])
+		queryDB = queryDB.Where("type = ?", filter["type"])
 	}
-	db.Order("updated_at DESC").Find(&plugins)
+	queryDB.Order("updated_at DESC").Find(&plugins)
 
 	var resp []model.Plugin
 	for _, plugin := range plugins {
@@ -70,6 +72,7 @@ func GetPlugin(filter map[string]interface{}) ([]model.Plugin, error) {
 			Name:      plugin.Name,
 			Type:      plugin.Type,
 			UpdatedAt: plugin.UpdatedAt.Format(common.GO_BIRTHDAY),
+			UserName:  plugin.UserName,
 		}
 		resp = append(resp, temp)
 	}
@@ -77,14 +80,14 @@ func GetPlugin(filter map[string]interface{}) ([]model.Plugin, error) {
 
 }
 
-func DeletePlugin(name string) error {
+func DeletePlugin(db *metadb.DB, name string) error {
 	var plugin model.Plugin
-	if err := mysql.Db.Where("name = ?", name).First(&plugin).Error; err != nil {
-		return NewError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("plugin (name: %s) not found", name))
+	if err := db.Where("name = ?", name).First(&plugin).Error; err != nil {
+		return response.ServiceError(httpcommon.RESOURCE_NOT_FOUND, fmt.Sprintf("plugin (name: %s) not found", name))
 	}
 
-	if err := mysql.Db.Where("name = ?", name).Delete(&mysql.Plugin{}).Error; err != nil {
-		return NewError(httpcommon.SERVER_ERROR, fmt.Sprintf("delete plugin (name: %s) failed, err: %v", name, err))
+	if err := db.Where("name = ?", name).Delete(&metadbmodel.Plugin{}).Error; err != nil {
+		return response.ServiceError(httpcommon.SERVER_ERROR, fmt.Sprintf("delete plugin (name: %s) failed, err: %v", name, err))
 	}
 	return nil
 }

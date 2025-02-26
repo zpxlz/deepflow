@@ -24,38 +24,47 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype/prompb"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/pool"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 	"github.com/prometheus/common/model"
 )
 
 const (
-	DefaultPartition           = ckdb.TimeFuncTwoHour
-	MAX_APP_LABEL_COLUMN_INDEX = 256
+	DefaultPartition = ckdb.TimeFuncTwoHour
 )
 
 type PrometheusSampleInterface interface {
 	DatabaseName() string
 	TableName() string
-	WriteBlock(*ckdb.Block)
+	OrgID() uint16
 	Columns(int) []*ckdb.Column
 	AppLabelLen() int
-	GenCKTable(string, string, int, *ckdb.ColdStorage, int) *ckdb.Table
+	GenCKTable(string, string, string, int, *ckdb.ColdStorage, int) *ckdb.Table
 	GenerateNewFlowTags(*flow_tag.FlowTagCache, string, *prompb.TimeSeries, []prompb.Label, []uint32, []uint32)
 	VpcId() int32
 	PodNsId() uint16
 	Release()
+
+	NewColumnBlock() ckdb.CKColumnBlock
+	AppendToColumnBlock(ckdb.CKColumnBlock)
+	NativeTagVersion() uint32
 }
 
 type PrometheusSample struct {
 	PrometheusSampleMini
-	UniversalTag zerodoc.UniversalTag
+	UniversalTag flow_metrics.UniversalTag
 }
 
 type PrometheusSampleMini struct {
-	Timestamp        uint32 // s
-	MetricID         uint32
-	TargetID         uint32
+	Timestamp uint32 // s
+	VtapId    uint16
+	MetricID  uint32
+	TargetID  uint32
+
+	// Not stored, only determines which database to store in.
+	// When Orgid is 0 or 1, it is stored in database 'prometheus', otherwise stored in '<OrgId>_prometheus'.
+	OrgId            uint16
+	TeamID           uint16
 	AppLabelValueIDs []uint32
 
 	Value float64
@@ -81,20 +90,14 @@ func (m *PrometheusSampleMini) PodNsId() uint16 {
 	return 0
 }
 
-// Note: The order of Write() must be consistent with the order of append() in Columns.
-func (m *PrometheusSampleMini) WriteBlock(block *ckdb.Block) {
-	block.WriteDateTime(m.Timestamp)
-	block.Write(
-		m.MetricID,
-		m.TargetID,
-	)
-	for _, v := range m.AppLabelValueIDs[1:] {
-		block.Write(v)
-	}
-	block.Write(m.Value)
+func (m *PrometheusSampleMini) NativeTagVersion() uint32 {
+	return 0
 }
 
-// Note: The order of append() must be consistent with the order of Write() in WriteBlock.
+func (m *PrometheusSampleMini) OrgID() uint16 {
+	return m.OrgId
+}
+
 func (m *PrometheusSampleMini) Columns(appLabelColumnCount int) []*ckdb.Column {
 	columns := []*ckdb.Column{}
 
@@ -102,6 +105,7 @@ func (m *PrometheusSampleMini) Columns(appLabelColumnCount int) []*ckdb.Column {
 	columns = append(columns,
 		ckdb.NewColumn("metric_id", ckdb.UInt32).SetComment("encoded ID of the metric name"),
 		ckdb.NewColumn("target_id", ckdb.UInt32).SetComment("the encoded ID of the target"),
+		ckdb.NewColumn("team_id", ckdb.UInt16).SetComment("the team ID"),
 	)
 	for i := 1; i <= appLabelColumnCount; i++ {
 		columns = append(columns, ckdb.NewColumn(fmt.Sprintf("app_label_value_id_%d", i), ckdb.UInt32))
@@ -111,7 +115,7 @@ func (m *PrometheusSampleMini) Columns(appLabelColumnCount int) []*ckdb.Column {
 	return columns
 }
 
-func (m *PrometheusSampleMini) GenCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage, appLabelColumnCount int) *ckdb.Table {
+func (m *PrometheusSampleMini) GenCKTable(cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage, appLabelColumnCount int) *ckdb.Table {
 	timeKey := "time"
 	engine := ckdb.MergeTree
 	// order key
@@ -120,6 +124,7 @@ func (m *PrometheusSampleMini) GenCKTable(cluster, storagePolicy string, ttl int
 	return &ckdb.Table{
 		Version:         common.CK_VERSION,
 		Database:        m.DatabaseName(),
+		DBType:          ckdbType,
 		LocalName:       m.TableName() + ckdb.LOCAL_SUBFFIX,
 		GlobalName:      m.TableName(),
 		Columns:         m.Columns(appLabelColumnCount),
@@ -144,6 +149,9 @@ func (m *PrometheusSampleMini) GenerateNewFlowTags(cache *flow_tag.FlowTagCache,
 		TableId:   m.MetricID,
 		VpcId:     m.VpcId(),
 		PodNsId:   m.PodNsId(),
+		VtapId:    m.VtapId,
+		TeamID:    m.TeamID,
+		OrgId:     m.OrgId,
 	}
 	cache.Fields = cache.Fields[:0]
 	cache.FieldValues = cache.FieldValues[:0]
@@ -185,7 +193,7 @@ func (m *PrometheusSampleMini) GenerateNewFlowTags(cache *flow_tag.FlowTagCache,
 		}
 		fieldName := strings.Clone(label.Name)
 
-		tagFieldValue := flow_tag.AcquireFlowTag()
+		tagFieldValue := flow_tag.AcquireFlowTag(flow_tag.TagFieldValue)
 		tagFieldValue.Timestamp = m.Timestamp
 		tagFieldValue.FlowTagInfo = *flowTagInfo
 		tagFieldValue.FlowTagInfo.FieldName = fieldName
@@ -203,7 +211,7 @@ func (m *PrometheusSampleMini) GenerateNewFlowTags(cache *flow_tag.FlowTagCache,
 				*old = m.Timestamp
 			}
 		}
-		tagField := flow_tag.AcquireFlowTag()
+		tagField := flow_tag.AcquireFlowTag(flow_tag.TagField)
 		tagField.Timestamp = m.Timestamp
 		tagField.FlowTagInfo = *flowTagInfo
 		tagField.FlowTagInfo.FieldName = fieldName
@@ -223,16 +231,17 @@ func (m *PrometheusSample) TableName() string {
 	return m.PrometheusSampleMini.DatabaseName()
 }
 
-// Note: The order of Write() must be consistent with the order of append() in Columns.
-func (m *PrometheusSample) WriteBlock(block *ckdb.Block) {
-	m.PrometheusSampleMini.WriteBlock(block)
-	m.UniversalTag.WriteBlock(block)
+func (m *PrometheusSample) NativeTagVersion() uint32 {
+	return 0
 }
 
-// Note: The order of append() must be consistent with the order of Write() in WriteBlock.
+func (m *PrometheusSample) OrgID() uint16 {
+	return m.OrgId
+}
+
 func (m *PrometheusSample) Columns(appLabelColumnCount int) []*ckdb.Column {
 	columns := m.PrometheusSampleMini.Columns(appLabelColumnCount)
-	columns = zerodoc.GenUniversalTagColumns(columns)
+	columns = flow_metrics.GenUniversalTagColumns(columns)
 	return columns
 }
 
@@ -240,14 +249,14 @@ func (m *PrometheusSample) Release() {
 	ReleasePrometheusSample(m)
 }
 
-func (m *PrometheusSample) GenCKTable(cluster, storagePolicy string, ttl int, coldStorage *ckdb.ColdStorage, appLabelColumnCount int) *ckdb.Table {
-	table := m.PrometheusSampleMini.GenCKTable(cluster, storagePolicy, ttl, coldStorage, appLabelColumnCount)
+func (m *PrometheusSample) GenCKTable(cluster, storagePolicy, ckdbType string, ttl int, coldStorage *ckdb.ColdStorage, appLabelColumnCount int) *ckdb.Table {
+	table := m.PrometheusSampleMini.GenCKTable(cluster, storagePolicy, ckdbType, ttl, coldStorage, appLabelColumnCount)
 	table.Columns = m.Columns(appLabelColumnCount)
 	return table
 }
 
 func genLru128Key(f *flow_tag.FlowTagInfo) (uint64, uint64) {
-	return uint64(f.TableId)<<32 | uint64(f.FieldNameId), uint64(f.FieldValueId)<<32 | uint64(int16(f.VpcId))<<16 | uint64(f.PodNsId)
+	return uint64(f.TableId)<<32 | uint64(f.FieldNameId), uint64(f.FieldValueId)<<32 | uint64(f.OrgId)<<16 | uint64(f.TeamID)
 }
 
 func (m *PrometheusSample) VpcId() int32 {
@@ -263,12 +272,12 @@ func (m *PrometheusSample) GenerateNewFlowTags(cache *flow_tag.FlowTagCache, met
 	m.PrometheusSampleMini.GenerateNewFlowTags(cache, metricName, timeSeries, extraLabels, tsLabelNameIDs, tsLabelValueIDs)
 }
 
-var prometheusSampleMiniPool = pool.NewLockFreePool(func() interface{} {
+var prometheusSampleMiniPool = pool.NewLockFreePool(func() *PrometheusSampleMini {
 	return &PrometheusSampleMini{}
 })
 
 func AcquirePrometheusSampleMini() *PrometheusSampleMini {
-	return prometheusSampleMiniPool.Get().(*PrometheusSampleMini)
+	return prometheusSampleMiniPool.Get()
 }
 
 func ReleasePrometheusSampleMini(p *PrometheusSampleMini) {
@@ -276,15 +285,15 @@ func ReleasePrometheusSampleMini(p *PrometheusSampleMini) {
 	prometheusSampleMiniPool.Put(p)
 }
 
-var prometheusSamplePool = pool.NewLockFreePool(func() interface{} {
+var prometheusSamplePool = pool.NewLockFreePool(func() *PrometheusSample {
 	return &PrometheusSample{}
 })
 
 func AcquirePrometheusSample() *PrometheusSample {
-	return prometheusSamplePool.Get().(*PrometheusSample)
+	return prometheusSamplePool.Get()
 }
 
-var emptyUniversalTag = zerodoc.UniversalTag{}
+var emptyUniversalTag = flow_metrics.UniversalTag{}
 
 func ReleasePrometheusSample(p *PrometheusSample) {
 	p.UniversalTag = emptyUniversalTag

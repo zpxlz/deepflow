@@ -18,7 +18,7 @@ use page_size;
 
 pub use public::error::af_packet::{Error, Result};
 
-use public::proto::trident::CaptureSocketType;
+use public::proto::agent::CaptureSocketType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
 pub enum OptTpacketVersion {
@@ -80,6 +80,7 @@ pub struct Options {
     pub version: OptTpacketVersion,
     pub socket_type: OptSocketType,
     pub iface: String,
+    pub packet_fanout_mode: Option<u32>,
 }
 
 impl Default for Options {
@@ -94,6 +95,7 @@ impl Default for Options {
             version: OptTpacketVersion::TpacketVersionHighestavailablet,
             socket_type: OptSocketType::SocketTypeRaw,
             iface: "".to_string(),
+            packet_fanout_mode: None,
         }
     }
 }

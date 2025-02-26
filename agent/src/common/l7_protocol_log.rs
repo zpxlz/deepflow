@@ -30,24 +30,27 @@ use super::flow::{L7PerfStats, PacketDirection};
 use super::l7_protocol_info::L7ProtocolInfo;
 use super::MetaPacket;
 
+use crate::common::meta_packet::{IcmpData, ProtocolData};
 use crate::config::handler::LogParserConfig;
-use crate::config::OracleParseConfig;
+use crate::config::OracleConfig;
 use crate::flow_generator::flow_map::FlowMapCounter;
 use crate::flow_generator::protocol_logs::fastcgi::FastCGILog;
 use crate::flow_generator::protocol_logs::plugin::custom_wrap::CustomWrapLog;
 use crate::flow_generator::protocol_logs::plugin::get_custom_log_parser;
 use crate::flow_generator::protocol_logs::sql::ObfuscateCache;
 use crate::flow_generator::protocol_logs::{
-    DnsLog, DubboLog, HttpLog, KafkaLog, MongoDBLog, MqttLog, MysqlLog, OracleLog, PostgresqlLog,
-    RedisLog, SofaRpcLog, TlsLog,
+    AmqpLog, BrpcLog, DnsLog, DubboLog, HttpLog, KafkaLog, MemcachedLog, MongoDBLog, MqttLog,
+    MysqlLog, NatsLog, OpenWireLog, PingLog, PostgresqlLog, PulsarLog, RedisLog, RocketmqLog,
+    SofaRpcLog, TarsLog, ZmtpLog,
 };
+
 use crate::flow_generator::{LogMessageType, Result};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::plugin::c_ffi::SoPluginFunc;
 use crate::plugin::wasm::WasmVm;
 
 use public::enums::IpProtocol;
-use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum};
+use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolChecker, L7ProtocolEnum};
 
 /*
  所有协议都需要实现L7ProtocolLogInterface这个接口.
@@ -158,23 +161,66 @@ macro_rules! impl_protocol_parser {
 // enum name will be used to parse strings so case matters
 // large structs (>128B) should be boxed to reduce memory consumption
 //
-impl_protocol_parser! {
-    pub enum L7ProtocolParser {
-        // http have two version but one parser, can not place in macro param.
-        // custom must in frist so can not place in macro
-        DNS(DnsLog),
-        SofaRPC(SofaRpcLog),
-        MySQL(MysqlLog),
-        Kafka(KafkaLog),
-        Redis(RedisLog),
-        MongoDB(MongoDBLog),
-        PostgreSQL(PostgresqlLog),
-        Dubbo(DubboLog),
-        FastCGI(FastCGILog),
-        Oracle(OracleLog),
-        MQTT(MqttLog),
-        TLS(TlsLog),
-        // add protocol below
+cfg_if::cfg_if! {
+    if #[cfg(not(feature = "enterprise"))] {
+        impl_protocol_parser! {
+            pub enum L7ProtocolParser {
+                // http have two version but one parser, can not place in macro param.
+                // custom must in first so can not place in macro
+                DNS(DnsLog),
+                SofaRPC(SofaRpcLog),
+                MySQL(MysqlLog),
+                Kafka(KafkaLog),
+                Redis(RedisLog),
+                MongoDB(MongoDBLog),
+                Memcached(MemcachedLog),
+                PostgreSQL(PostgresqlLog),
+                Dubbo(DubboLog),
+                FastCGI(FastCGILog),
+                Brpc(BrpcLog),
+                Tars(TarsLog),
+                MQTT(MqttLog),
+                AMQP(AmqpLog),
+                NATS(NatsLog),
+                Pulsar(PulsarLog),
+                ZMTP(ZmtpLog),
+                RocketMQ(RocketmqLog),
+                OpenWire(OpenWireLog),
+                Ping(PingLog),
+                // add protocol below
+            }
+        }
+    } else {
+        impl_protocol_parser! {
+            pub enum L7ProtocolParser {
+                // http have two version but one parser, can not place in macro param.
+                // custom must in first so can not place in macro
+                DNS(DnsLog),
+                SofaRPC(SofaRpcLog),
+                MySQL(MysqlLog),
+                Kafka(KafkaLog),
+                Redis(RedisLog),
+                MongoDB(MongoDBLog),
+                Memcached(MemcachedLog),
+                PostgreSQL(PostgresqlLog),
+                Dubbo(DubboLog),
+                FastCGI(FastCGILog),
+                Brpc(BrpcLog),
+                Tars(TarsLog),
+                Oracle(crate::flow_generator::protocol_logs::sql::OracleLog),
+                MQTT(MqttLog),
+                AMQP(AmqpLog),
+                NATS(NatsLog),
+                Pulsar(PulsarLog),
+                ZMTP(ZmtpLog),
+                RocketMQ(RocketmqLog),
+                OpenWire(OpenWireLog),
+                TLS(crate::flow_generator::protocol_logs::tls::TlsLog),
+                SomeIp(crate::flow_generator::protocol_logs::rpc::SomeIpLog),
+                Ping(PingLog),
+                // add protocol below
+            }
+        }
     }
 }
 
@@ -247,6 +293,13 @@ pub trait L7ProtocolParserInterface {
         true
     }
 
+    // l4即不是udp也不是tcp，用于快速过滤协议
+    // ==============================
+    // L4 is neither UDP nor TCP and is used to quickly filter protocols
+    fn parsable_on_other(&self) -> bool {
+        false
+    }
+
     // is parse default? use for config init.
     fn parse_default(&self) -> bool {
         true
@@ -261,28 +314,19 @@ pub trait L7ProtocolParserInterface {
 }
 
 #[derive(Clone)]
-pub struct EbpfParam {
+pub struct EbpfParam<'a> {
     pub is_tls: bool,
     // 目前仅 http2 uprobe 有意义
     // ==========================
     // now only http2 uprobe uses
     pub is_req_end: bool,
     pub is_resp_end: bool,
-    pub process_kname: String,
+    pub process_kname: &'a str,
 }
 
-pub struct KafkaInfoCache {
-    // kafka req
-    pub api_key: u16,
-    pub api_version: u16,
-
-    // kafka resp code
-    pub code: i16,
-}
 pub struct LogCache {
     pub msg_type: LogMessageType,
     pub time: u64,
-    pub kafka_info: Option<KafkaInfoCache>,
     // req_end, resp_end, merged
     // set merged to true when req and resp merge once
     pub multi_merge_info: Option<(bool, bool, bool)>,
@@ -339,6 +383,7 @@ pub struct ParseParam<'a> {
     pub port_src: u16,
     pub port_dst: u16,
     pub flow_id: u64,
+    pub icmp_data: Option<&'a IcmpData>,
 
     // parse info
     pub direction: PacketDirection,
@@ -346,9 +391,10 @@ pub struct ParseParam<'a> {
     // ebpf_type 不为 EBPF_TYPE_NONE 会有值
     // ===================================
     // not None when payload from ebpf
-    pub ebpf_param: Option<EbpfParam>,
+    pub ebpf_param: Option<EbpfParam<'a>>,
     // calculate from cap_seq, req and correspond resp may have same packet seq, non ebpf always 0
-    pub packet_seq: u64,
+    pub packet_start_seq: u64,
+    pub packet_end_seq: u64,
     pub time: u64, // micro second
     pub parse_perf: bool,
     pub parse_log: bool,
@@ -369,18 +415,23 @@ pub struct ParseParam<'a> {
 
     // the config of `l7_log_packet_size`, must set in parse_payload and check_payload
     pub buf_size: u16,
+    pub captured_byte: u16,
 
-    pub oracle_parse_conf: OracleParseConfig,
+    pub oracle_parse_conf: OracleConfig,
 }
 
-impl ParseParam<'_> {
+impl<'a> ParseParam<'a> {
     pub fn is_from_ebpf(&self) -> bool {
         self.ebpf_type != EbpfType::None
     }
 
     pub fn new(
-        packet: &MetaPacket<'_>,
+        packet: &'a MetaPacket<'a>,
         cache: Rc<RefCell<L7PerfCache>>,
+        wasm_vm: Rc<RefCell<Option<WasmVm>>>,
+        #[cfg(any(target_os = "linux", target_os = "android"))] so_func: Rc<
+            RefCell<Option<Vec<SoPluginFunc>>>,
+        >,
         parse_perf: bool,
         parse_log: bool,
     ) -> Self {
@@ -390,11 +441,17 @@ impl ParseParam<'_> {
             ip_dst: packet.lookup_key.dst_ip,
             port_src: packet.lookup_key.src_port,
             port_dst: packet.lookup_key.dst_port,
+            icmp_data: if let ProtocolData::IcmpData(icmp_data) = &packet.protocol_data {
+                Some(icmp_data)
+            } else {
+                None
+            },
             flow_id: packet.flow_id,
 
             direction: packet.lookup_key.direction,
             ebpf_type: packet.ebpf_type,
-            packet_seq: packet.cap_seq,
+            packet_start_seq: packet.cap_start_seq,
+            packet_end_seq: packet.cap_end_seq,
             ebpf_param: None,
             time: packet.lookup_key.timestamp.as_micros() as u64,
             parse_perf,
@@ -403,9 +460,9 @@ impl ParseParam<'_> {
 
             l7_perf_cache: cache,
 
-            wasm_vm: Default::default(),
+            wasm_vm,
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            so_func: Default::default(),
+            so_func,
 
             stats_counter: None,
 
@@ -413,8 +470,9 @@ impl ParseParam<'_> {
             rrt_timeout: Duration::from_secs(10).as_micros() as usize,
 
             buf_size: 0,
+            captured_byte: 0,
 
-            oracle_parse_conf: OracleParseConfig::default(),
+            oracle_parse_conf: OracleConfig::default(),
         };
         if packet.ebpf_type != EbpfType::None {
             param.ebpf_param = Some(EbpfParam {
@@ -422,9 +480,9 @@ impl ParseParam<'_> {
                 is_req_end: packet.is_request_end,
                 is_resp_end: packet.is_response_end,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                process_kname: String::from_utf8_lossy(&packet.process_kname[..]).to_string(),
+                process_kname: std::str::from_utf8(&packet.process_kname[..]).unwrap_or(""),
                 #[cfg(target_os = "windows")]
-                process_kname: "".into(),
+                process_kname: "",
             });
         }
 
@@ -440,21 +498,16 @@ impl<'a> ParseParam<'a> {
         false
     }
 
-    pub fn set_wasm_vm(&mut self, vm: Rc<RefCell<Option<WasmVm>>>) {
-        self.wasm_vm = vm;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn set_so_func(&mut self, so_func: Rc<RefCell<Option<Vec<SoPluginFunc>>>>) {
-        self.so_func = so_func;
-    }
-
     pub fn set_counter(&mut self, stat: Arc<FlowMapCounter>) {
         self.stats_counter = Some(stat);
     }
 
     pub fn set_buf_size(&mut self, buf_size: usize) {
         self.buf_size = buf_size as u16;
+    }
+
+    pub fn set_captured_byte(&mut self, captured_byte: usize) {
+        self.captured_byte = captured_byte as u16;
     }
 
     pub fn set_rrt_timeout(&mut self, t: usize) {
@@ -465,7 +518,7 @@ impl<'a> ParseParam<'a> {
         self.parse_config = Some(conf);
     }
 
-    pub fn set_oracle_conf(&mut self, conf: OracleParseConfig) {
+    pub fn set_oracle_conf(&mut self, conf: OracleConfig) {
         self.oracle_parse_conf = conf;
     }
 }
@@ -515,18 +568,20 @@ impl L7ProtocolBitmap {
     pub fn set_disabled(&mut self, p: L7Protocol) {
         self.0 &= !(1 << (p as u128));
     }
+}
 
-    pub fn is_disabled(&self, p: L7Protocol) -> bool {
+impl L7ProtocolChecker for L7ProtocolBitmap {
+    fn is_disabled(&self, p: L7Protocol) -> bool {
         self.0 & (1 << (p as u128)) == 0
     }
 
-    pub fn is_enabled(&self, p: L7Protocol) -> bool {
+    fn is_enabled(&self, p: L7Protocol) -> bool {
         !self.is_disabled(p)
     }
 }
 
-impl From<&Vec<String>> for L7ProtocolBitmap {
-    fn from(vs: &Vec<String>) -> Self {
+impl From<&[String]> for L7ProtocolBitmap {
+    fn from(vs: &[String]) -> Self {
         let mut bitmap = L7ProtocolBitmap(0);
         for v in vs.iter() {
             if let Ok(p) = L7ProtocolParser::try_from(v.as_str()) {

@@ -18,22 +18,22 @@ package diffbase
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddLBVMConnection(dbItem *mysql.LBVMConnection, seq int) {
+func (b *DataSet) AddLBVMConnection(dbItem *metadbmodel.LBVMConnection, seq int) {
 	b.LBVMConnections[dbItem.Lcuuid] = &LBVMConnection{
 		DiffBase: DiffBase{
 			Sequence: seq,
 			Lcuuid:   dbItem.Lcuuid,
 		},
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, b.LBVMConnections[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, b.LBVMConnections[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteLBVMConnection(lcuuid string) {
 	delete(b.LBVMConnections, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type LBVMConnection struct {

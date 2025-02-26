@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddRDSInstance(dbItem *mysql.RDSInstance, seq int) {
+func (b *DataSet) AddRDSInstance(dbItem *metadbmodel.RDSInstance, seq int) {
 	b.RDSInstances[dbItem.Lcuuid] = &RDSInstance{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -35,12 +35,12 @@ func (b *DataSet) AddRDSInstance(dbItem *mysql.RDSInstance, seq int) {
 		RegionLcuuid: dbItem.Region,
 		AZLcuuid:     dbItem.AZ,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, b.RDSInstances[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, b.RDSInstances[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteRDSInstance(lcuuid string) {
 	delete(b.RDSInstances, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type RDSInstance struct {

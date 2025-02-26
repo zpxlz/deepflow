@@ -16,13 +16,14 @@
 
 use std::fmt::Display;
 
-use chrono::{prelude::NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::pb_adapter::{
     ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
 };
-use super::{value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType};
+use super::{set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType};
+use crate::config::handler::LogParserConfig;
 use crate::{
     common::{
         enums::IpProtocol,
@@ -252,10 +253,16 @@ pub struct TlsInfo {
     #[serde(skip)]
     pub client_cert_not_after: Timestamp,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     msg_type: LogMessageType,
     rrt: u64,
     tls_rtt: u64,
     session_id: Option<u32>,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 impl L7ProtocolInfoInterface for TlsInfo {
@@ -284,10 +291,25 @@ impl L7ProtocolInfoInterface for TlsInfo {
     fn is_tls(&self) -> bool {
         true
     }
+
+    fn get_request_domain(&self) -> String {
+        self.request_domain.clone()
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.request_resource.len()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 impl TlsInfo {
     pub fn merge(&mut self, other: &mut Self) {
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
         match other.msg_type {
             LogMessageType::Request => {
                 std::mem::swap(&mut self.handshake_protocol, &mut other.handshake_protocol);
@@ -302,6 +324,7 @@ impl TlsInfo {
                     &mut self.client_cert_not_before,
                     &mut other.client_cert_not_before,
                 );
+                self.captured_request_byte = other.captured_request_byte;
             }
             LogMessageType::Response => {
                 self.status = other.status;
@@ -318,8 +341,17 @@ impl TlsInfo {
                     &mut self.server_cert_not_before,
                     &mut other.server_cert_not_before,
                 );
+                self.captured_response_byte = other.captured_response_byte;
             }
             _ => {}
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::TLS) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.request_resource)
+                || t.request_type.is_on_blacklist(&self.request_type)
+                || t.request_domain.is_on_blacklist(&self.request_domain);
         }
     }
 }
@@ -338,12 +370,9 @@ impl From<TlsInfo> for L7ProtocolSendLog {
         if !f.client_cert_not_before.is_zero() {
             attributes.push(KeyVal {
                 key: "client_cert_not_before".to_string(),
-                val: NaiveDateTime::from_timestamp_opt(
-                    f.client_cert_not_before.as_secs() as i64,
-                    0,
-                )
-                .unwrap()
-                .to_string(),
+                val: DateTime::from_timestamp(f.client_cert_not_before.as_secs() as i64, 0)
+                    .unwrap()
+                    .to_string(),
             });
         }
         if !f.client_cert_not_after.is_zero() {
@@ -351,7 +380,7 @@ impl From<TlsInfo> for L7ProtocolSendLog {
                 (f.client_cert_not_after.as_secs() as i64 - now) as f32 / Self::SECONDS_PER_DAY;
             attributes.push(KeyVal {
                 key: "client_cert_not_after".to_string(),
-                val: NaiveDateTime::from_timestamp_opt(f.client_cert_not_after.as_secs() as i64, 0)
+                val: DateTime::from_timestamp(f.client_cert_not_after.as_secs() as i64, 0)
                     .unwrap()
                     .to_string(),
             });
@@ -363,12 +392,9 @@ impl From<TlsInfo> for L7ProtocolSendLog {
         if !f.server_cert_not_before.is_zero() {
             attributes.push(KeyVal {
                 key: "server_cert_not_before".to_string(),
-                val: NaiveDateTime::from_timestamp_opt(
-                    f.server_cert_not_before.as_secs() as i64,
-                    0,
-                )
-                .unwrap()
-                .to_string(),
+                val: DateTime::from_timestamp(f.server_cert_not_before.as_secs() as i64, 0)
+                    .unwrap()
+                    .to_string(),
             });
         }
         if !f.server_cert_not_after.is_zero() {
@@ -376,7 +402,7 @@ impl From<TlsInfo> for L7ProtocolSendLog {
                 (f.server_cert_not_after.as_secs() as i64 - now) as f32 / Self::SECONDS_PER_DAY;
             attributes.push(KeyVal {
                 key: "server_cert_not_after".to_string(),
-                val: NaiveDateTime::from_timestamp_opt(f.server_cert_not_after.as_secs() as i64, 0)
+                val: DateTime::from_timestamp(f.server_cert_not_after.as_secs() as i64, 0)
                     .unwrap()
                     .to_string(),
             });
@@ -386,6 +412,8 @@ impl From<TlsInfo> for L7ProtocolSendLog {
             });
         }
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req: L7Request {
                 resource: f.request_resource,
                 domain: f.request_domain,
@@ -435,6 +463,7 @@ impl From<TlsInfo> for L7ProtocolSendLog {
 pub struct TlsLog {
     change_cipher_spec_count: u8,
     perf_stats: Option<L7PerfStats>,
+    last_is_on_blacklist: bool,
 }
 
 //解析器接口实现
@@ -455,18 +484,44 @@ impl L7ProtocolParserInterface for TlsLog {
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         let mut info = TlsInfo::default();
         self.parse(payload, &mut info, param)?;
-        if info.session_id.is_some() {
-            // Triggered by Client Hello and the last Change cipher spec
-            info.cal_rrt(param, None).map(|rtt| {
-                info.tls_rtt = rtt;
-                self.perf_stats.as_mut().map(|p| p.update_tls_rtt(rtt));
-            });
-            info.session_id = None;
+
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
         }
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
+        if !info.is_on_blacklist && !self.last_is_on_blacklist {
+            match param.direction {
+                PacketDirection::ClientToServer => {
+                    self.perf_stats.as_mut().map(|p| p.inc_req());
+                }
+                PacketDirection::ServerToClient => {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+                }
+            }
+            match info.status {
+                L7ResponseStatus::ClientError => {
+                    self.perf_stats.as_mut().map(|p| p.inc_req_err());
+                }
+                L7ResponseStatus::ServerError => {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp_err());
+                }
+                _ => {}
+            }
+            if info.session_id.is_some() {
+                // Triggered by Client Hello and the last Change cipher spec
+                info.cal_rrt(param).map(|rtt| {
+                    info.tls_rtt = rtt;
+                    self.perf_stats.as_mut().map(|p| p.update_tls_rtt(rtt));
+                });
+                info.session_id = None;
+            }
+            if info.msg_type != LogMessageType::Session {
+                info.cal_rrt(param).map(|rrt| {
+                    info.rrt = rrt;
+                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
+                });
+            }
+        }
+        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::TlsInfo(info)))
         } else {
@@ -515,104 +570,117 @@ impl TlsLog {
 
         match param.direction {
             PacketDirection::ClientToServer => {
-                if tls_headers.len() > 0 {
-                    tls_headers.iter().for_each(|h| {
-                        if h.is_client_hello() {
+                match Version::from(tls_headers[0].version()) {
+                    Version::Unknown(v) => {
+                        return Err(Error::TlsLogParseFailed(format!(
+                            "Unknown tls version 0x{:x}",
+                            v
+                        )))
+                    }
+                    v => info.version = v,
+                }
+                info.msg_type = LogMessageType::Request;
+                tls_headers.iter().for_each(|h| {
+                    if h.is_client_hello() {
+                        info.session_id = Some(0xff);
+                    }
+                    if h.is_alert() {
+                        info.status = L7ResponseStatus::ClientError;
+                        info.msg_type = LogMessageType::Session;
+                    }
+                    if h.is_change_cipher_spec() {
+                        self.change_cipher_spec_count += 1;
+                        if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
+                            self.change_cipher_spec_count = 0;
                             info.session_id = Some(0xff);
                         }
-                        if h.is_alert() {
-                            self.perf_stats
-                                .as_mut()
-                                .map(|p: &mut L7PerfStats| p.inc_resp_err());
-                            info.status = L7ResponseStatus::ServerError;
-                        }
-                        if h.is_change_cipher_spec() {
-                            self.change_cipher_spec_count += 1;
-                            if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
-                                self.change_cipher_spec_count = 0;
-                                info.session_id = Some(0xff);
-                            }
-                        }
+                    }
 
-                        if info.handshake_protocol.is_empty() && h.handshake_headers.len() > 0 {
-                            info.handshake_protocol = h.handshake_headers[0].to_string();
-                        }
+                    if info.handshake_protocol.is_empty() && h.handshake_headers.len() > 0 {
+                        info.handshake_protocol = h.handshake_headers[0].to_string();
+                    }
 
-                        if let Some(server_name) = h.domain_name() {
-                            info.request_domain = server_name;
-                        }
+                    if let Some(server_name) = h.domain_name() {
+                        info.request_domain = server_name.clone();
+                        info.request_resource = server_name;
+                    }
 
-                        if info.request_type.is_empty() || h.is_change_cipher_spec() {
-                            info.request_type = h.to_string();
+                    if let Some(v) = h.validity() {
+                        if info.client_cert_not_after.is_zero() {
+                            info.client_cert_not_before = Timestamp::from(v.0);
+                            info.client_cert_not_after = Timestamp::from(v.1);
                         }
+                    }
+                });
 
-                        if let Some(v) = h.validity() {
-                            if info.client_cert_not_after.is_zero() {
-                                info.client_cert_not_before = Timestamp::from(v.0);
-                                info.client_cert_not_after = Timestamp::from(v.1);
-                            }
-                        }
-                    });
-                    info.version = Version::from(tls_headers[0].version());
-                    info.request_resource = tls_headers
-                        .iter()
-                        .map(|i| i.to_string())
-                        .collect::<Vec<String>>()
-                        .join("|")
-                        .to_string();
-                    info.msg_type = LogMessageType::Request;
-
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
+                info.request_type = tls_headers
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<String>>()
+                    .join("|")
+                    .to_string();
             }
             PacketDirection::ServerToClient => {
-                if tls_headers.len() > 0 {
-                    tls_headers.iter().for_each(|h| {
-                        if h.is_alert() {
-                            self.perf_stats
-                                .as_mut()
-                                .map(|p: &mut L7PerfStats| p.inc_resp_err());
-                            info.status = L7ResponseStatus::ServerError;
-                        }
+                info.msg_type = LogMessageType::Response;
 
-                        if let Some(v) = h.supported_version() {
-                            info.version = Version::from(v);
+                if info.version.is_empty() {
+                    match Version::from(tls_headers[0].version()) {
+                        Version::Unknown(v) => {
+                            return Err(Error::TlsLogParseFailed(format!(
+                                "Unknown tls version 0x{:x}",
+                                v
+                            )))
                         }
-
-                        if h.is_change_cipher_spec() {
-                            self.change_cipher_spec_count += 1;
-                            if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
-                                self.change_cipher_spec_count = 0;
-                                info.session_id = Some(0xff);
-                            }
-                        }
-
-                        if h.cipher_suite().is_some() && info.cipher_suite.is_none() {
-                            info.cipher_suite = h.cipher_suite().map(|c| CipherSuite::from(c));
-                        }
-
-                        if let Some(v) = h.validity() {
-                            if info.server_cert_not_after.is_zero() {
-                                info.server_cert_not_before = Timestamp::from(v.0);
-                                info.server_cert_not_after = Timestamp::from(v.1);
-                            }
-                        }
-                    });
-                    if info.version.is_empty() {
-                        info.version = Version::from(tls_headers[0].version());
+                        v => info.version = v,
                     }
-                    info.response_result = tls_headers
-                        .iter()
-                        .map(|i| i.to_string())
-                        .collect::<Vec<String>>()
-                        .join("|")
-                        .to_string();
-                    info.msg_type = LogMessageType::Response;
-
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
                 }
+
+                tls_headers.iter().for_each(|h| {
+                    if h.is_alert() {
+                        info.status = L7ResponseStatus::ServerError;
+                        info.msg_type = LogMessageType::Session;
+                    }
+
+                    if let Some(v) = h.supported_version() {
+                        info.version = Version::from(v);
+                    }
+
+                    if h.is_change_cipher_spec() {
+                        self.change_cipher_spec_count += 1;
+                        if self.change_cipher_spec_count >= Self::CHNAGE_CIPHER_SPEC_LIMIT {
+                            self.change_cipher_spec_count = 0;
+                            info.session_id = Some(0xff);
+                        }
+                    }
+
+                    if h.cipher_suite().is_some() && info.cipher_suite.is_none() {
+                        info.cipher_suite = h.cipher_suite().map(|c| CipherSuite::from(c));
+                    }
+
+                    if let Some(v) = h.validity() {
+                        if info.server_cert_not_after.is_zero() {
+                            info.server_cert_not_before = Timestamp::from(v.0);
+                            info.server_cert_not_after = Timestamp::from(v.1);
+                        }
+                    }
+                });
+
+                if let Version::Unknown(v) = info.version {
+                    return Err(Error::TlsLogParseFailed(format!(
+                        "Unknown tls version 0x{:x}",
+                        v
+                    )));
+                }
+
+                info.response_result = tls_headers
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<String>>()
+                    .join("|")
+                    .to_string();
             }
         }
+        set_captured_byte!(info, param);
         Ok(())
     }
 }
@@ -655,7 +723,16 @@ mod tests {
                 None => continue,
             };
 
-            let param = &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true);
+            let param = &mut ParseParam::new(
+                packet as &MetaPacket,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
+            param.set_captured_byte(payload.len());
             let is_tls = tls.check_payload(payload, param);
             tls.reset();
             let info = tls.parse_payload(payload, param);
@@ -666,8 +743,6 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-            } else {
-                output.push_str(&format!("{:?} is_tls: {}\r\n", TlsInfo::default(), is_tls));
             }
         }
         output
@@ -742,7 +817,15 @@ mod tests {
             }
             let _ = tls.parse_payload(
                 packet.get_l4_payload().unwrap(),
-                &ParseParam::new(&*packet, rrt_cache.clone(), true, true),
+                &ParseParam::new(
+                    &*packet,
+                    rrt_cache.clone(),
+                    Default::default(),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    Default::default(),
+                    true,
+                    true,
+                ),
             );
         }
         tls.perf_stats.unwrap()

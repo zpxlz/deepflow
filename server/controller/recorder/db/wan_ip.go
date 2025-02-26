@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type WANIP struct {
-	OperatorBase[mysql.WANIP]
+	OperatorBase[*metadbmodel.WANIP, metadbmodel.WANIP]
 }
 
 func NewWANIP() *WANIP {
 	return &WANIP{
-		OperatorBase[mysql.WANIP]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.WANIP](
+			ctrlrcommon.RESOURCE_TYPE_WAN_IP_EN,
+			false,
+			false,
+		),
 	}
 }

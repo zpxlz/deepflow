@@ -17,66 +17,70 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChPodCluster struct {
-	UpdaterBase[mysql.ChPodCluster, IDKey]
+	SubscriberComponent[*message.PodClusterFieldsUpdate, message.PodClusterFieldsUpdate, metadbmodel.PodCluster, metadbmodel.ChPodCluster, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChPodCluster(resourceTypeToIconID map[IconKey]int) *ChPodCluster {
-	updater := &ChPodCluster{
-		UpdaterBase[mysql.ChPodCluster, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_POD,
-		},
+	mng := &ChPodCluster{
+		newSubscriberComponent[*message.PodClusterFieldsUpdate, message.PodClusterFieldsUpdate, metadbmodel.PodCluster, metadbmodel.ChPodCluster, IDKey](
+			common.RESOURCE_TYPE_POD_CLUSTER_EN, RESOURCE_TYPE_CH_POD_CLUSTER,
+		),
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (p *ChPodCluster) generateNewData() (map[IDKey]mysql.ChPodCluster, bool) {
-	var podClusters []mysql.PodCluster
-	err := mysql.Db.Unscoped().Find(&podClusters).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(p.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChPodCluster) sourceToTarget(md *message.Metadata, source *metadbmodel.PodCluster) (keys []IDKey, targets []metadbmodel.ChPodCluster) {
+	iconID := c.resourceTypeToIconID[IconKey{
+		NodeType: RESOURCE_TYPE_POD_CLUSTER,
+	}]
+	sourceName := source.Name
+	if source.DeletedAt.Valid {
+		sourceName += " (deleted)"
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChPodCluster)
-	for _, podCluster := range podClusters {
-		if podCluster.DeletedAt.Valid {
-			keyToItem[IDKey{ID: podCluster.ID}] = mysql.ChPodCluster{
-				ID:     podCluster.ID,
-				Name:   podCluster.Name + " (deleted)",
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD_CLUSTER}],
-			}
-		} else {
-			keyToItem[IDKey{ID: podCluster.ID}] = mysql.ChPodCluster{
-				ID:     podCluster.ID,
-				Name:   podCluster.Name,
-				IconID: p.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_POD_CLUSTER}],
-			}
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, metadbmodel.ChPodCluster{
+		ID:          source.ID,
+		Name:        sourceName,
+		IconID:      iconID,
+		TeamID:      md.TeamID,
+		DomainID:    md.DomainID,
+		SubDomainID: md.SubDomainID,
+	})
+	return
 }
 
-func (p *ChPodCluster) generateKey(dbItem mysql.ChPodCluster) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (p *ChPodCluster) generateUpdateInfo(oldItem, newItem mysql.ChPodCluster) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChPodCluster) onResourceUpdated(sourceID int, fieldsUpdate *message.PodClusterFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
-	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
+
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem metadbmodel.ChPodCluster
+		db.Where("id = ?", sourceID).First(&chItem)
+		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
 	}
-	return nil, false
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChPodCluster) softDeletedTargetsUpdated(targets []metadbmodel.ChPodCluster, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

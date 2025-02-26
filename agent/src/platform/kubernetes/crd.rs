@@ -22,17 +22,18 @@ use serde::{Deserialize, Serialize};
 
 use super::resource_watcher::Trimmable;
 
-pub mod pingan {
+pub mod pingan_cloud {
     use super::*;
 
-    use k8s_openapi::api::core::v1::ServicePort;
+    use k8s_openapi::api::core::v1::{ServicePort, ServiceStatus};
 
     #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
     #[kube(
         group = "crd.pingan.org",
         version = "v1alpha1",
         kind = "ServiceRule",
-        namespaced
+        namespaced,
+        status = "ServiceStatus"
     )]
     #[serde(rename_all = "camelCase")]
     pub struct ServiceRuleSpec {
@@ -59,6 +60,12 @@ pub mod pingan {
                 labels: self.metadata.labels.take(),
                 ..Default::default()
             };
+            if let Some(svc_status) = self.status.take() {
+                sr.status = Some(ServiceStatus {
+                    load_balancer: svc_status.load_balancer,
+                    ..Default::default()
+                });
+            }
             sr
         }
     }
@@ -80,7 +87,7 @@ pub mod kruise {
     )]
     #[serde(rename_all = "camelCase")]
     pub struct CloneSetSpec {
-        pub relicas: Option<i32>,
+        pub replicas: Option<i32>,
         pub selector: LabelSelector,
         pub template: PodTemplateSpec,
     }
@@ -113,7 +120,7 @@ pub mod kruise {
     )]
     #[serde(rename_all = "camelCase")]
     pub struct StatefulSetSpec {
-        pub relicas: Option<i32>,
+        pub replicas: Option<i32>,
         pub selector: LabelSelector,
         pub template: PodTemplateSpec,
     }
@@ -168,6 +175,80 @@ pub mod calico {
                 ..Default::default()
             };
             res
+        }
+    }
+}
+
+pub mod opengauss {
+    use super::*;
+
+    #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
+    #[kube(
+        group = "opengauss.cmbc.com.cn",
+        version = "v1",
+        kind = "OpenGaussCluster",
+        namespaced
+    )]
+    #[serde(rename_all = "camelCase")]
+    pub struct OpenGaussClusterSpec {}
+
+    impl Trimmable for OpenGaussCluster {
+        fn trim(mut self) -> Self {
+            let name = if let Some(name) = self.metadata.name.as_ref() {
+                name
+            } else {
+                ""
+            };
+            let mut ss = Self::new(name, self.spec);
+            ss.metadata = ObjectMeta {
+                uid: self.metadata.uid.take(),
+                name: self.metadata.name.take(),
+                namespace: self.metadata.namespace.take(),
+                labels: self.metadata.labels.take(),
+                ..Default::default()
+            };
+            ss
+        }
+    }
+}
+
+pub mod tkex {
+    use super::*;
+
+    use k8s_openapi::{
+        api::core::v1::PodTemplateSpec, apimachinery::pkg::apis::meta::v1::LabelSelector,
+    };
+
+    #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
+    #[kube(
+        group = "platform.stke",
+        version = "v1alpha1",
+        kind = "StatefulSetPlus",
+        namespaced
+    )]
+    #[serde(rename_all = "camelCase")]
+    pub struct StatefulSetPlusSpec {
+        pub replicas: Option<i32>,
+        pub selector: LabelSelector,
+        pub template: PodTemplateSpec,
+    }
+
+    impl Trimmable for StatefulSetPlus {
+        fn trim(mut self) -> Self {
+            let name = if let Some(name) = self.metadata.name.as_ref() {
+                name
+            } else {
+                ""
+            };
+            let mut ssp = Self::new(name, self.spec);
+            ssp.metadata = ObjectMeta {
+                uid: self.metadata.uid.take(),
+                name: self.metadata.name.take(),
+                namespace: self.metadata.namespace.take(),
+                labels: self.metadata.labels.take(),
+                ..Default::default()
+            };
+            ssp
         }
     }
 }

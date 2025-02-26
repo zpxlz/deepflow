@@ -15,7 +15,7 @@
  */
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     hash::Hash,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
@@ -32,19 +32,19 @@ use log::{debug, info, warn};
 
 use super::{
     consts::{QUEUE_BATCH_SIZE, RCV_TIMEOUT},
+    reset_delay_seconds,
     types::{AppMeterWithFlow, FlowMeterWithFlow, MiniFlow},
-    MetricsType, FLOW_METRICS_PEER_DST, FLOW_METRICS_PEER_SRC,
+    MetricsType, FLOW_METRICS_PEER_DST, FLOW_METRICS_PEER_SRC, SECONDS_IN_MINUTE,
 };
 use crate::{
     common::{
-        enums::{EthernetType, IpProtocol},
-        flow::{L7Protocol, SignalSource},
+        endpoint::EPC_INTERNET,
+        enums::{CaptureNetworkType, EthernetType, IpProtocol},
+        flow::{CloseType, L7Protocol, SignalSource},
     },
     config::handler::{CollectorAccess, CollectorConfig},
     metric::{
-        document::{
-            BoxedDocument, Code, Direction, Document, DocumentFlag, TagType, Tagger, TapSide,
-        },
+        document::{BoxedDocument, Code, Direction, Document, DocumentFlag, Tagger, TapSide},
         meter::{AppMeter, FlowMeter, Meter, UsageMeter},
     },
     rpc::get_timestamp,
@@ -54,11 +54,10 @@ use crate::{
     },
 };
 use public::{
+    proto::agent::AgentType,
     queue::{DebugSender, Error, Receiver},
     utils::net::MacAddr,
 };
-
-const MINUTE: u64 = 60;
 
 #[derive(Default)]
 pub struct CollectorCounter {
@@ -134,6 +133,9 @@ struct StashKey {
     src_gpid: u32,
     dst_gpid: u32,
     endpoint_hash: u32,
+    // request-reponse time span
+    time_span: u32,
+    biz_type: u8,
 }
 
 impl Default for StashKey {
@@ -145,6 +147,8 @@ impl Default for StashKey {
             src_gpid: 0,
             dst_gpid: 0,
             endpoint_hash: 0,
+            time_span: 0,
+            biz_type: 0,
         }
     }
 }
@@ -187,10 +191,7 @@ impl StashKey {
         .union(Code::SERVER_PORT)
         .union(Code::L7_PROTOCOL);
 
-    const ACL: Code = Code::ACL_GID
-        .union(Code::TAG_TYPE)
-        .union(Code::TAG_VALUE)
-        .union(Code::VTAP_ID);
+    const ACL: Code = Code::ACL_GID.union(Code::TUNNEL_IP_ID).union(Code::VTAP_ID);
 
     fn new(tagger: &Tagger, src_ip: IpAddr, dst_ip: Option<IpAddr>, endpoint_hash: u32) -> Self {
         let mut fast_id = 0;
@@ -199,7 +200,7 @@ impl StashKey {
             // fast_id
             // 128          72        64    59       56        48           32          24         16        0
             // +-------------+---------+-----+--------+---------+------------+-----------+----------+---------+
-            // |             | L7Proto | MAC | CodeID | TapType | ServerPort | Direction | Protocol | L3EpcId |
+            // |             | L7Proto | MAC | CodeID | CaptureNetworkType | ServerPort | Direction | Protocol | L3EpcId |
             // +-------------+---------+-----+--------+---------+------------+-----------+----------+---------+
             Self::SINGLE_MAC_IP_PORT_APP => {
                 fast_id |= (tagger.l7_protocol as u128) << 64;
@@ -251,7 +252,7 @@ impl StashKey {
             // RESERVED
             // 20    19       16        8         0
             // ------------------------------------
-            // | MAC | CodeID | L7Proto | TapType |
+            // | MAC | CodeID | L7Proto | CaptureNetworkType |
             // ------------------------------------
             Self::EDGE_MAC_IP_PORT_APP => {
                 let tap_port_reserve = (tagger.l7_protocol as u32) << 8 | 3 << 16 | 1 << 19;
@@ -305,11 +306,7 @@ impl StashKey {
                     .0 as u128)
                     << 64;
             }
-            Self::ACL => {
-                fast_id |= tagger.acl_gid as u128
-                    | (tagger.tag_type as u128) << 16
-                    | (tagger.tag_value as u128) << 24;
-            }
+            Self::ACL => fast_id |= tagger.acl_gid as u128 | (tagger.server_port as u128) << 16,
             _ => panic!(
                 "There is no matching code. You need to update the tagger.code: {:?}",
                 tagger.code
@@ -323,12 +320,15 @@ impl StashKey {
             src_gpid: tagger.gpid,
             dst_gpid: tagger.gpid_1,
             endpoint_hash,
+            biz_type: tagger.biz_type,
+            time_span: tagger.time_span,
         }
     }
 }
 
 struct Stash {
     sender: DebugSender<BoxedDocument>,
+    closed_docs: Vec<BoxedDocument>,
     counter: Arc<CollectorCounter>,
     start_time: Duration,
     slot_interval: u64,
@@ -356,13 +356,15 @@ impl Stash {
         };
 
         let start_time = Duration::from_secs(
-            get_timestamp(ctx.ntp_diff.load(Ordering::Relaxed)).as_secs() / MINUTE * MINUTE
-                - 2 * MINUTE,
+            get_timestamp(ctx.ntp_diff.load(Ordering::Relaxed)).as_secs() / SECONDS_IN_MINUTE
+                * SECONDS_IN_MINUTE
+                - 2 * SECONDS_IN_MINUTE,
         );
         let inner = HashMap::with_capacity(Self::MIN_STASH_CAPACITY);
         let stash_init_capacity = inner.capacity();
         Self {
             sender,
+            closed_docs: Vec::with_capacity(QUEUE_BATCH_SIZE),
             counter,
             start_time,
             global_thread_id: ctx.id as u8 + 1,
@@ -388,14 +390,13 @@ impl Stash {
             return;
         }
 
-        // timeInSecond needs to be corrected here.
-        // because doc time is used to push the time window, no correction is made to the timestamp in doc.
-        // for tick in queue (that is, accFlow = = nil), the time is modified to time_in_second-delay_seconds.
-        // for minute collector, minus 60s
+        // time_in_second needs to be corrected here. because doc time is used to push the time window,
+        // no correction is made to the timestamp in doc. for tick in queue (that is, accFlow == nil),
+        // the time is modified to time_in_second - delay_seconds. for minute collector, minus 60s
         if acc_flow.is_none() && time_in_second >= self.context.delay_seconds {
             match self.context.metric_type {
                 MetricsType::SECOND => time_in_second -= self.context.delay_seconds,
-                _ => time_in_second -= self.context.delay_seconds - MINUTE,
+                _ => time_in_second -= self.context.delay_seconds - SECONDS_IN_MINUTE,
             }
         }
 
@@ -443,11 +444,11 @@ impl Stash {
             let id_map = &acc_flow.id_maps[0];
             for (&acl_gid, &ip_id) in id_map.iter() {
                 let tagger = Tagger {
-                    code: Code::ACL_GID | Code::TAG_TYPE | Code::TAG_VALUE | Code::VTAP_ID,
+                    code: StashKey::ACL,
                     acl_gid,
-                    tag_value: ip_id,
-                    tag_type: TagType::TunnelIpId,
+                    server_port: ip_id,
                     signal_source: flow.signal_source,
+                    agent_id: config.agent_id,
                     ..Default::default()
                 };
                 let meter = &acc_flow.flow_meter;
@@ -459,16 +460,16 @@ impl Stash {
                     ..Default::default()
                 };
                 let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
-                self.add(key, tagger, Meter::Usage(usage_meter));
+                self.add(key, tagger, Meter::Usage(usage_meter), flow.close_type);
             }
             let id_map = &acc_flow.id_maps[1];
             for (&acl_gid, &ip_id) in id_map.iter() {
                 let tagger = Tagger {
-                    code: Code::ACL_GID | Code::TAG_TYPE | Code::TAG_VALUE | Code::VTAP_ID,
+                    code: StashKey::ACL,
                     acl_gid,
-                    tag_value: ip_id,
-                    tag_type: TagType::TunnelIpId,
+                    server_port: ip_id,
                     signal_source: flow.signal_source,
+                    agent_id: config.agent_id,
                     ..Default::default()
                 };
 
@@ -481,11 +482,12 @@ impl Stash {
                     ..Default::default()
                 };
                 let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
-                self.add(key, tagger, Meter::Usage(usage_meter));
+                self.add(key, tagger, Meter::Usage(usage_meter), flow.close_type);
             }
         }
 
-        if !acc_flow.is_active_host0 && !acc_flow.is_active_host1 && !config.inactive_ip_enabled {
+        if !acc_flow.is_active_host0 && !acc_flow.is_active_host1 && config.inactive_ip_aggregation
+        {
             self.counter.drop_inactive.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -500,17 +502,24 @@ impl Stash {
         config: &CollectorConfig,
     ) {
         for ep in 0..2 {
-            // Do not count the data of None direction
-            if directions[ep] == Direction::None {
-                continue;
-            }
+            let direction = match config.agent_type {
+                AgentType::TtDedicatedPhysicalMachine
+                    if acc_flow.flow.flow_key.tap_type != CaptureNetworkType::Cloud
+                        && directions[0] != Direction::None
+                        && directions[1] != Direction::None =>
+                {
+                    Direction::None
+                }
+                _ if directions[ep] == Direction::None => continue,
+                _ => directions[ep],
+            };
             let is_active_host = if ep == 0 {
                 acc_flow.is_active_host0
             } else {
                 acc_flow.is_active_host1
             };
             // single_stats: Do not count the inactive end (Internet/private network IP with no response packet)
-            if config.inactive_ip_enabled || is_active_host {
+            if !config.inactive_ip_aggregation || is_active_host {
                 let flow_meter = if ep == FLOW_METRICS_PEER_DST {
                     acc_flow.flow_meter.to_reversed()
                 } else {
@@ -520,29 +529,33 @@ impl Stash {
                     self.global_thread_id,
                     &acc_flow.flow,
                     ep,
-                    directions[ep],
+                    direction,
                     is_active_host,
                     config,
                     None,
+                    0,
+                    0,
                     acc_flow.l7_protocol,
                     self.context.agent_mode,
                 );
-                self.fill_single_l4_stats(tagger, flow_meter);
+                self.fill_single_l4_stats(tagger, flow_meter, acc_flow.flow.close_type);
             }
             let tagger = get_edge_tagger(
                 self.global_thread_id,
                 &acc_flow.flow,
-                directions[ep],
+                direction,
                 acc_flow.is_active_host0,
                 acc_flow.is_active_host1,
                 config,
                 None,
+                0,
+                0,
                 acc_flow.l7_protocol,
                 self.context.agent_mode,
             );
             // edge_stats: If the direction of a certain end is known, the statistical data
             // will be recorded with the direction (corresponding tap-side), up to two times
-            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter);
+            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter, acc_flow.flow.close_type);
         }
         // edge_stats: If both ends of direction are None, record the
         // statistical data with direction=0 (corresponding tap-side=rest)
@@ -561,34 +574,42 @@ impl Stash {
                 acc_flow.is_active_host1,
                 config,
                 None,
+                0,
+                0,
                 acc_flow.l7_protocol,
                 self.context.agent_mode,
             );
-            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter);
+            self.fill_edge_l4_stats(tagger, acc_flow.flow_meter, acc_flow.flow.close_type);
         }
     }
 
-    fn fill_single_l4_stats(&mut self, tagger: Tagger, flow_meter: FlowMeter) {
+    fn fill_single_l4_stats(
+        &mut self,
+        tagger: Tagger,
+        flow_meter: FlowMeter,
+        close_type: CloseType,
+    ) {
         // We collect the single-ended metrics data from Packet, XFlow, EBPF, Otel to the table (vtap_app_port).
         // In the case of signal_source grouping, the single_stats data is not duplicate.
-        // Only data whose direction is c|s|local has flow_meter.
+        // Only data whose direction is c|s|local|None has flow_meter.
         if tagger.direction == Direction::ServerToClient
             || tagger.direction == Direction::ClientToServer
             || tagger.direction == Direction::LocalToLocal
+            || tagger.direction == Direction::None
         {
             let key = StashKey::new(&tagger, tagger.ip, None, 0);
-            self.add(key, tagger, Meter::Flow(flow_meter));
+            self.add(key, tagger, Meter::Flow(flow_meter), close_type);
         }
     }
 
-    fn fill_edge_l4_stats(&mut self, tagger: Tagger, flow_meter: FlowMeter) {
+    fn fill_edge_l4_stats(&mut self, tagger: Tagger, flow_meter: FlowMeter, close_type: CloseType) {
         // network metrics (vtap_flow_edge_port)
         // Packet data and XFlow data have L4 info
         if tagger.signal_source == SignalSource::Packet
             || tagger.signal_source == SignalSource::XFlow
         {
             let key = StashKey::new(&tagger, tagger.ip, Some(tagger.ip1), 0);
-            self.add(key, tagger, Meter::Flow(flow_meter));
+            self.add(key, tagger, Meter::Flow(flow_meter), close_type);
         }
     }
 
@@ -605,14 +626,27 @@ impl Stash {
             return;
         }
 
-        // timeInSecond needs to be corrected here.
-        // because doc time is used to push the time window, no correction is made to the timestamp in doc.
-        // for tick in queue (that is, accFlow = = nil), the time is modified to time_in_second-delay_seconds.
-        // for minute collector, minus 60s
+        // if the flow is closed, fill and send the stats data as soon as possible, and do not push the time window
+        if let Some(m) = meter.as_ref() {
+            if m.flow.close_type != CloseType::Unknown
+                && m.flow.close_type != CloseType::ForcedReport
+            {
+                if !m.is_active_host0 && !m.is_active_host1 && config.inactive_ip_aggregation {
+                    self.counter.drop_inactive.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                self.fill_l7_stats(m, &m.flow.directions, &config);
+                return;
+            }
+        }
+
+        // time_in_second needs to be corrected here, because doc time is used to push the time window,
+        // no correction is made to the timestamp in doc, for tick in queue (that is, meter == nil),
+        // the time is modified to time_in_second - delay_seconds, for minute collector, minus 60s
         if meter.is_none() && time_in_second >= self.context.delay_seconds {
             match self.context.metric_type {
                 MetricsType::SECOND => time_in_second -= self.context.delay_seconds,
-                _ => time_in_second -= self.context.delay_seconds - MINUTE,
+                _ => time_in_second -= self.context.delay_seconds - SECONDS_IN_MINUTE,
             }
         }
 
@@ -652,7 +686,7 @@ impl Stash {
             None => return,
         };
 
-        if !meter.is_active_host0 && !meter.is_active_host1 && !config.inactive_ip_enabled {
+        if !meter.is_active_host0 && !meter.is_active_host1 && config.inactive_ip_aggregation {
             self.counter.drop_inactive.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -680,7 +714,7 @@ impl Stash {
                 meter.is_active_host1
             };
             // single_stats: Do not count the inactive end (Internet/private network IP with no response packet)
-            if config.inactive_ip_enabled || is_active_host {
+            if !config.inactive_ip_aggregation || is_active_host {
                 let mut tagger = get_single_tagger(
                     self.global_thread_id,
                     &flow,
@@ -689,11 +723,18 @@ impl Stash {
                     is_active_host,
                     config,
                     meter.endpoint.clone(),
+                    meter.biz_type,
+                    meter.time_span,
                     meter.l7_protocol,
                     self.context.agent_mode,
                 );
                 tagger.code |= Code::L7_PROTOCOL;
-                self.fill_single_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
+                self.fill_single_l7_stats(
+                    tagger,
+                    meter.endpoint_hash,
+                    meter.app_meter,
+                    flow.close_type,
+                );
             }
             let mut tagger = get_edge_tagger(
                 self.global_thread_id,
@@ -703,13 +744,20 @@ impl Stash {
                 meter.is_active_host1,
                 config,
                 meter.endpoint.clone(),
+                meter.biz_type,
+                meter.time_span,
                 meter.l7_protocol,
                 self.context.agent_mode,
             );
             tagger.code |= Code::L7_PROTOCOL;
             // edge_stats: If the direction of a certain end is known, the statistical data
             // will be recorded with the direction (corresponding tap-side), up to two times
-            self.fill_edge_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
+            self.fill_edge_l7_stats(
+                tagger,
+                meter.endpoint_hash,
+                meter.app_meter,
+                flow.close_type,
+            );
         }
         // edge_stats: If both ends of direction are None, record the
         // statistical data with direction=0 (corresponding tap-side=rest)
@@ -728,15 +776,28 @@ impl Stash {
                 meter.is_active_host1,
                 config,
                 meter.endpoint.clone(),
+                meter.biz_type,
+                meter.time_span,
                 meter.l7_protocol,
                 self.context.agent_mode,
             );
             tagger.code |= Code::L7_PROTOCOL;
-            self.fill_edge_l7_stats(tagger, meter.endpoint_hash, meter.app_meter);
+            self.fill_edge_l7_stats(
+                tagger,
+                meter.endpoint_hash,
+                meter.app_meter,
+                flow.close_type,
+            );
         }
     }
 
-    fn fill_single_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u32, app_meter: AppMeter) {
+    fn fill_single_l7_stats(
+        &mut self,
+        tagger: Tagger,
+        endpoint_hash: u32,
+        app_meter: AppMeter,
+        close_type: CloseType,
+    ) {
         // The l7_protocol of otel data may not be available, so report all otel data metrics.
         if tagger.l7_protocol != L7Protocol::Unknown || tagger.signal_source == SignalSource::OTel {
             // Only data whose direction is c|s|local|c-p|s-p|c-app|s-app|app has app_meter.
@@ -748,28 +809,67 @@ impl Stash {
                 || tagger.signal_source != SignalSource::Packet
             {
                 let key = StashKey::new(&tagger, tagger.ip, None, endpoint_hash);
-                self.add(key, tagger, Meter::App(app_meter));
+                self.add(key, tagger, Meter::App(app_meter), close_type);
             }
         }
     }
 
-    fn fill_edge_l7_stats(&mut self, tagger: Tagger, endpoint_hash: u32, app_meter: AppMeter) {
+    fn fill_edge_l7_stats(
+        &mut self,
+        tagger: Tagger,
+        endpoint_hash: u32,
+        app_meter: AppMeter,
+        close_type: CloseType,
+    ) {
         // The l7_protocol of otel data may not be available, so report all otel data metrics.
         // application metrics (vtap_app_edge_port)
         if tagger.l7_protocol != L7Protocol::Unknown || tagger.signal_source == SignalSource::OTel {
             let key = StashKey::new(&tagger, tagger.ip, Some(tagger.ip1), endpoint_hash);
-            self.add(key, tagger, Meter::App(app_meter));
+            self.add(key, tagger, Meter::App(app_meter), close_type);
         }
     }
 
-    fn add(&mut self, key: StashKey, tagger: Tagger, meter: Meter) {
-        if let Some(doc) = self.inner.get_mut(&key) {
-            doc.meter.sequential_merge(&meter);
-            return;
+    fn push_closed_doc(&mut self, closed_doc: BoxedDocument) {
+        self.closed_docs.push(closed_doc);
+        if self.closed_docs.len() >= QUEUE_BATCH_SIZE {
+            if let Err(e) = self.sender.send_all(&mut self.closed_docs) {
+                warn!("queue failed to send Document data, because {:?}", e);
+                self.closed_docs.clear();
+            }
         }
-        let mut doc = Document::new(meter);
-        doc.tagger = tagger;
-        self.inner.insert(key, doc);
+    }
+
+    fn add(&mut self, key: StashKey, tagger: Tagger, meter: Meter, close_type: CloseType) {
+        if close_type != CloseType::Unknown && close_type != CloseType::ForcedReport {
+            match self.inner.entry(key) {
+                Entry::Occupied(o) => {
+                    let mut doc = o.remove();
+                    doc.meter.sequential_merge(&meter);
+                    doc.timestamp = self.start_time.as_secs() as u32;
+                    doc.flags |= self.doc_flag;
+                    self.push_closed_doc(BoxedDocument(Box::new(doc)));
+                }
+                Entry::Vacant(_) => {
+                    let mut doc = Document::new(meter);
+                    doc.tagger = tagger;
+                    doc.timestamp = self.start_time.as_secs() as u32;
+                    doc.flags |= self.doc_flag;
+                    self.push_closed_doc(BoxedDocument(Box::new(doc)));
+                }
+            }
+        } else {
+            match self.inner.entry(key) {
+                Entry::Occupied(mut o) => {
+                    let doc = o.get_mut();
+                    doc.meter.sequential_merge(&meter);
+                }
+                Entry::Vacant(o) => {
+                    let mut doc = Document::new(meter);
+                    doc.tagger = tagger;
+                    o.insert(doc);
+                }
+            }
+        }
     }
 
     fn flush_stats(&mut self) {
@@ -779,8 +879,11 @@ impl Stash {
         let mut batch = Vec::with_capacity(QUEUE_BATCH_SIZE);
         for (_, mut doc) in self.inner.drain() {
             if batch.len() >= QUEUE_BATCH_SIZE {
-                if let Err(Error::Terminated(..)) = self.sender.send_all(&mut batch) {
-                    warn!("{} queue terminated", self.context.name);
+                if let Err(e) = self.sender.send_all(&mut batch) {
+                    warn!(
+                        "{} queue failed to send data, because {:?}",
+                        self.context.name, e
+                    );
                     return;
                 }
             }
@@ -789,8 +892,11 @@ impl Stash {
             batch.push(BoxedDocument(Box::new(doc)))
         }
         if batch.len() > 0 {
-            if let Err(Error::Terminated(..)) = self.sender.send_all(&mut batch) {
-                warn!("{} queue terminated", self.context.name);
+            if let Err(e) = self.sender.send_all(&mut batch) {
+                warn!(
+                    "{} queue failed to send data, because {:?}",
+                    self.context.name, e
+                );
             }
         }
 
@@ -816,11 +922,11 @@ impl Stash {
     }
 }
 
-// server_port is ignored when is_active_service and inactive_server_port_enabled is turned off
-// is_active_service and SFlow,NetFlow data, ignoring service port
+// server_port is ignored when service is not active and inactive_server_port_aggregation is turned on
+// is_active_service and SFlow, NetFlow data, ignoring service port
 // ignore the server for non-TCP/UDP traffic
-fn ignore_server_port(flow: &MiniFlow, inactive_server_port_enabled: bool) -> bool {
-    (!flow.is_active_service && !inactive_server_port_enabled)
+fn ignore_server_port(flow: &MiniFlow, inactive_server_port_aggregation: bool) -> bool {
+    (!flow.is_active_service && inactive_server_port_aggregation)
         || (flow.flow_key.proto != IpProtocol::TCP && flow.flow_key.proto != IpProtocol::UDP)
 }
 
@@ -832,6 +938,8 @@ fn get_single_tagger(
     is_active_host: bool,
     config: &CollectorConfig,
     endpoint: Option<String>,
+    biz_type: u8,
+    time_span: u32,
     l7_protocol: L7Protocol,
     agent_mode: RunningMode,
 ) -> Tagger {
@@ -850,27 +958,29 @@ fn get_single_tagger(
             }
         }
         RunningMode::Managed => {
-            if !is_active_host && !config.inactive_ip_enabled {
-                unspecified_ip(is_ipv6)
+            if config.inactive_ip_aggregation {
+                if !is_active_host {
+                    unspecified_ip(is_ipv6)
+                } else {
+                    side.nat_real_ip
+                }
             } else if ep == FLOW_METRICS_PEER_SRC {
-                if flow.peers[0].l3_epc_id > 0 || flow.signal_source == SignalSource::OTel {
+                if flow.peers[0].l3_epc_id != EPC_INTERNET
+                    || flow.signal_source == SignalSource::OTel
+                {
                     flow.peers[0].nat_real_ip
                 } else {
                     unspecified_ip(is_ipv6)
                 }
             } else {
-                if flow.peers[1].l3_epc_id > 0 || flow.signal_source == SignalSource::OTel {
-                    flow.peers[1].nat_real_ip
-                } else {
-                    unspecified_ip(is_ipv6)
-                }
+                flow.peers[1].nat_real_ip
             }
         }
     };
 
     Tagger {
         global_thread_id,
-        vtap_id: config.vtap_id,
+        agent_id: config.agent_id,
         mac: if !has_mac {
             MacAddr::ZERO
         } else if ep == FLOW_METRICS_PEER_SRC {
@@ -888,7 +998,7 @@ fn get_single_tagger(
         tap_type: flow_key.tap_type,
         // If the resource is located on the client, the service port is ignored
         server_port: if ep == FLOW_METRICS_PEER_SRC
-            || ignore_server_port(flow, config.inactive_server_port_enabled)
+            || ignore_server_port(flow, config.inactive_server_port_aggregation)
         {
             0
         } else {
@@ -915,7 +1025,9 @@ fn get_single_tagger(
         otel_service: flow.otel_service.clone(),
         otel_instance: flow.otel_instance.clone(),
         endpoint,
+        biz_type,
         pod_id: flow.pod_id,
+        time_span,
         ..Default::default()
     }
 }
@@ -928,6 +1040,8 @@ fn get_edge_tagger(
     is_active_host1: bool,
     config: &CollectorConfig,
     endpoint: Option<String>,
+    biz_type: u8,
+    time_span: u32,
     l7_protocol: L7Protocol,
     agent_mode: RunningMode,
 ) -> Tagger {
@@ -942,7 +1056,7 @@ fn get_edge_tagger(
         RunningMode::Standalone => (flow.peers[0].nat_real_ip, flow.peers[1].nat_real_ip),
         RunningMode::Managed => {
             let (mut src_ip, mut dst_ip) = (flow.peers[0].nat_real_ip, flow.peers[1].nat_real_ip);
-            if !config.inactive_ip_enabled {
+            if config.inactive_ip_aggregation {
                 if !is_active_host0 {
                     src_ip = unspecified_ip(is_ipv6);
                 }
@@ -955,11 +1069,10 @@ fn get_edge_tagger(
                 // except for otel data
                 // =======================================
                 // 开启存储非活跃IP后，Internet IP也需要存0, otel数据除外
-                if flow.peers[0].l3_epc_id <= 0 && flow.signal_source != SignalSource::OTel {
+                if flow.peers[0].l3_epc_id == EPC_INTERNET
+                    && flow.signal_source != SignalSource::OTel
+                {
                     src_ip = unspecified_ip(is_ipv6);
-                }
-                if flow.peers[1].l3_epc_id <= 0 && flow.signal_source != SignalSource::OTel {
-                    dst_ip = unspecified_ip(is_ipv6);
                 }
             }
 
@@ -984,7 +1097,7 @@ fn get_edge_tagger(
 
     Tagger {
         global_thread_id,
-        vtap_id: config.vtap_id,
+        agent_id: config.agent_id,
         mac: src_mac,
         mac1: dst_mac,
         ip: src_ip,
@@ -998,7 +1111,7 @@ fn get_edge_tagger(
         tap_side: TapSide::from(direction),
         tap_port: flow_key.tap_port,
         tap_type: flow_key.tap_type,
-        server_port: if ignore_server_port(flow, config.inactive_server_port_enabled) {
+        server_port: if ignore_server_port(flow, config.inactive_server_port_aggregation) {
             0
         } else {
             dst_ep.nat_real_port
@@ -1026,6 +1139,8 @@ fn get_edge_tagger(
         otel_instance: flow.otel_instance.clone(),
         endpoint,
         pod_id: flow.pod_id,
+        biz_type,
+        time_span,
         ..Default::default()
     }
 }
@@ -1035,6 +1150,29 @@ fn get_l3_epc_id(l3_epc_id: i32, signal_source: SignalSource) -> i16 {
         0 // OTel data l3_epc_id always not from internet
     } else {
         l3_epc_id as i16
+    }
+}
+
+struct CollectorStats {
+    id: u32,
+    kind: &'static str,
+    layer7: bool,
+}
+
+impl stats::Module for CollectorStats {
+    fn name(&self) -> &'static str {
+        "collector"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![
+            StatsOption::Tag("index", self.id.to_string()),
+            if self.layer7 {
+                StatsOption::Tag("kind", format!("l7_{}", self.kind))
+            } else {
+                StatsOption::Tag("kind", self.kind.to_owned())
+            },
+        ]
     }
 }
 
@@ -1058,29 +1196,33 @@ pub struct Collector {
     context: Context,
 }
 
+fn metric_type_to_tag(
+    metric_type: MetricsType,
+    delay_seconds: u64,
+) -> (&'static str, &'static str, u64) {
+    match metric_type {
+        MetricsType::MINUTE => (
+            "minute",
+            "minute_collector",
+            reset_delay_seconds(delay_seconds),
+        ),
+        _ => ("second", "second_collector", delay_seconds),
+    }
+}
+
 impl Collector {
     pub fn new(
         id: u32,
         receiver: Receiver<Box<FlowMeterWithFlow>>,
         sender: DebugSender<BoxedDocument>,
         metric_type: MetricsType,
-        delay_seconds: u32,
+        delay_seconds: u64,
         stats: &Arc<stats::Collector>,
         config: CollectorAccess,
         ntp_diff: Arc<AtomicI64>,
         agent_mode: RunningMode,
     ) -> Self {
-        let delay_seconds = delay_seconds as u64;
-        let (kind, name) = match metric_type {
-            MetricsType::MINUTE => {
-                if delay_seconds < MINUTE || delay_seconds >= MINUTE * 2 {
-                    panic!("delay_seconds必须在[60, 120)秒内");
-                }
-                ("minute", "minute_collector")
-            }
-            _ => ("second", "second_collector"),
-        };
-
+        let (kind, name, delay_seconds) = metric_type_to_tag(metric_type, delay_seconds);
         let running = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(CollectorCounter {
             running: running.clone(),
@@ -1088,12 +1230,12 @@ impl Collector {
         });
 
         stats.register_countable(
-            "collector",
+            &CollectorStats {
+                id,
+                kind,
+                layer7: false,
+            },
             Countable::Ref(Arc::downgrade(&counter) as Weak<dyn RefCountable>),
-            vec![
-                StatsOption::Tag("kind", kind.to_owned()),
-                StatsOption::Tag("index", id.to_string()),
-            ],
         );
 
         Self {
@@ -1138,13 +1280,24 @@ impl Collector {
                                 let time_in_second = flow.time_in_second.as_secs();
                                 stash.collect_l4(Some(*flow), time_in_second, &config);
                             }
+                            if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
+                                warn!("queue failed to send l4 Document data, because {:?}", e);
+                                stash.closed_docs.clear();
+                            }
                             stash.calc_stash_counters();
                         }
-                        Err(Error::Timeout) => stash.collect_l4(
-                            None,
-                            get_timestamp(stash.context.ntp_diff.load(Ordering::Relaxed)).as_secs(),
-                            &config,
-                        ),
+                        Err(Error::Timeout) => {
+                            stash.collect_l4(
+                                None,
+                                get_timestamp(stash.context.ntp_diff.load(Ordering::Relaxed))
+                                    .as_secs(),
+                                &config,
+                            );
+                            if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
+                                warn!("queue failed to send l4 Document data, because {:?}", e);
+                                stash.closed_docs.clear();
+                            }
+                        }
                         Err(Error::Terminated(..)) => break,
                         Err(Error::BatchTooLarge(_)) => unreachable!(),
                     }
@@ -1195,23 +1348,13 @@ impl L7Collector {
         l7_receiver: Receiver<Box<AppMeterWithFlow>>,
         sender: DebugSender<BoxedDocument>,
         metric_type: MetricsType,
-        delay_seconds: u32,
+        delay_seconds: u64,
         stats: &Arc<stats::Collector>,
         config: CollectorAccess,
         ntp_diff: Arc<AtomicI64>,
         agent_mode: RunningMode,
     ) -> Self {
-        let delay_seconds = delay_seconds as u64;
-        let (kind, name) = match metric_type {
-            MetricsType::MINUTE => {
-                if delay_seconds < MINUTE || delay_seconds >= MINUTE * 2 {
-                    panic!("delay_seconds必须在[60, 120)秒内");
-                }
-                ("minute", "minute_collector")
-            }
-            _ => ("second", "second_collector"),
-        };
-
+        let (kind, name, delay_seconds) = metric_type_to_tag(metric_type, delay_seconds);
         let running = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(CollectorCounter {
             running: running.clone(),
@@ -1219,12 +1362,12 @@ impl L7Collector {
         });
 
         stats.register_countable(
-            "collector",
+            &CollectorStats {
+                id,
+                kind,
+                layer7: true,
+            },
             Countable::Ref(Arc::downgrade(&counter) as Weak<dyn RefCountable>),
-            vec![
-                StatsOption::Tag("kind", "l7_".to_owned() + &kind.to_owned()),
-                StatsOption::Tag("index", id.to_string()),
-            ],
         );
 
         Self {
@@ -1269,13 +1412,24 @@ impl L7Collector {
                                 let ts = meter.time_in_second.as_secs();
                                 stash.collect_l7(Some(*meter), ts, &config);
                             }
+                            if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
+                                warn!("queue failed to send l7 Document data, because {:?}", e);
+                                stash.closed_docs.clear();
+                            }
                             stash.calc_stash_counters();
                         }
-                        Err(Error::Timeout) => stash.collect_l7(
-                            None,
-                            get_timestamp(stash.context.ntp_diff.load(Ordering::Relaxed)).as_secs(),
-                            &config,
-                        ),
+                        Err(Error::Timeout) => {
+                            stash.collect_l7(
+                                None,
+                                get_timestamp(stash.context.ntp_diff.load(Ordering::Relaxed))
+                                    .as_secs(),
+                                &config,
+                            );
+                            if let Err(e) = stash.sender.send_all(&mut stash.closed_docs) {
+                                warn!("queue failed to send l7 Document data, because {:?}", e);
+                                stash.closed_docs.clear();
+                            }
+                        }
                         Err(Error::Terminated(..)) => break,
                         Err(Error::BatchTooLarge(_)) => unreachable!(),
                     }
@@ -1324,7 +1478,7 @@ mod tests {
 
     use std::collections::HashSet;
 
-    use crate::common::enums::TapType;
+    use crate::common::enums::CaptureNetworkType;
 
     use super::*;
 
@@ -1363,7 +1517,7 @@ mod tests {
         tagger.l3_epc_id = (tagger.l3_epc_id as u16 ^ 0x8000) as i16;
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
-        tagger.tap_type = TapType::Idc(255);
+        tagger.tap_type = CaptureNetworkType::Idc(255);
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
         tagger.direction = Direction::ServerToClient;
@@ -1402,7 +1556,7 @@ mod tests {
         tagger.l3_epc_id1 = (tagger.l3_epc_id as u16 ^ 0x8000) as i16;
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
-        tagger.tap_type = TapType::Idc(200);
+        tagger.tap_type = CaptureNetworkType::Idc(200);
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
         tagger.direction = Direction::ClientToServer;
@@ -1412,12 +1566,11 @@ mod tests {
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
 
-        tagger.code = Code::ACL_GID | Code::TAG_TYPE | Code::TAG_VALUE | Code::VTAP_ID;
-        tagger.tag_type = TagType::TunnelIpId;
-        tagger.tag_value = 0xffff;
+        tagger.code = Code::ACL_GID | Code::TUNNEL_IP_ID | Code::VTAP_ID;
+        tagger.server_port = 0xffff;
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
-        tagger.tag_value = 0x7fff;
+        tagger.server_port = 0x7fff;
         let key = StashKey::new(&tagger, Ipv4Addr::UNSPECIFIED.into(), None, 0);
         assert_eq!(map.insert(key), true);
     }

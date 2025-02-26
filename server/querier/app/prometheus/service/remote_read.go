@@ -19,9 +19,9 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,62 +37,75 @@ import (
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse"
 )
 
+// prometheusReader's lifecycle is belong to each query through api
 type prometheusReader struct {
 	slimit                  int
+	orgID                   string
+	extraFilters            string
+	blockTeamID             []string
 	interceptPrometheusExpr func(func(e *parser.AggregateExpr) error) error
-	getExternalTagFromCache func(string) string
-	addExternalTagToCache   func(string, string)
+	getExternalTagFromCache func(string, string) string
+	addExternalTagToCache   func(string, string, string)
 }
 
 func (p *prometheusReader) promReaderExecute(ctx context.Context, req *prompb.ReadRequest, debug bool) (resp *prompb.ReadResponse, querierSql, sql string, duration float64, err error) {
 	// promrequest trans to sql
-	// pp.Println(req)
-	var metricName string
+	if req == nil || len(req.Queries) == 0 {
+		return nil, "", "", 0, errors.New("len(req.Queries) == 0, this feature is not yet implemented! ")
+	}
+	start, end := cache.GetPromRequestQueryTime(req.Queries[0])
+	metricName := cache.GetMetricFromLabelMatcher(&req.Queries[0].Matchers)
+	cacheOrgFilterKey := fmt.Sprintf("%s-%s", p.orgID, strings.Join(p.blockTeamID, "-"))
+
 	var response *prompb.ReadResponse
-	// var queryResult, result *common.Result
+	// clear cache if data not found
+	defer func(r *prompb.ReadRequest) {
+		// when error occurs, means query not finished yet, remove the first query placeholder
+		// if error is nil, means query finished, don't clean key
+		if err != nil || response == nil {
+			cache.PromReadResponseCache().Remove(r, cacheOrgFilterKey, p.extraFilters)
+		}
+	}(req)
+
 	// should get cache result immediately
-	item, hit, metricName, storage_query_start, storage_query_end := cache.PromReadResponseCache().Get(req)
-	if item != nil && len(item.Results) > 0 {
-		response = item
-	}
+	// for DeepFlow Native metrics, don't use cache
+	cacheAvailable := config.Cfg.Prometheus.Cache.RemoteReadCache && !strings.Contains(metricName, "__")
+	if cacheAvailable {
+		var hit cache.CacheHit
+		var cacheItem *cache.CacheItem
+		cacheItem, hit, start, end = cache.PromReadResponseCache().Get(req.Queries[0], start, end, cacheOrgFilterKey, p.extraFilters)
+		if cacheItem != nil {
+			response = cacheItem.Data()
+		}
 
-	if config.Cfg.Prometheus.Cache.RemoteReadCache && hit == cache.CacheKeyFoundNil {
-		cacheLoadingFinished := &sync.WaitGroup{}
-		cacheLoadingFinished.Add(1)
+		if hit == cache.CacheKeyFoundNil && cacheItem != nil {
+			// found item, but is loading by other request
+			loadCompleted := cacheItem.GetLoadCompleteSignal()
 
-		go func() {
-			waitCtx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
-			for {
-				select {
-				case <-waitCtx.Done():
-					cancelFunc()
-					cacheLoadingFinished.Done()
-					return
-				default:
-					if item, hit, metricName, storage_query_start, storage_query_end = cache.PromReadResponseCache().Get(req); item != nil && len(item.Results) > 0 {
-						response = item
-						cacheLoadingFinished.Done()
-						cancelFunc()
-						return
-					}
-					time.Sleep(10 * time.Millisecond)
+			select {
+			case <-time.After(time.Duration(config.Cfg.Prometheus.Cache.CacheFirstTimeout) * time.Second):
+				log.Infof("req [%s:%d-%d] wait 10 seconds to get cache result", metricName, start, end)
+				return response, "", "", 0, errors.New("query timeout, retry to get response! ")
+			case <-loadCompleted:
+				cacheItem, hit, start, end = cache.PromReadResponseCache().Get(req.Queries[0], start, end, cacheOrgFilterKey, p.extraFilters)
+				if cacheItem != nil {
+					response = cacheItem.Data()
 				}
+				log.Debugf("req [%s:%d-%d] get cached result", metricName, start, end)
 			}
-		}()
+		}
 
-		cacheLoadingFinished.Wait()
-	}
-
-	if hit == cache.CacheHitFull {
-		return response, "", "", 0, nil
+		if hit == cache.CacheHitFull {
+			return response, "", "", 0, nil
+		}
 	}
 
 	// CacheKeyNotFound & CacheHitPart, do query
 	var result *common.Result
 	var db, datasource string
 	var debugInfo map[string]interface{}
-	log.Debugf("metric: [%s] data query range: [%d-%d]", metricName, storage_query_start, storage_query_end)
-	ctx, querierSql, db, datasource, metricName, err = p.promReaderTransToSQL(ctx, req, storage_query_start, storage_query_end, debug)
+	log.Debugf("metric: [%s] data query range: [%d-%d]", metricName, start, end)
+	ctx, querierSql, db, datasource, metricName, err = p.promReaderTransToSQL(ctx, req, start, end, debug)
 	// fmt.Println(sql, db)
 	if err != nil {
 		return nil, "", "", 0, err
@@ -107,21 +120,21 @@ func (p *prometheusReader) promReaderExecute(ctx context.Context, req *prompb.Re
 		ctx = context.WithValue(ctx, "remote_read", true)
 	}
 	// if `api` pass `debug` or config debug, get debug info from querier
-	debugQuerier := debug || config.Cfg.Prometheus.RequestQueryWithDebug
 	args := common.QuerierParams{
 		DB:         db,
 		Sql:        querierSql,
 		DataSource: datasource,
-		Debug:      strconv.FormatBool(debugQuerier),
+		Debug:      strconv.FormatBool(debug),
 		QueryUUID:  query_uuid.String(),
 		Context:    ctx,
+		ORGID:      p.orgID,
 	}
 	// get parentSpan for inject others attribute below
 	parentSpan := trace.SpanFromContext(ctx)
 
 	// start span trace query time of any query uuid
 	var span trace.Span
-	if config.Cfg.Prometheus.RequestQueryWithDebug {
+	if debug {
 		tr := otel.GetTracerProvider().Tracer("querier/prometheus/clickhouseQuery")
 		ctx, span = tr.Start(ctx, "PromReaderExecute",
 			trace.WithSpanKind(trace.SpanKindClient),
@@ -138,12 +151,10 @@ func (p *prometheusReader) promReaderExecute(ctx context.Context, req *prompb.Re
 		return nil, "", "", 0, err
 	}
 
-	if debugQuerier {
+	if debug {
 		duration = extractQueryTimeFromQueryResponse(debugInfo)
 		sql = extractQuerySQLFromQueryResponse(debugInfo)
-	}
 
-	if config.Cfg.Prometheus.RequestQueryWithDebug {
 		// inject query_time for current span
 		span.SetAttributes(attribute.Float64("query_time", duration))
 
@@ -166,17 +177,13 @@ func (p *prometheusReader) promReaderExecute(ctx context.Context, req *prompb.Re
 		}
 	}
 
-	if req == nil || len(req.Queries) == 0 {
-		return nil, "", "", 0, errors.New("len(req.Queries) == 0, this feature is not yet implemented! ")
-	}
-
 	api_query_start, api_query_end := cache.GetPromRequestQueryTime(req.Queries[0])
 	// response trans to prom resp
 	resp, err = p.respTransToProm(ctx, metricName, api_query_start, api_query_end, result)
 
-	if config.Cfg.Prometheus.Cache.RemoteReadCache {
+	if cacheAvailable {
 		// merge result into cache
-		response = cache.PromReadResponseCache().AddOrMerge(req, resp)
+		response = cache.PromReadResponseCache().AddOrMerge(req, resp, cacheOrgFilterKey, p.extraFilters)
 	} else {
 		// not using cache, query result would be real result
 		response = resp
@@ -207,7 +214,7 @@ func extractQuerySQLFromQueryResponse(debug map[string]interface{}) string {
 	return ""
 }
 
-func queryDataExecute(ctx context.Context, querierSql string, db string, ds string, debug bool) (*common.Result, string, float64, error) {
+func queryDataExecute(ctx context.Context, querierSql string, db string, ds string, orgID string, debug bool) (*common.Result, string, float64, error) {
 	var sql string
 	var duration float64
 	query_uuid := uuid.New()
@@ -218,6 +225,7 @@ func queryDataExecute(ctx context.Context, querierSql string, db string, ds stri
 		Debug:      strconv.FormatBool(debug),
 		QueryUUID:  query_uuid.String(),
 		Context:    ctx,
+		ORGID:      orgID,
 	}
 	// trace clickhouse query
 	var span trace.Span
@@ -233,11 +241,7 @@ func queryDataExecute(ctx context.Context, querierSql string, db string, ds stri
 	ckEngine := &clickhouse.CHEngine{DB: args.DB, DataSource: args.DataSource}
 	ckEngine.Init()
 	result, debugInfo, err := ckEngine.ExecuteQuery(&args)
-	if err != nil {
-		log.Errorf("ExecuteQuery failed, debug info = %v, err info = %v", debug, err)
-		return nil, "", 0, err
-	}
-	if debug {
+	if debug && debugInfo != nil {
 		duration = extractQueryTimeFromQueryResponse(debugInfo)
 		sql = extractQuerySQLFromQueryResponse(debugInfo)
 
@@ -245,5 +249,10 @@ func queryDataExecute(ctx context.Context, querierSql string, db string, ds stri
 		span.SetAttributes(attribute.String("querier_sql", querierSql))
 		span.SetAttributes(attribute.String("sql", sql))
 	}
+	if err != nil {
+		log.Errorf("ExecuteQuery failed, debug info = %v, err info = %v", debug, err)
+		return nil, sql, duration, err
+	}
+
 	return result, sql, duration, err
 }

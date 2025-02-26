@@ -19,19 +19,19 @@ package tencent
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getNetworks(region tencentRegion) ([]model.Network, []model.Subnet, []model.VInterface, error) {
-	log.Debug("get networks starting")
+func (t *Tencent) getNetworks(region string) ([]model.Network, []model.Subnet, []model.VInterface, error) {
+	log.Debug("get networks starting", logger.NewORGPrefix(t.orgID))
 	var networks []model.Network
 	var subnets []model.Subnet
 	var netVinterfaces []model.VInterface
 
 	attrs := []string{"SubnetId", "SubnetName", "VpcId", "CidrBlock"}
-	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeSubnets", region.name, "SubnetSet", true, map[string]interface{}{})
+	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeSubnets", region, "SubnetSet", true, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("network request tencent api error: (%s)", err.Error())
+		log.Errorf("network request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.Network{}, []model.Subnet{}, []model.VInterface{}, err
 	}
 	for _, nData := range resp {
@@ -41,9 +41,9 @@ func (t *Tencent) getNetworks(region tencentRegion) ([]model.Network, []model.Su
 		vpcID := nData.Get("VpcId").MustString()
 		subnetID := nData.Get("SubnetId").MustString()
 		azID := nData.Get("Zone").MustString()
-		networkLcuuid := common.GetUUID(subnetID, uuid.Nil)
-		vpcLcuuid := common.GetUUID(vpcID, uuid.Nil)
-		azLcuuid := common.GetUUID(t.uuidGenerate+"_"+azID, uuid.Nil)
+		networkLcuuid := common.GetUUIDByOrgID(t.orgID, subnetID)
+		vpcLcuuid := common.GetUUIDByOrgID(t.orgID, vpcID)
+		azLcuuid := common.GetUUIDByOrgID(t.orgID, t.uuidGenerate+"_"+azID)
 		networkName := nData.Get("SubnetName").MustString()
 		networks = append(networks, model.Network{
 			Lcuuid:         networkLcuuid,
@@ -54,14 +54,14 @@ func (t *Tencent) getNetworks(region tencentRegion) ([]model.Network, []model.Su
 			External:       false,
 			NetType:        common.NETWORK_TYPE_LAN,
 			AZLcuuid:       azLcuuid,
-			RegionLcuuid:   t.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid:   t.regionLcuuid,
 		})
 		t.azLcuuidMap[azLcuuid] = 0
 
 		cidr4 := nData.Get("CidrBlock").MustString()
 		cidr6 := nData.Get("Ipv6CidrBlock").MustString()
 		subnets = append(subnets, model.Subnet{
-			Lcuuid:        common.GetUUID(networkLcuuid, uuid.Nil),
+			Lcuuid:        common.GetUUIDByOrgID(t.orgID, networkLcuuid),
 			Name:          networkName,
 			CIDR:          cidr4 + cidr6,
 			NetworkLcuuid: networkLcuuid,
@@ -71,17 +71,17 @@ func (t *Tencent) getNetworks(region tencentRegion) ([]model.Network, []model.Su
 		routeTableID := nData.Get("RouteTableId").MustString()
 		if routeTableID != "" {
 			netVinterfaces = append(netVinterfaces, model.VInterface{
-				Lcuuid:        common.GetUUID(subnetID+routeTableID, uuid.Nil),
+				Lcuuid:        common.GetUUIDByOrgID(t.orgID, subnetID+routeTableID),
 				Type:          common.VIF_TYPE_LAN,
 				Mac:           common.VIF_DEFAULT_MAC,
-				DeviceLcuuid:  common.GetUUID(routeTableID, uuid.Nil),
+				DeviceLcuuid:  common.GetUUIDByOrgID(t.orgID, routeTableID),
 				DeviceType:    common.VIF_DEVICE_TYPE_VROUTER,
 				NetworkLcuuid: networkLcuuid,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  t.getRegionLcuuid(region.lcuuid),
+				RegionLcuuid:  t.regionLcuuid,
 			})
 		}
 	}
-	log.Debug("get networks complete")
+	log.Debug("get networks complete", logger.NewORGPrefix(t.orgID))
 	return networks, subnets, netVinterfaces, nil
 }

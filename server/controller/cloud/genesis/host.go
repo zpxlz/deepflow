@@ -21,12 +21,11 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getHosts() ([]model.Host, error) {
-	log.Debug("get hosts starting")
+	log.Debug("get hosts starting", logger.NewORGPrefix(g.orgID))
 	hosts := []model.Host{}
 	hostsData := g.genesisData.Hosts
 
@@ -34,7 +33,7 @@ func (g *Genesis) getHosts() ([]model.Host, error) {
 
 	for _, h := range hostsData {
 		host := model.Host{
-			Lcuuid:       common.GetUUID(h.IP, uuid.Nil),
+			Lcuuid:       common.GetUUIDByOrgID(g.orgID, h.IP),
 			IP:           h.IP,
 			Name:         h.Hostname,
 			HType:        common.HOST_HTYPE_KVM,
@@ -42,10 +41,10 @@ func (g *Genesis) getHosts() ([]model.Host, error) {
 			MemTotal:     common.HOST_MEMORY_MB,
 			Type:         common.HOST_TYPE_VM,
 			AZLcuuid:     g.azLcuuid,
-			RegionLcuuid: g.regionUuid,
+			RegionLcuuid: g.regionLcuuid,
 		}
 		hosts = append(hosts, host)
 	}
-	log.Debug("get hosts complete")
+	log.Debug("get hosts complete", logger.NewORGPrefix(g.orgID))
 	return hosts, nil
 }

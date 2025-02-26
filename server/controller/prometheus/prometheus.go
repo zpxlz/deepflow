@@ -29,19 +29,17 @@ var (
 )
 
 type PrometheusManager struct {
-	Encoder               *encoder.Encoder
-	SynchronizerCache     *cache.Cache
-	APPLabelLayoutUpdater *APPLabelLayoutUpdater
-	Clear                 *Cleaner
+	Encoders           *encoder.ORGEncoders
+	SynchronizerCaches *cache.ORGCaches
+	Clear              *Cleaner
 }
 
 func GetSingleton() *PrometheusManager {
 	prometheusManagerOnce.Do(func() {
 		prometheusManager = &PrometheusManager{
-			Encoder:               encoder.GetSingleton(),
-			SynchronizerCache:     cache.GetSingleton(),
-			APPLabelLayoutUpdater: GetAPPLabelLayoutUpdater(),
-			Clear:                 GetCleaner(),
+			Encoders:           encoder.GetORGEncoders(),
+			SynchronizerCaches: cache.GetORGCaches(),
+			Clear:              GetCleaner(),
 		}
 	})
 	return prometheusManager

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,11 +35,17 @@ import (
 	_ "github.com/vishvananda/netlink"
 )
 
+const (
+	HEADER_KEY_X_ORG_ID = "X-Org-Id"
+	DEFAULT_ORG_ID      = 1
+)
+
 // Filter query string parameters
 type Filter map[string]interface{}
 
 type HTTPConf struct {
 	Timeout time.Duration
+	ORGID   int
 }
 
 type HTTPOption func(*HTTPConf)
@@ -46,6 +53,12 @@ type HTTPOption func(*HTTPConf)
 func WithTimeout(t time.Duration) HTTPOption {
 	return func(h *HTTPConf) {
 		h.Timeout = t
+	}
+}
+
+func WithORGID(orgID int) HTTPOption {
+	return func(h *HTTPConf) {
+		h.ORGID = orgID
 	}
 }
 
@@ -72,6 +85,9 @@ func CURLPerform(method string, url string, body map[string]interface{}, strBody
 
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ORGID != 0 {
+		req.Header.Set(HEADER_KEY_X_ORG_ID, strconv.Itoa(cfg.ORGID))
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json, text/plain")
@@ -122,6 +138,9 @@ func CURLPostFormData(url, contentType string, body *bytes.Buffer, opts ...HTTPO
 	if err != nil {
 		return nil, err
 	}
+	if cfg.ORGID != 0 {
+		req.Header.Set(HEADER_KEY_X_ORG_ID, strconv.Itoa(cfg.ORGID))
+	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json, text/plain")
 	req.Header.Set("X-User-Id", "1")
@@ -147,6 +166,9 @@ func CURLResponseRawJson(method string, url string, opts ...HTTPOption) (*simple
 
 	if err != nil {
 		return errResponse, err
+	}
+	if cfg.ORGID != 0 {
+		req.Header.Set(HEADER_KEY_X_ORG_ID, strconv.Itoa(cfg.ORGID))
 	}
 	req.Header.Set("Accept", "application/json, text/plain")
 	req.Header.Set("X-User-Id", "1")
@@ -194,6 +216,11 @@ func GetServerInfo(cmd *cobra.Command) *Server {
 func GetTimeout(cmd *cobra.Command) time.Duration {
 	t, _ := cmd.Flags().GetDuration("timeout")
 	return t
+}
+
+func GetORGID(cmd *cobra.Command) int {
+	orgID, _ := cmd.Flags().GetUint32("org-id")
+	return int(orgID)
 }
 
 func PrettyPrint(data interface{}) {

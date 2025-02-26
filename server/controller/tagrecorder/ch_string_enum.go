@@ -17,64 +17,64 @@
 package tagrecorder
 
 import (
-	"strings"
-
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/querier/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/tag"
 )
 
 type ChStringEnum struct {
-	UpdaterBase[mysql.ChStringEnum, StringEnumTagKey]
+	UpdaterComponent[metadbmodel.ChStringEnum, StringEnumTagKey]
 }
 
 func NewChStringEnum() *ChStringEnum {
 	updater := &ChStringEnum{
-		UpdaterBase[mysql.ChStringEnum, StringEnumTagKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_STRING_ENUM,
-		},
+		newUpdaterComponent[metadbmodel.ChStringEnum, StringEnumTagKey](
+			RESOURCE_TYPE_CH_STRING_ENUM,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (e *ChStringEnum) generateNewData() (map[StringEnumTagKey]mysql.ChStringEnum, bool) {
+func (e *ChStringEnum) generateNewData(dbClient *metadb.DB) (map[StringEnumTagKey]metadbmodel.ChStringEnum, bool) {
 	sql := "show tag all_string_enum values from tagrecorder"
 	db := "tagrecorder"
 	table := "tagrecorder"
-	keyToItem := make(map[StringEnumTagKey]mysql.ChStringEnum)
+	keyToItem := make(map[StringEnumTagKey]metadbmodel.ChStringEnum)
 	respMap, err := tag.GetEnumTagValues(db, table, sql)
 	if err != nil {
-		log.Errorf("read failed: %v", err)
+		log.Errorf("read failed: %v", err, dbClient.LogPrefixORGID)
 	}
 
 	for name, tagValues := range respMap {
-		tagName := strings.TrimSuffix(name, "."+config.Cfg.Language)
 		for _, valueAndName := range tagValues {
 			tagValue := valueAndName.([]interface{})[0]
-			tagDisplayName := valueAndName.([]interface{})[1]
-			tagDescription := valueAndName.([]interface{})[2]
+			tagDisplayNameZH := valueAndName.([]interface{})[1]
+			tagDisplayNameEN := valueAndName.([]interface{})[2]
+			tagDescriptionZH := valueAndName.([]interface{})[3]
+			tagDescriptionEN := valueAndName.([]interface{})[4]
 			key := StringEnumTagKey{
-				TagName:  tagName,
+				TagName:  name,
 				TagValue: tagValue.(string),
 			}
-			keyToItem[key] = mysql.ChStringEnum{
-				TagName:     tagName,
-				Value:       tagValue.(string),
-				Name:        tagDisplayName.(string),
-				Description: tagDescription.(string),
+			keyToItem[key] = metadbmodel.ChStringEnum{
+				TagName:       name,
+				Value:         tagValue.(string),
+				NameZH:        tagDisplayNameZH.(string),
+				NameEN:        tagDisplayNameEN.(string),
+				DescriptionZH: tagDescriptionZH.(string),
+				DescriptionEN: tagDescriptionEN.(string),
 			}
 		}
 	}
-
 	return keyToItem, true
 }
 
-func (e *ChStringEnum) generateKey(dbItem mysql.ChStringEnum) StringEnumTagKey {
+func (e *ChStringEnum) generateKey(dbItem metadbmodel.ChStringEnum) StringEnumTagKey {
 	return StringEnumTagKey{TagName: dbItem.TagName, TagValue: dbItem.Value}
 }
 
-func (e *ChStringEnum) generateUpdateInfo(oldItem, newItem mysql.ChStringEnum) (map[string]interface{}, bool) {
+func (e *ChStringEnum) generateUpdateInfo(oldItem, newItem metadbmodel.ChStringEnum) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.TagName != newItem.TagName {
 		updateInfo["tag_name"] = newItem.TagName
@@ -82,11 +82,17 @@ func (e *ChStringEnum) generateUpdateInfo(oldItem, newItem mysql.ChStringEnum) (
 	if oldItem.Value != newItem.Value {
 		updateInfo["value"] = newItem.Value
 	}
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+	if oldItem.NameZH != newItem.NameZH {
+		updateInfo["name_zh"] = newItem.NameZH
 	}
-	if oldItem.Description != newItem.Description {
-		updateInfo["description"] = newItem.Description
+	if oldItem.NameEN != newItem.NameEN {
+		updateInfo["name_en"] = newItem.NameEN
+	}
+	if oldItem.DescriptionZH != newItem.DescriptionZH {
+		updateInfo["description_zh"] = newItem.DescriptionZH
+	}
+	if oldItem.DescriptionEN != newItem.DescriptionEN {
+		updateInfo["description_en"] = newItem.DescriptionEN
 	}
 	if len(updateInfo) > 0 {
 		return updateInfo, true

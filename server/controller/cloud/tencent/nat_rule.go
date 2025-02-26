@@ -22,15 +22,15 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getNatRules(region tencentRegion) ([]model.NATRule, error) {
-	log.Debug("get nat rules starting")
+func (t *Tencent) getNatRules(region string) ([]model.NATRule, error) {
+	log.Debug("get nat rules starting", logger.NewORGPrefix(t.orgID))
 	var natRules []model.NATRule
 
 	if len(t.natIDs) == 0 {
-		log.Debug("not found nat gateway ids")
+		log.Debug("not found nat gateway ids", logger.NewORGPrefix(t.orgID))
 		return []model.NATRule{}, nil
 	}
 
@@ -40,9 +40,9 @@ func (t *Tencent) getNatRules(region tencentRegion) ([]model.NATRule, error) {
 		"NatGatewayIds": t.natIDs,
 	}
 
-	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeNatGatewayDestinationIpPortTranslationNatRules", region.name, "NatGatewayDestinationIpPortTranslationNatRuleSet", true, params)
+	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeNatGatewayDestinationIpPortTranslationNatRules", region, "NatGatewayDestinationIpPortTranslationNatRuleSet", true, params)
 	if err != nil {
-		log.Errorf("nat rule request tencent api error: (%s)", err.Error())
+		log.Errorf("nat rule request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.NATRule{}, err
 	}
 	for _, nData := range resp {
@@ -57,8 +57,8 @@ func (t *Tencent) getNatRules(region tencentRegion) ([]model.NATRule, error) {
 		privatePort := nData.Get("PrivatePort").MustInt()
 		key := publicIP + natID + strconv.Itoa(publicPort) + ipProtocol + privateIP + strconv.Itoa(privatePort)
 		natRules = append(natRules, model.NATRule{
-			Lcuuid:           common.GetUUID(key, uuid.Nil),
-			NATGatewayLcuuid: common.GetUUID(natID, uuid.Nil),
+			Lcuuid:           common.GetUUIDByOrgID(t.orgID, key),
+			NATGatewayLcuuid: common.GetUUIDByOrgID(t.orgID, natID),
 			Type:             "DNAT",
 			Protocol:         strings.ToUpper(ipProtocol),
 			FloatingIP:       publicIP,
@@ -67,6 +67,6 @@ func (t *Tencent) getNatRules(region tencentRegion) ([]model.NATRule, error) {
 			FixedIPPort:      privatePort,
 		})
 	}
-	log.Debug("get nat rules complete")
+	log.Debug("get nat rules complete", logger.NewORGPrefix(t.orgID))
 	return natRules, nil
 }

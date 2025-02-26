@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodIngressRule struct {
-	UpdaterBase[cloudmodel.PodIngressRule, mysql.PodIngressRule, *diffbase.PodIngressRule]
+	UpdaterBase[
+		cloudmodel.PodIngressRule,
+		*diffbase.PodIngressRule,
+		*metadbmodel.PodIngressRule,
+		metadbmodel.PodIngressRule,
+		*message.PodIngressRuleAdd,
+		message.PodIngressRuleAdd,
+		*message.PodIngressRuleUpdate,
+		message.PodIngressRuleUpdate,
+		*message.PodIngressRuleFieldsUpdate,
+		message.PodIngressRuleFieldsUpdate,
+		*message.PodIngressRuleDelete,
+		message.PodIngressRuleDelete]
 }
 
 func NewPodIngressRule(wholeCache *cache.Cache, cloudData []cloudmodel.PodIngressRule) *PodIngressRule {
 	updater := &PodIngressRule{
-		UpdaterBase[cloudmodel.PodIngressRule, mysql.PodIngressRule, *diffbase.PodIngressRule]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPodIngressRule(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PodIngressRules,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodIngressRule,
+			*diffbase.PodIngressRule,
+			*metadbmodel.PodIngressRule,
+			metadbmodel.PodIngressRule,
+			*message.PodIngressRuleAdd,
+			message.PodIngressRuleAdd,
+			*message.PodIngressRuleUpdate,
+			message.PodIngressRuleUpdate,
+			*message.PodIngressRuleFieldsUpdate,
+			message.PodIngressRuleFieldsUpdate,
+			*message.PodIngressRuleDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN,
+			wholeCache,
+			db.NewPodIngressRule().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PodIngressRules,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,28 +73,29 @@ func (r *PodIngressRule) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodIngress
 	return
 }
 
-func (r *PodIngressRule) generateDBItemToAdd(cloudItem *cloudmodel.PodIngressRule) (*mysql.PodIngressRule, bool) {
+func (r *PodIngressRule) generateDBItemToAdd(cloudItem *cloudmodel.PodIngressRule) (*metadbmodel.PodIngressRule, bool) {
 	podIngressID, exists := r.cache.ToolDataSet.GetPodIngressIDByLcuuid(cloudItem.PodIngressLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, cloudItem.PodIngressLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN, cloudItem.Lcuuid,
-		))
+		), r.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.PodIngressRule{
+	dbItem := &metadbmodel.PodIngressRule{
 		Name:         cloudItem.Name,
 		Protocol:     cloudItem.Protocol,
 		Host:         cloudItem.Host,
 		PodIngressID: podIngressID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
+		Domain:       r.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
 // 保留接口
-func (r *PodIngressRule) generateUpdateInfo(diffBase *diffbase.PodIngressRule, cloudItem *cloudmodel.PodIngressRule) (map[string]interface{}, bool) {
-	return nil, false
+func (r *PodIngressRule) generateUpdateInfo(diffBase *diffbase.PodIngressRule, cloudItem *cloudmodel.PodIngressRule) (*message.PodIngressRuleFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

@@ -24,11 +24,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.RoutingTable, error) {
-	log.Debug("get routers and tables starting")
+func (a *Aws) getRouterAndTables(client *ec2.Client) ([]model.VRouter, []model.RoutingTable, error) {
+	log.Debug("get routers and tables starting", logger.NewORGPrefix(a.orgID))
 	a.vpcOrSubnetToRouter = map[string]string{}
 	var routers []model.VRouter
 	var routerTables []model.RoutingTable
@@ -52,9 +52,9 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 		} else {
 			input = &ec2.DescribeRouteTablesInput{MaxResults: &maxResults, NextToken: &nextToken}
 		}
-		result, err := a.ec2Client.DescribeRouteTables(context.TODO(), input)
+		result, err := client.DescribeRouteTables(context.TODO(), input)
 		if err != nil {
-			log.Errorf("routetable request aws api error: (%s)", err.Error())
+			log.Errorf("routetable request aws api error: (%s)", err.Error(), logger.NewORGPrefix(a.orgID))
 			return []model.VRouter{}, []model.RoutingTable{}, err
 		}
 		retRouteTables = append(retRouteTables, result.RouteTables...)
@@ -66,7 +66,7 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 
 	for _, rData := range retRouteTables {
 		routeTableID := a.getStringPointerValue(rData.RouteTableId)
-		routeTableLcuuid := common.GetUUID(routeTableID, uuid.Nil)
+		routeTableLcuuid := common.GetUUIDByOrgID(a.orgID, routeTableID)
 		routeTableName := a.getResultTagName(rData.Tags)
 		if routeTableName == "" {
 			routeTableName = routeTableID
@@ -82,8 +82,8 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 		routers = append(routers, model.VRouter{
 			Lcuuid:       routeTableLcuuid,
 			Name:         routeTableName,
-			VPCLcuuid:    common.GetUUID(vpcID, uuid.Nil),
-			RegionLcuuid: a.getRegionLcuuid(region.lcuuid),
+			VPCLcuuid:    common.GetUUIDByOrgID(a.orgID, vpcID),
+			RegionLcuuid: a.regionLcuuid,
 		})
 
 		for _, route := range rData.Routes {
@@ -103,7 +103,7 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 			case route.InstanceId != nil:
 				gatewayID = *route.InstanceId
 			default:
-				log.Infof("routetable rule (%s) gateway id not found", route)
+				log.Infof("routetable rule (%s) gateway id not found", route, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 			prefix := gatewayID[:strings.Index(gatewayID, "-")+1]
@@ -115,7 +115,7 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 			}
 			destination := a.getStringPointerValue(route.DestinationCidrBlock) + a.getStringPointerValue(route.DestinationIpv6CidrBlock)
 			routerTables = append(routerTables, model.RoutingTable{
-				Lcuuid:        common.GetUUID(routeTableLcuuid+destination+gatewayID, uuid.Nil),
+				Lcuuid:        common.GetUUIDByOrgID(a.orgID, routeTableLcuuid+destination+gatewayID),
 				VRouterLcuuid: routeTableLcuuid,
 				Destination:   destination,
 				Nexthop:       gatewayID,
@@ -123,6 +123,6 @@ func (a *Aws) getRouterAndTables(region awsRegion) ([]model.VRouter, []model.Rou
 			})
 		}
 	}
-	log.Debug("get routers and tables complete")
+	log.Debug("get routers and tables complete", logger.NewORGPrefix(a.orgID))
 	return routers, routerTables, nil
 }

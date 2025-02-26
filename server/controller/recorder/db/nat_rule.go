@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type NATRule struct {
-	OperatorBase[mysql.NATRule]
+	OperatorBase[*metadbmodel.NATRule, metadbmodel.NATRule]
 }
 
 func NewNATRule() *NATRule {
 	return &NATRule{
-		OperatorBase[mysql.NATRule]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.NATRule](
+			ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN,
+			false,
+			false,
+		),
 	}
 }

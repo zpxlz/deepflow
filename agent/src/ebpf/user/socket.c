@@ -21,26 +21,41 @@
 #include <sys/prctl.h>
 #include <arpa/inet.h>
 #include <bcc/perf_reader.h>
+#include <linux/version.h>
 #include "clib.h"
 #include "symbol.h"
+#include "proc.h"
 #include "tracer.h"
 #include "probe.h"
 #include "table.h"
-#include "common.h"
+#include "utils.h"
 #include "socket.h"
 #include "log.h"
 #include "go_tracer.h"
 #include "ssl_tracer.h"
+#include "unwind_tracer.h"
 #include "load.h"
-#include "btf_vmlinux.h"
+#include "btf_core.h"
 #include "config.h"
+#include "perf_reader.h"
+#include "extended/extended.h"
 
 #include "socket_trace_bpf_common.c"
+#include "socket_trace_bpf_3_10_0.c"
 #include "socket_trace_bpf_5_2_plus.c"
 #include "socket_trace_bpf_kylin.c"
+#include "socket_trace_bpf_kfunc.c"
+#include "socket_trace_bpf_rt.c"
 
+static enum linux_kernel_type g_k_type;
 static struct list_head events_list;	// Use for extra register events
 static pthread_t proc_events_pthread;	// Process exec/exit thread
+/*
+ * Control whether to disable the tracing feature.
+ * 'true' disables the tracing feature, and 'false' enables it.
+ * The default is 'false'.
+ */
+static bool g_disable_syscall_tracing;
 
 /*
  * tracer_hooks_detach() and tracer_hooks_attach() will become terrible
@@ -55,6 +70,8 @@ static pthread_t proc_events_pthread;	// Process exec/exit thread
  */
 static volatile uint64_t probes_act;
 
+extern u64 thread_index_max;
+extern __thread uword thread_index;	// for symbol pid caches hash
 extern int sys_cpus_count;
 extern bool *cpu_online;
 extern uint32_t attach_failed_count;
@@ -71,6 +88,11 @@ static debug_callback_t datadump_cb;
 static bool datadump_enable;
 static int datadump_pid;	// If the value is 0, process-ID/thread-ID filtering is not performed.
 static uint32_t datadump_start_time;
+/*
+ * The sequence number of the socket data is used to label the
+ * dumped data for ordering purposes.
+ */
+static uint64_t datadump_seq;
 static uint32_t datadump_timeout;
 static char datadump_comm[16];	// If null, process or thread name filtering is not performed.
 static uint8_t datadump_proto;
@@ -96,11 +118,14 @@ static uint64_t io_event_minimal_duration = 1000000;
  */
 static uint32_t conf_socket_map_max_reclaim;
 
+struct bpf_tracer *g_tracer;
+
 /*
  * The table for L7 protocol filtering ports.
  */
 ports_bitmap_t *ports_bitmap[PROTO_NUM];
 
+extern uint32_t k_version;
 extern int major, minor;
 extern char linux_release[128];
 
@@ -113,24 +138,147 @@ static bool bpf_stats_map_collect(struct bpf_tracer *tracer,
 				  struct trace_stats *stats_total);
 static bool is_adapt_success(struct bpf_tracer *t);
 static int update_offsets_table(struct bpf_tracer *t,
-				struct bpf_offset_param *offset);
-static void datadump_process(void *data);
+				bpf_offset_param_t * offset);
+static void datadump_process(void *data, int64_t boot_time);
 static bool bpf_stats_map_update(struct bpf_tracer *tracer,
-				 int socket_num, int trace_num);
-static void socket_tracer_set_probes(struct tracer_probes_conf *tps)
+				 int socket_num, int trace_num,
+				 int conflict_count,
+				 int max_delay,
+				 int total_time, int event_count);
+extern int bpf_raw_tracepoint_open(const char *name, int prog_fd);
+static bool fentry_try_attach(const char *fn)
 {
-	int index = 0, curr_idx;
+	int prog_fd, attach_fd;
+	char kfunc_name[PROBE_NAME_SZ];
+	snprintf(kfunc_name, sizeof(kfunc_name), "kfunc__%s", fn);
+	struct bpf_insn insns[] = {
+		BPF_ALU64_IMM(BPF_MOV, BPF_REG_0, 0),	/* r0 = 0 */
+		BPF_EXIT_INSN(),
+	};
 
+	int stderr_fd = suspend_stderr();
+	if (stderr_fd < 0) {
+		ebpf_warning("Failed to suspend stderr.\n");
+		return false;
+	}
+
+	prog_fd = df_prog_load
+	    (BPF_PROG_TYPE_TRACING, kfunc_name, insns, sizeof(insns));
+
+	if (prog_fd < 0) {
+		resume_stderr(stderr_fd);
+		return false;
+	}
+
+	attach_fd = bpf_raw_tracepoint_open(NULL, prog_fd);
+	if (attach_fd >= 0)
+		close(attach_fd);
+
+	close(prog_fd);
+	resume_stderr(stderr_fd);
+
+	return attach_fd >= 0;
+}
+
+static bool fentry_can_attach(const char *name)
+{
+	const char *vmlinux_path = "/sys/kernel/btf/vmlinux";
+	if (access(vmlinux_path, R_OK))
+		return false;
+	return fentry_try_attach(name);
+}
+
+static inline void
+kfunc_set_sym_for_entry_and_exit(struct tracer_probes_conf *tps, const char *fn)
+{
+	kfunc_set_symbol(tps, fn, false);
+	kfunc_set_symbol(tps, fn, true);
+}
+
+static void config_probes_for_kfunc(struct tracer_probes_conf *tps)
+{
+	kfunc_set_sym_for_entry_and_exit(tps, "ksys_write");
+	kfunc_set_sym_for_entry_and_exit(tps, "ksys_read");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendto");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_recvfrom");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendmsg");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_sendmmsg");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_recvmsg");
+	kfunc_set_sym_for_entry_and_exit(tps, "__sys_recvmmsg");
+	kfunc_set_sym_for_entry_and_exit(tps, "do_writev");
+	kfunc_set_sym_for_entry_and_exit(tps, "do_readv");
+#if defined(__x86_64__)
+	kfunc_set_symbol(tps, "__x64_sys_close", false);
+#else
+	kfunc_set_symbol(tps, "__arm64_sys_close", false);
+#endif
+	kfunc_set_symbol(tps, "__sys_socket", true);
+	kfunc_set_symbol(tps, "__sys_accept4", true);
+	kfunc_set_symbol(tps, "__sys_connect", false);
+	if (access(SYSCALL_FORK_TP_PATH, F_OK)) {
+		/*
+		 * Different CPU architectures have variations in system calls.
+		 * It is necessary to confirm whether a specific system call exists.
+		 * You can check https://arm64.syscall.sh/ for reference.
+		 */
+		if (kallsyms_lookup_name("sys_fork"))
+			probes_set_exit_symbol(tps, "sys_fork");
+	}
+
+	if (access(SYSCALL_CLONE_TP_PATH, F_OK)) {
+		if (kallsyms_lookup_name("sys_clone"))
+			probes_set_exit_symbol(tps, "sys_clone");
+	}
+	// process execute
+	if (!access(SYSCALL_FORK_TP_PATH, F_OK))
+		tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_fork");
+	if (!access(SYSCALL_CLONE_TP_PATH, F_OK))
+		tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_clone");
+
+	tps_set_symbol(tps, "tracepoint/sched/sched_process_exec");
+	// process exit
+	tps_set_symbol(tps, "tracepoint/sched/sched_process_exit");
+
+	// Periodic trigger for timeout checks on cached data
+	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_getppid");
+}
+
+static void config_probes_for_kprobe_and_tracepoint(struct tracer_probes_conf
+						    *tps)
+{
 	probes_set_enter_symbol(tps, "__sys_sendmsg");
 	probes_set_enter_symbol(tps, "__sys_sendmmsg");
 	probes_set_enter_symbol(tps, "__sys_recvmsg");
 	probes_set_enter_symbol(tps, "__sys_recvmmsg");
-	probes_set_enter_symbol(tps, "do_writev");
-	probes_set_enter_symbol(tps, "do_readv");
-	tps->kprobes_nr = index;
+
+	if (k_version == KERNEL_VERSION(3, 10, 0)) {
+		/*
+		 * The Linux 3.10 kernel interface for Redhat7 and
+		 * Centos7 is sys_writev() and sys_readv()
+		 */
+		probes_set_enter_symbol(tps, "sys_writev");
+		probes_set_enter_symbol(tps, "sys_readv");
+	} else {
+		probes_set_enter_symbol(tps, "do_writev");
+		probes_set_enter_symbol(tps, "do_readv");
+	}
+
+	if (access(SYSCALL_FORK_TP_PATH, F_OK)) {
+		/*
+		 * Different CPU architectures have variations in system calls.
+		 * It is necessary to confirm whether a specific system call exists.
+		 * You can check https://arm64.syscall.sh/ for reference.
+		 */
+		if (kallsyms_lookup_name("sys_fork"))
+			probes_set_exit_symbol(tps, "sys_fork");
+	}
+
+	if (access(SYSCALL_CLONE_TP_PATH, F_OK)) {
+		if (kallsyms_lookup_name("sys_clone"))
+			probes_set_exit_symbol(tps, "sys_clone");
+	}
 
 	/* tracepoints */
-	index = 0;
 
 	/*
 	 * 由于在Linux 4.17+ sys_write, sys_read, sys_sendto, sys_recvfrom
@@ -143,7 +291,17 @@ static void socket_tracer_set_probes(struct tracer_probes_conf *tps)
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_connect");
 
 	// exit tracepoints
-	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_socket");
+	/*
+	 * `tracepoint/syscalls/sys_exit_socket` This is currently added only to
+	 * implement the NGINX tracing feature. If the tracing feature is disabled,
+	 * the syscall socket() interface will not be hooked.
+	 */
+	if (!g_disable_syscall_tracing)
+		tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_socket");
+	else
+		ebpf_info("Due to the tracing feature being disabled, the"
+			  " syscall socket() will not be attached.\n");
+
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_read");
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_write");
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_sendto");
@@ -157,23 +315,27 @@ static void socket_tracer_set_probes(struct tracer_probes_conf *tps)
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_accept");
 	tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_accept4");
 	// process execute
-	tps_set_symbol(tps, "tracepoint/sched/sched_process_fork");
-
-	// 周期性触发用于缓存的数据的超时检查
-	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_getppid");
-
-	// clear trace connection
-	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_close");
-
-	// Used for process offsets management
+	if (!access(SYSCALL_FORK_TP_PATH, F_OK))
+		tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_fork");
+	if (!access(SYSCALL_CLONE_TP_PATH, F_OK))
+		tps_set_symbol(tps, "tracepoint/syscalls/sys_exit_clone");
+	tps_set_symbol(tps, "tracepoint/sched/sched_process_exec");
+	// process exit
 	tps_set_symbol(tps, "tracepoint/sched/sched_process_exit");
 
-	tps->tps_nr = index;
+	// clear trace connection & fetch close info
+	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_close");
 
-	// 收集go可执行文件uprobe符号信息
-	collect_go_uprobe_syms_from_procfs(tps);
+	// Periodic trigger for timeout checks on cached data
+	tps_set_symbol(tps, "tracepoint/syscalls/sys_enter_getppid");
+}
 
-	collect_ssl_uprobe_syms_from_procfs(tps);
+static void socket_tracer_set_probes(struct tracer_probes_conf *tps)
+{
+	if (g_k_type == K_TYPE_KFUNC)
+		config_probes_for_kfunc(tps);
+	else
+		config_probes_for_kprobe_and_tracepoint(tps);
 }
 
 /* ==========================================================
@@ -266,7 +428,15 @@ static int kernel_offset_infer_client(void)
 	      rcv_loop:
 		len = recv(cli_fd, buf, sizeof(buf), 0);
 		if (len > 0) {
+			/*
+			 * Another send action occurs here to avoid
+			 * failure to infer the value of 'write_seq'.
+			 * Troubleshoot the invalid kernel adaptation
+			 * mechanism in EulerOS 2.9 and EulerOS 2.10
+			 * (Linux 4.18).
+			 */
 			buf[len] = '\0';
+			send(cli_fd, buf, len, 0);
 			break;
 		} else if (len == 0) {
 			break;
@@ -350,12 +520,11 @@ static bool bpf_offset_map_collect(struct bpf_tracer *tracer,
 				   struct bpf_offset_param_array *array)
 {
 	int nr_cpus = get_num_possible_cpus();
-	struct bpf_offset_param values[nr_cpus];
+	bpf_offset_param_t values[nr_cpus];
 	if (!bpf_table_get_value(tracer, MAP_MEMBERS_OFFSET_NAME, 0, values))
 		return false;
 
-	struct bpf_offset_param *out_val =
-	    (struct bpf_offset_param *)(array + 1);
+	bpf_offset_param_t *out_val = (bpf_offset_param_t *) (array + 1);
 
 	int i;
 	for (i = 0; i < array->count; i++)
@@ -372,7 +541,7 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 		return -1;
 
 	*outsize = sizeof(struct bpf_socktrace_params) +
-	    sizeof(struct bpf_offset_param) * sys_cpus_count;
+	    sizeof(bpf_offset_param_t) * sys_cpus_count;
 
 	*out = calloc(1, *outsize);
 	if (*out == NULL) {
@@ -392,6 +561,10 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 	params->datadump_enable = datadump_enable;
 	params->datadump_pid = datadump_pid;
 	params->datadump_proto = datadump_proto;
+
+	params->proc_exec_event_count = get_proc_exec_event_count();
+	params->proc_exit_event_count = get_proc_exit_event_count();
+
 	safe_buf_copy(params->datadump_file_path,
 		      sizeof(params->datadump_file_path),
 		      (void *)datadump_file_path, sizeof(datadump_file_path));
@@ -460,11 +633,13 @@ static int datadump_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
 		}
 
 		if (msg->enable) {
+			datadump_seq = 0;
 			datadump_start_time = get_sys_uptime();
 			datadump_timeout = msg->timeout;
 		}
 
 		if (datadump_enable && !msg->enable) {
+			datadump_seq = 0;
 			datadump_timeout = 0;
 			datadump_pid = 0;
 			datadump_comm[0] = '\0';
@@ -533,6 +708,7 @@ int datadump_set_config(int pid, const char *comm, int proto, int timeout,
 
 	datadump_enable = true;
 	datadump_use_remote = true;
+	datadump_seq = 0;
 	datadump_pid = pid;
 	datadump_proto = (uint8_t) proto;
 	datadump_cb = cb;
@@ -571,15 +747,17 @@ static inline bool need_proto_reconfirm(uint16_t l7_proto)
 static void process_event(struct process_event_t *e)
 {
 	if (e->meta.event_type == EVENT_TYPE_PROC_EXEC) {
+		if (e->maybe_thread && !is_user_process(e->pid))
+			return;
 		update_proc_info_cache(e->pid, PROC_EXEC);
-		go_process_exec(e->pid);
-		ssl_process_exec(e->pid);
+		unwind_process_exec(e->pid);
+		extended_process_exec(e->pid);
 	} else if (e->meta.event_type == EVENT_TYPE_PROC_EXIT) {
 		/* Cache for updating process information used in
 		 * symbol resolution. */
 		update_proc_info_cache(e->pid, PROC_EXIT);
-		go_process_exit(e->pid);
-		ssl_process_exit(e->pid);
+		unwind_process_exit(e->pid);
+		extended_process_exit(e->pid);
 	}
 }
 
@@ -590,7 +768,8 @@ static inline int dispatch_queue_index(uint64_t val, int count)
 
 // Some event types of data are handled by the user using a separate callback interface,
 // which completes the dispatch logic after reading the data from the Perf-Reader.
-static int register_events_handle(struct event_meta *meta,
+static int register_events_handle(struct reader_forward_info *fwd_info,
+				  struct event_meta *meta,
 				  int size, struct bpf_tracer *tracer)
 {
 	// Internal logic processing for process exec/exit.
@@ -612,13 +791,12 @@ static int register_events_handle(struct event_meta *meta,
 		return ETR_NOHANDLE;
 	}
 
-	int q_idx;
+	uint64_t q_idx;
 	struct queue *q;
 	int nr;
 	struct mem_block_head *block_head;
 
-	q_idx = dispatch_queue_index((uint64_t) meta->event_type,
-				     tracer->dispatch_workers_nr);
+	q_idx = fwd_info->queue_id;
 	q = &tracer->queues[q_idx];
 	block_head = malloc(sizeof(struct mem_block_head) + size);
 	if (block_head == NULL) {
@@ -649,10 +827,119 @@ static int register_events_handle(struct event_meta *meta,
 	return ETR_OK;
 }
 
-// Read datas from perf ring-buffer and dispatch.
-static void reader_raw_cb(void *t, void *raw, int raw_size)
+static u32 copy_regular_file_data(void *dst, void *src, int len)
 {
-	struct bpf_tracer *tracer = (struct bpf_tracer *)t;
+	if (len <= 0)
+		return 0;
+
+	struct user_io_event_buffer u_event;
+	struct __io_event_buffer event;
+	memcpy(&event, src, sizeof(event));
+	char *buffer = event.filename;
+	u32 buffer_len = event.len;
+	u32 buf_offset =
+	    offsetof(typeof(struct user_io_event_buffer), filename);
+
+	/*
+	 * Due to the maximum length limitation of the data, the file
+	 * path may be truncated. Here, only the valid length is considered.
+	 */
+	if (buf_offset + buffer_len > len) {
+		buffer_len = len - buf_offset;
+	}
+
+	buffer[buffer_len - 1] = '\0';
+	int event_len;
+	int i, temp_index = 0;
+	char temp[buffer_len + 1];
+	temp[0] = '\0';
+
+	/*
+	 * The path content is in the form "a\0b\0c\0" and needs to
+	 * be converted into the directory format "/c/b/a".
+	 *
+	 * e.g.:
+	 *
+	 * buffer "comm\019317\0task\032148\0/\0"
+	 * convert to "/32148/task/19317/comm"
+	 */
+	if (buffer_len <= 1)
+		goto copy_event;
+
+	char *p;
+	for (i = buffer_len - 2; i >= 0; i--) {
+		if (i == 0) {
+			p = &buffer[0];
+		} else {
+			if (buffer[i] != '\0')
+				continue;
+			p = &buffer[i + 1];
+		}
+
+		temp_index +=
+		    snprintf(temp + temp_index, sizeof(temp) - temp_index,
+			     "%s%s", p, (temp_index > 0 && i != 0) ? "/" : "");
+
+	}
+
+copy_event:
+	buffer = u_event.filename;
+	memcpy(buffer, temp, temp_index + 1);
+	buffer_len = temp_index + 1;
+	u_event.bytes_count = event.bytes_count;
+	u_event.operation = event.operation;
+	u_event.latency = event.latency;
+	u_event.offset = event.offset;
+	event_len = offsetof(typeof(struct user_io_event_buffer),
+			     filename) + buffer_len;
+	safe_buf_copy(dst, len, &u_event, event_len);
+
+	return event_len;
+}
+
+// Read datas from perf ring-buffer and dispatch.
+static void reader_raw_cb(void *cookie, void *raw, int raw_size)
+{
+#ifdef TLS_DEBUG
+	struct debug_data *debug = raw;
+	if (debug->magic == 0xffff || debug->magic == 0xfffe) {
+		const char *fun;
+		if (debug->fun == 1)
+			fun = "go_tls_write_enter";
+		else if (debug->fun == 2)
+			fun = "go_tls_write_exit";
+		else if (debug->fun == 3)
+			fun = "go_tls_read_enter";
+		else if (debug->fun == 4)
+			fun = "go_tls_read_exit";
+		else
+			fun = "unknown";
+
+		const char *err = "";
+		if (debug->num == 1 || debug->num == 2)
+			err = "(E)";
+
+		if (debug->magic == 0xffff) {
+			fprintf(stdout,
+				">UPROBE DEBUG nobuf fun %s num %d%s len %d\n",
+				fun, debug->num, err, debug->len);
+		} else {
+			fprintf(stdout,
+				">UPROBE DEBUG buf fun %s num %d%s [%d(%c) "
+				"%d(%c) %d(%c) %d(%c)]\n", fun, debug->num, err,
+				debug->buf[0], debug->buf[0], debug->buf[1],
+				debug->buf[1], debug->buf[2], debug->buf[2],
+				debug->buf[3], debug->buf[3]);
+		}
+		fflush(stdout);
+		return;
+	}
+#endif
+
+	struct reader_forward_info *fwd_info = cookie;
+	ebpf_debug(stdout, "* fwd cpu %d -> queue %ld\n",
+		   fwd_info->cpu_id, fwd_info->queue_id);
+	struct bpf_tracer *tracer = g_tracer;
 	struct event_meta *ev_meta = raw;
 
 	/*
@@ -667,7 +954,7 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 	}
 
 	if (ev_meta->event_type >= EVENT_TYPE_MIN) {
-		register_events_handle(ev_meta, raw_size, tracer);
+		register_events_handle(fwd_info, ev_meta, raw_size, tracer);
 		return;
 	}
 
@@ -675,7 +962,7 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 	 * In the following, the socket data buffer is processed.
 	 */
 
-	int q_idx;
+	uint64_t q_idx;
 	struct queue *q;
 	int nr;
 	struct mem_block_head *block_head;	// 申请内存块的指针
@@ -695,7 +982,7 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 		return;
 	}
 
-	if (buf->events_num <= 0 || buf->events_num > MAX_PKT_BURST) {
+	if (buf->events_num <= 0 || buf->events_num > MAX_EVENTS_BURST) {
 		ebpf_warning("buf->events_num %u, invalid\n", buf->events_num);
 		return;
 	}
@@ -721,18 +1008,17 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 	}
 
 	/* Determine which queue to distribute to based on the first socket_data. */
-	q_idx =
-	    dispatch_queue_index(sd->socket_id, tracer->dispatch_workers_nr);
+	q_idx = fwd_info->queue_id;
 	q = &tracer->queues[q_idx];
 
-	if (buf->events_num > MAX_PKT_BURST) {
+	if (buf->events_num > MAX_EVENTS_BURST) {
 		ebpf_info
-		    ("buf->events_num > MAX_PKT_BURST(16) error. events_num:%d\n",
+		    ("buf->events_num > MAX_EVENTS_BURST(32) error. events_num:%d\n",
 		     buf->events_num);
 		return;
 	}
 
-	struct socket_bpf_data *burst_data[MAX_PKT_BURST];
+	struct socket_bpf_data *burst_data[MAX_EVENTS_BURST];
 
 	/*
 	 * ----------- -> memory block ptr (free_ptr)
@@ -782,51 +1068,60 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 
 		data_buf_ptr = block_head + 1;
 		submit_data = data_buf_ptr;
+		memset(submit_data, 0, sizeof(*submit_data));
 
-		submit_data->socket_id = sd->socket_id;
-
-		// 数据捕获时间戳，精度为微秒(us)
-		submit_data->timestamp =
-		    (sd->timestamp + sys_boot_time_ns) / 1000ULL;
-
-		submit_data->tuple = sd->tuple;
+		submit_data->timestamp = sd->timestamp;
 		submit_data->direction = sd->direction;
-		submit_data->l7_protocal_hint = sd->data_type;
-		submit_data->need_reconfirm =
-		    need_proto_reconfirm(sd->data_type);
-		submit_data->process_id = sd->tgid;
-		submit_data->thread_id = sd->pid;
-		submit_data->coroutine_id = sd->coroutine_id;
 		submit_data->source = sd->source;
-		if (sd->source == DATA_SOURCE_GO_TLS_UPROBE ||
-		    sd->source == DATA_SOURCE_OPENSSL_UPROBE)
-			submit_data->is_tls = true;
-		else
-			submit_data->is_tls = false;
-
 		submit_data->cap_data =
 		    (char *)((void **)&submit_data->cap_data + 1);
 		submit_data->syscall_len = sd->syscall_len;
-		submit_data->tcp_seq = sd->tcp_seq;
-		submit_data->cap_seq = sd->data_seq;
-		submit_data->syscall_trace_id_call = sd->thread_trace_id;
 		safe_buf_copy(submit_data->process_kname,
 			      sizeof(submit_data->process_kname), sd->comm,
 			      sizeof(sd->comm));
 		submit_data->process_kname[sizeof(submit_data->process_kname) -
 					   1] = '\0';
-		get_container_id_from_procs_cache(sd->tgid,
-						  submit_data->container_id,
-						  sizeof
-						  (submit_data->container_id));
-		submit_data->msg_type = sd->msg_type;
-		submit_data->socket_role = sd->socket_role;
+		submit_data->l7_protocal_hint = sd->data_type;
+		if (sd->source != DATA_SOURCE_DPDK) {
+			submit_data->socket_id = sd->socket_id;
+			submit_data->tuple = sd->tuple;
+			submit_data->need_reconfirm =
+			    need_proto_reconfirm(sd->data_type);
+			submit_data->process_id = sd->tgid;
+			submit_data->thread_id = sd->pid;
+			submit_data->coroutine_id = sd->coroutine_id;
+			submit_data->is_tls = sd->is_tls;
+			if (sd->source == DATA_SOURCE_GO_TLS_UPROBE ||
+			    sd->source == DATA_SOURCE_OPENSSL_UPROBE)
+				submit_data->is_tls = true;
 
-		// 各种协议的统计
-		if (sd->data_type >= PROTO_NUM)
-			sd->data_type = PROTO_UNKNOWN;
+			submit_data->tcp_seq = sd->tcp_seq;
+			submit_data->cap_seq = sd->data_seq;
+			submit_data->syscall_trace_id_call =
+			    sd->thread_trace_id;
+			get_container_id_from_procs_cache(sd->tgid,
+							  submit_data->
+							  container_id,
+							  sizeof(submit_data->
+								 container_id));
+			submit_data->msg_type = sd->msg_type;
+			submit_data->socket_role = sd->socket_role;
+		} else {
+			if (sd->direction == T_EGRESS) {
+				atomic64_inc(&tracer->tx_pkts);
+				atomic64_add(&tracer->tx_bytes, sd->syscall_len);
+			} else {
+				atomic64_inc(&tracer->rx_pkts);
+				atomic64_add(&tracer->rx_bytes, sd->syscall_len);
+			}
+		}
 
-		atomic64_inc(&tracer->proto_status[sd->data_type]);
+		// Statistics of Various Protocols
+		if (submit_data->l7_protocal_hint >= PROTO_NUM)
+			submit_data->l7_protocal_hint = PROTO_UNKNOWN;
+
+		atomic64_inc(&tracer->proto_stats
+			     [submit_data->l7_protocal_hint]);
 		int offset = 0;
 		if (len > 0) {
 			if (sd->extra_data_count > 0) {
@@ -835,9 +1130,15 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 					    sd->extra_data_count);
 				offset = sd->extra_data_count;
 			}
-
-			memcpy_fast(submit_data->cap_data + offset, sd->data,
-				    len);
+			if (sd->source == DATA_SOURCE_IO_EVENT) {
+				len =
+				    copy_regular_file_data(submit_data->cap_data
+							   + offset, sd->data,
+							   len);
+			} else {
+				memcpy_fast(submit_data->cap_data + offset,
+					    sd->data, len);
+			}
 			submit_data->cap_data[len + offset] = '\0';
 		}
 		submit_data->syscall_len += offset;
@@ -861,6 +1162,11 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 			free(socket_data_buff);
 			return;
 		}
+		int i;
+		for (i = nr; i < buf->events_num; i++) {
+			if (burst_data[i]->source == DATA_SOURCE_DPDK)
+				atomic64_inc(&tracer->dropped_pkts);
+		}
 	}
 
 	submit_data = burst_data[nr - 1];
@@ -877,9 +1183,10 @@ static void reader_raw_cb(void *t, void *raw, int raw_size)
 	atomic64_add(&q->enqueue_nr, nr);
 }
 
-static void reader_lost_cb(void *t, uint64_t lost)
+static void reader_lost_cb(void *cookie, uint64_t lost)
 {
-	struct bpf_tracer *tracer = (struct bpf_tracer *)t;
+	struct reader_forward_info *fwd_info = cookie;
+	struct bpf_tracer *tracer = fwd_info->tracer;
 	atomic64_add(&tracer->lost, lost);
 }
 
@@ -922,7 +1229,7 @@ static void reclaim_trace_map(struct bpf_tracer *tracer, uint32_t timeout)
 	reclaim_count = __reclaim_map(map_fd, &clear_elem_head);
 	// The trace statistics map needs to be updated to reflect the count.   
 	curr_trace_count -= reclaim_count;
-	if (!bpf_stats_map_update(tracer, -1, curr_trace_count)) {
+	if (!bpf_stats_map_update(tracer, -1, curr_trace_count, -1, -1, -1, -1)) {
 		ebpf_warning("Update trace statistics failed.\n");
 	}
 
@@ -943,7 +1250,7 @@ static void reclaim_socket_map(struct bpf_tracer *tracer, uint32_t timeout)
 
 	uint64_t conn_key, next_conn_key;
 	uint32_t sockets_reclaim_count = 0;
-	struct socket_info_t value;
+	struct socket_info_s value;
 	conn_key = 0;
 	uint32_t uptime = get_sys_uptime();
 	uint32_t curr_socket_count = 0;
@@ -968,7 +1275,8 @@ static void reclaim_socket_map(struct bpf_tracer *tracer, uint32_t timeout)
 
 	sockets_reclaim_count = __reclaim_map(map_fd, &clear_elem_head);
 	curr_socket_count -= sockets_reclaim_count;
-	if (!bpf_stats_map_update(tracer, curr_socket_count, -1)) {
+	if (!bpf_stats_map_update
+	    (tracer, curr_socket_count, -1, -1, -1, -1, -1)) {
 		ebpf_warning("Update trace statistics failed.\n");
 	}
 
@@ -1027,8 +1335,8 @@ static int check_kern_adapt_and_state_update(void)
 			  "Set the status to TRACER_RUNNING\n", linux_release);
 		t->state = TRACER_RUNNING;
 		CLIB_MEMORY_BARRIER();
-		add_probes_act(ACT_DETACH);
 		set_period_event_invalid("check-kern-adapt");
+		set_period_event_invalid("trigger_kern_adapt");
 		t->adapt_success = true;
 	}
 
@@ -1091,6 +1399,7 @@ static void check_datadump_timeout(void)
 	if (datadump_enable) {
 		passed_sec = get_sys_uptime() - datadump_start_time;
 		if (passed_sec > datadump_timeout) {
+			datadump_seq = 0;
 			datadump_start_time = 0;
 			datadump_enable = false;
 			datadump_use_remote = false;
@@ -1118,6 +1427,7 @@ static void check_datadump_timeout(void)
 static void process_events_handle_main(__unused void *arg)
 {
 	prctl(PR_SET_NAME, "proc-events");
+	thread_index = THREAD_PROC_EVENTS_HANDLE_IDX;
 	struct bpf_tracer *t = arg;
 	for (;;) {
 		/*
@@ -1136,21 +1446,53 @@ static void process_events_handle_main(__unused void *arg)
 
 		go_process_events_handle();
 		ssl_events_handle();
+		extended_events_handle();
+		unwind_events_handle();
 		check_datadump_timeout();
+		/* check and clean symbol cache */
+		exec_proc_info_cache_update();
 		usleep(LOOP_DELAY_US);
 	}
 }
 
-static int update_offset_map_default(struct bpf_tracer *t)
+static int update_offset_map_default(struct bpf_tracer *t,
+				     enum linux_kernel_type kern_type)
 {
-	struct bpf_offset_param offset;
+	bpf_offset_param_t offset;
 	memset(&offset, 0, sizeof(offset));
 
-	offset.struct_files_struct_fdt_offset = 0x20;
-	offset.struct_files_private_data_offset = 0xc8;
+	switch (kern_type) {
+	case K_TYPE_VER_3_10:
+		offset.struct_files_struct_fdt_offset = 0x8;
+		offset.struct_files_private_data_offset = 0xa8;
+		break;
+	case K_TYPE_KYLIN:
+		offset.struct_files_struct_fdt_offset = 0x20;
+		offset.struct_files_private_data_offset = 0xc0;
+		break;
+	default:
+		offset.struct_files_struct_fdt_offset = 0x20;
+		offset.struct_files_private_data_offset = 0xc8;
+	};
+
+	/*
+	 * In Tencent Linux (4.14.105-1-tlinux3-0023.1), there is a difference in
+	 * `struct_files_private_data_offset`. If the offset value of the generic
+	 * eBPF program is used, it will result in the kernel being unable to adapt.
+	 * A separate correction is made here.
+	 */
+	if (strstr(linux_release, "tlinux3"))
+		offset.struct_files_private_data_offset = 0xc0;
+
+	// For 4.19.90-2211.5.0.0178.22.uel20.x86_64
+	if (strstr(linux_release, "uel20"))
+		offset.struct_files_private_data_offset = 0xc0;
+
 	offset.struct_file_f_inode_offset = 0x20;
-	offset.struct_inode_i_mode_offset = 0x00;
+	offset.struct_file_f_pos_offset = 0x68;
+	offset.struct_inode_i_mode_offset = 0x0;
 	offset.struct_file_dentry_offset = 0x18;
+	offset.struct_dentry_d_parent_offset = 0x18;
 	offset.struct_dentry_name_offset = 0x28;
 	offset.struct_sock_family_offset = 0x10;
 	offset.struct_sock_saddr_offset = 0x4;
@@ -1166,6 +1508,7 @@ static int update_offset_map_default(struct bpf_tracer *t)
 		ebpf_error("update_offset_map_default failed.\n");
 		return ETR_UPDATE_MAP_FAILD;
 	}
+
 	return ETR_OK;
 }
 
@@ -1214,6 +1557,8 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	    kernel_struct_field_offset(obj, "file", "private_data");
 	int struct_file_f_inode_offset =
 	    kernel_struct_field_offset(obj, "file", "f_inode");
+	int struct_file_f_pos_offset =
+	    kernel_struct_field_offset(obj, "file", "f_pos");
 	int struct_inode_i_mode_offset =
 	    kernel_struct_field_offset(obj, "inode", "i_mode");
 	int struct_file_dentry_offset_1 =
@@ -1234,6 +1579,8 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	}
 	int struct_dentry_name_offset =
 	    struct_dentry_name_offset_1 + struct_dentry_name_offset_2;
+	int struct_dentry_d_parent_offset =
+	    kernel_struct_field_offset(obj, "dentry", "d_parent");
 	int struct_sock_family_offset =
 	    kernel_struct_field_offset(obj, "sock_common", "skc_family");
 	int struct_sock_saddr_offset =
@@ -1251,7 +1598,7 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	int struct_sock_skc_state_offset =
 	    kernel_struct_field_offset(obj, "sock_common", "skc_state");
 	int struct_sock_common_ipv6only_offset =
-	    kernel_struct_field_offset(obj, "sock_common", "skc_flags");
+	    struct_sock_skc_state_offset + 1;
 
 	if (copied_seq_offs < 0 || write_seq_offs < 0 || files_offs < 0 ||
 	    sk_flags_offs < 0 || struct_files_struct_fdt_offset < 0 ||
@@ -1263,7 +1610,8 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	    struct_sock_ip6saddr_offset < 0 ||
 	    struct_sock_ip6daddr_offset < 0 || struct_sock_dport_offset < 0 ||
 	    struct_sock_sport_offset < 0 || struct_sock_skc_state_offset < 0 ||
-	    struct_sock_common_ipv6only_offset < 0) {
+	    struct_sock_common_ipv6only_offset < 0 ||
+	    struct_dentry_d_parent_offset < 0 || struct_file_f_pos_offset < 0) {
 		return ETR_NOTSUPP;
 	}
 
@@ -1278,12 +1626,16 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 		  struct_files_private_data_offset);
 	ebpf_info("    struct_file_f_inode_offset: 0x%x\n",
 		  struct_file_f_inode_offset);
+	ebpf_info("    struct_file_f_pos_offset: 0x%x\n",
+		  struct_file_f_pos_offset);
 	ebpf_info("    struct_inode_i_mode_offset: 0x%x\n",
 		  struct_inode_i_mode_offset);
 	ebpf_info("    struct_file_dentry_offset: 0x%x\n",
 		  struct_file_dentry_offset);
 	ebpf_info("    struct_dentry_name_offset: 0x%x\n",
 		  struct_dentry_name_offset);
+	ebpf_info("    struct_dentry_d_parent_offset: 0x%x\n",
+		  struct_dentry_d_parent_offset);
 	ebpf_info("    struct_sock_family_offset: 0x%x\n",
 		  struct_sock_family_offset);
 	ebpf_info("    struct_sock_saddr_offset: 0x%x\n",
@@ -1303,7 +1655,7 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	ebpf_info("    struct_sock_common_ipv6only_offset: 0x%x\n",
 		  struct_sock_common_ipv6only_offset);
 
-	struct bpf_offset_param offset;
+	bpf_offset_param_t offset;
 	offset.ready = 1;
 	offset.task__files_offset = files_offs;
 	offset.sock__flags_offset = sk_flags_offs;
@@ -1313,9 +1665,11 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	offset.struct_files_private_data_offset =
 	    struct_files_private_data_offset;
 	offset.struct_file_f_inode_offset = struct_file_f_inode_offset;
+	offset.struct_file_f_pos_offset = struct_file_f_pos_offset;
 	offset.struct_inode_i_mode_offset = struct_inode_i_mode_offset;
 	offset.struct_file_dentry_offset = struct_file_dentry_offset;
 	offset.struct_dentry_name_offset = struct_dentry_name_offset;
+	offset.struct_dentry_d_parent_offset = struct_dentry_d_parent_offset;
 	offset.struct_sock_family_offset = struct_sock_family_offset;
 	offset.struct_sock_saddr_offset = struct_sock_saddr_offset;
 	offset.struct_sock_daddr_offset = struct_sock_daddr_offset;
@@ -1340,6 +1694,28 @@ static void update_protocol_filter_array(struct bpf_tracer *tracer)
 	for (int idx = 0; idx < PROTO_NUM; ++idx) {
 		bpf_table_set_value(tracer, MAP_PROTO_FILTER_NAME, idx,
 				    &ebpf_config_protocol_filter[idx]);
+	}
+}
+
+static void update_allow_reasm_protos_array(struct bpf_tracer *tracer)
+{
+	for (int idx = 0; idx < PROTO_NUM; ++idx) {
+		bool ret;
+		ret = bpf_table_set_value(tracer,
+					  MAP_ALLOW_REASM_PROTOS_NAME,
+					  idx, &allow_seg_reasm_protos[idx]);
+		if (ret) {
+			if (allow_seg_reasm_protos[idx]) {
+				ebpf_info
+				    ("Allow proto %s(%d) segment reassembly\n",
+				     get_proto_name(idx), idx);
+			}
+		} else {
+			ebpf_warning
+			    ("Set proto %s(%d) to map '%s' failed, %s\n",
+			     get_proto_name(idx), idx,
+			     MAP_ALLOW_REASM_PROTOS_NAME, strerror(errno));
+		}
 	}
 }
 
@@ -1426,11 +1802,11 @@ int set_data_limit_max(int limit_size)
 
 	int cpu;
 	int nr_cpus = get_num_possible_cpus();
-	struct trace_conf_t values[nr_cpus];
+	struct tracer_ctx_s values[nr_cpus];
 	memset(values, 0, sizeof(values));
 
-	if (!bpf_table_get_value(tracer, MAP_TRACE_CONF_NAME, 0, values)) {
-		ebpf_warning("Get map '%s' failed.\n", MAP_TRACE_CONF_NAME);
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
 		return ETR_NOTEXIST;
 	}
 
@@ -1439,8 +1815,8 @@ int set_data_limit_max(int limit_size)
 	}
 
 	if (!bpf_table_set_value
-	    (tracer, MAP_TRACE_CONF_NAME, 0, (void *)&values)) {
-		ebpf_warning("Set '%s' failed\n", MAP_TRACE_CONF_NAME);
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
@@ -1460,11 +1836,11 @@ int set_go_tracing_timeout(int timeout)
 
 	int cpu;
 	int nr_cpus = get_num_possible_cpus();
-	struct trace_conf_t values[nr_cpus];
+	struct tracer_ctx_s values[nr_cpus];
 	memset(values, 0, sizeof(values));
 
-	if (!bpf_table_get_value(tracer, MAP_TRACE_CONF_NAME, 0, values)) {
-		ebpf_warning("Get map '%s' failed.\n", MAP_TRACE_CONF_NAME);
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
 		return ETR_NOTEXIST;
 	}
 
@@ -1473,8 +1849,8 @@ int set_go_tracing_timeout(int timeout)
 	}
 
 	if (!bpf_table_set_value
-	    (tracer, MAP_TRACE_CONF_NAME, 0, (void *)&values)) {
-		ebpf_warning("Set '%s' failed\n", MAP_TRACE_CONF_NAME);
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
@@ -1492,11 +1868,11 @@ int set_io_event_collect_mode(uint32_t mode)
 
 	int cpu;
 	int nr_cpus = get_num_possible_cpus();
-	struct trace_conf_t values[nr_cpus];
+	struct tracer_ctx_s values[nr_cpus];
 	memset(values, 0, sizeof(values));
 
-	if (!bpf_table_get_value(tracer, MAP_TRACE_CONF_NAME, 0, values)) {
-		ebpf_warning("Get map '%s' failed.\n", MAP_TRACE_CONF_NAME);
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
 		return ETR_NOTEXIST;
 	}
 
@@ -1505,8 +1881,8 @@ int set_io_event_collect_mode(uint32_t mode)
 	}
 
 	if (!bpf_table_set_value
-	    (tracer, MAP_TRACE_CONF_NAME, 0, (void *)&values)) {
-		ebpf_warning("Set '%s' failed\n", MAP_TRACE_CONF_NAME);
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
@@ -1524,11 +1900,11 @@ int set_io_event_minimal_duration(uint64_t duration)
 
 	int cpu;
 	int nr_cpus = get_num_possible_cpus();
-	struct trace_conf_t values[nr_cpus];
+	struct tracer_ctx_s values[nr_cpus];
 	memset(values, 0, sizeof(values));
 
-	if (!bpf_table_get_value(tracer, MAP_TRACE_CONF_NAME, 0, values)) {
-		ebpf_warning("Get map '%s' failed.\n", MAP_TRACE_CONF_NAME);
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
 		return ETR_NOTEXIST;
 	}
 
@@ -1538,32 +1914,12 @@ int set_io_event_minimal_duration(uint64_t duration)
 	}
 
 	if (!bpf_table_set_value
-	    (tracer, MAP_TRACE_CONF_NAME, 0, (void *)&values)) {
-		ebpf_warning("Set '%s' failed\n", MAP_TRACE_CONF_NAME);
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
 	return 0;
-}
-
-static void __insert_output_prog_to_map(struct bpf_tracer *tracer,
-					const char *map_name,
-					const char *prog_name, int key)
-{
-	struct ebpf_prog *prog;
-	prog = ebpf_obj__get_prog_by_name(tracer->obj, prog_name);
-	if (prog == NULL) {
-		ebpf_error("bpf_obj__get_prog_by_name() not find \"%s\"\n",
-			   prog_name);
-	}
-
-	if (!bpf_table_set_value(tracer, map_name, key, &prog->prog_fd)) {
-		ebpf_error("bpf_table_set_value() failed, prog fd:%d\n",
-			   prog->prog_fd);
-	}
-
-	ebpf_info("Insert into map('%s'), key %d, program name %s\n",
-		  map_name, key, prog_name);
 }
 
 /*
@@ -1575,36 +1931,33 @@ static void __insert_output_prog_to_map(struct bpf_tracer *tracer,
 static void insert_output_prog_to_map(struct bpf_tracer *tracer)
 {
 	// jmp for tracepoints
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_TP_NAME,
-				    PROG_PROTO_INFER_FOR_TP,
-				    PROG_PROTO_INFER_TP_IDX);
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_TP_NAME,
-				    PROG_DATA_SUBMIT_NAME_FOR_TP,
-				    PROG_DATA_SUBMIT_TP_IDX);
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_TP_NAME,
-				    PROG_OUTPUT_DATA_NAME_FOR_TP,
-				    PROG_OUTPUT_DATA_TP_IDX);
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_TP_NAME,
-				    PROG_IO_EVENT_NAME_FOR_TP,
-				    PROG_IO_EVENT_TP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_TP_NAME,
+			   PROG_PROTO_INFER_FOR_TP, PROG_PROTO_INFER_TP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_TP_NAME,
+			   PROG_DATA_SUBMIT_NAME_FOR_TP,
+			   PROG_DATA_SUBMIT_TP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_TP_NAME,
+			   PROG_OUTPUT_DATA_NAME_FOR_TP,
+			   PROG_OUTPUT_DATA_TP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_TP_NAME,
+			   PROG_IO_EVENT_NAME_FOR_TP, PROG_IO_EVENT_TP_IDX);
 
 	// jmp for kprobe/uprobe
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_KP_NAME,
-				    PROG_PROTO_INFER_FOR_KP,
-				    PROG_PROTO_INFER_KP_IDX);
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_KP_NAME,
-				    PROG_DATA_SUBMIT_NAME_FOR_KP,
-				    PROG_DATA_SUBMIT_KP_IDX);
-	__insert_output_prog_to_map(tracer,
-				    MAP_PROGS_JMP_KP_NAME,
-				    PROG_OUTPUT_DATA_NAME_FOR_KP,
-				    PROG_OUTPUT_DATA_KP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_KP_NAME,
+			   PROG_PROTO_INFER_FOR_KP, PROG_PROTO_INFER_KP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_KP_NAME,
+			   PROG_DATA_SUBMIT_NAME_FOR_KP,
+			   PROG_DATA_SUBMIT_KP_IDX);
+	insert_prog_to_map(tracer,
+			   MAP_PROGS_JMP_KP_NAME,
+			   PROG_OUTPUT_DATA_NAME_FOR_KP,
+			   PROG_OUTPUT_DATA_KP_IDX);
 }
 
 /*
@@ -1613,12 +1966,12 @@ static void insert_output_prog_to_map(struct bpf_tracer *tracer)
 static void process_data(void *queue)
 {
 	prctl(PR_SET_NAME, "queue-worker");
-	int nr;
+	volatile int nr;
 	struct queue *q = (struct queue *)queue;
 	struct ring *r = q->r;
-	void *rx_burst[MAX_PKT_BURST];
+	void *rx_burst[MAX_EVENTS_BURST];
 	for (;;) {
-		nr = ring_sc_dequeue_burst(r, rx_burst, MAX_PKT_BURST, NULL);
+		nr = ring_sc_dequeue_burst(r, rx_burst, MAX_EVENTS_BURST, NULL);
 		if (nr == 0) {
 			/*
 			 * 等着生产者唤醒
@@ -1629,7 +1982,7 @@ static void process_data(void *queue)
 		} else {
 			atomic64_add(&q->dequeue_nr, nr);
 			prefetch_and_process_data(q->t, nr, rx_burst);
-			if (nr == MAX_PKT_BURST)
+			if (nr == MAX_EVENTS_BURST)
 				atomic64_inc(&q->burst_count);
 		}
 	}
@@ -1654,20 +2007,34 @@ static_always_inline uint64_t clib_cpu_time_now(void)
 }
 #endif
 
-extern __thread uword thread_index;	// for symbol pid caches hash
-static void poller(void *t)
+static void perf_buffer_read(void *arg)
 {
-	struct bpf_tracer *tracer = (struct bpf_tracer *)t;
+	/*
+	 * Each "read" thread has its own independent epoll fd, used
+	 * to monitor the perf buffer belonging to its jurisdiction.
+	 */
+	uint64_t epoll_id = (uint64_t) arg;
+	thread_index = THREAD_SOCK_READER_IDX_BASE + epoll_id;	// for bihash
+	if (thread_index > thread_index_max)
+		thread_index_max = thread_index;
+	struct bpf_tracer *tracer = find_bpf_tracer(SK_TRACER_NAME);
+	if (tracer == NULL) {
+		ebpf_warning("find_bpf_tracer() error\n");
+		return;
+	}
+
 	struct bpf_perf_reader *perf_reader;
 	int i;
-	thread_index = THREAD_PROC_ACT_IDX;
 	for (;;) {
 #ifndef PERFORMANCE_TEST
 		for (i = 0; i < tracer->perf_readers_count; i++) {
 			perf_reader = &tracer->readers[i];
-			perf_reader_poll(perf_reader->readers_count,
-					 perf_reader->readers,
-					 perf_reader->epoll_timeout);
+			struct epoll_event events[perf_reader->readers_count];
+			int nfds =
+			    reader_epoll_wait(perf_reader, events, epoll_id);
+			if (nfds > 0) {
+				reader_event_read(events, nfds);
+			}
 		}
 #else
 		uint64_t data_len, rand_seed;
@@ -1706,7 +2073,23 @@ static void poller(void *t)
 	/* return NULL; */
 }
 
-static int dispatch_worker(struct bpf_tracer *tracer, unsigned int queue_size)
+static int perf_read_workers_setup(struct bpf_tracer *tracer)
+{
+	int i, ret;
+	struct bpf_perf_reader *r = &tracer->readers[0];
+	for (i = 0; i < r->epoll_fds_count; i++) {
+		ret = enable_tracer_reader_work("sk-reader", i,
+						tracer,
+						(void *)&perf_buffer_read);
+		if (ret)
+			return ETR_INVAL;
+	}
+
+	return ETR_OK;
+}
+
+static int dispatch_workers_setup(struct bpf_tracer *tracer,
+				  unsigned int queue_size)
 {
 	int i, ret;
 
@@ -1752,12 +2135,107 @@ static int dispatch_worker(struct bpf_tracer *tracer, unsigned int queue_size)
 		}
 	}
 
-	ret = enable_tracer_reader_work("socket-reader",
-					tracer, (void *)&poller);
-	if (ret)
-		return ETR_INVAL;
-
 	return ETR_OK;
+}
+
+static int check_dependencies(void)
+{
+	if (check_kernel_version(4, 14) != 0) {
+		return -1;
+	}
+
+	if (access(FTRACE_SYSCALLS_PATH, F_OK) != 0) {
+		ebpf_warning("Directory %s does not exist. deepflow-agent "
+			     "relies on the kernel compilation option "
+			     "'CONFIG_FTRACE_SYSCALLS'. Please ensure that "
+			     "this kernel compilation option is enabled (when "
+			     "enabled, it will display CONFIG_FTRACE_SYSCALLS=y). "
+			     "Generally, you can check the Linux kernel compilation"
+			     " options through the file `/boot/config-<current running"
+			     " Linux kernel version>`. If the compilation option is "
+			     "enabled but the `%s`"
+			     " directory is still missing, it may be due to a missing "
+			     "mount. Please manually execute the command `mount -t tracefs"
+			     " nodev /sys/kernel/debug/tracing` on the node to attempt to "
+			     "resolve the issue.\n", FTRACE_SYSCALLS_PATH,
+			     FTRACE_SYSCALLS_PATH);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int select_bpf_binary(char load_name[NAME_LEN], void **bin_buffer,
+			     int *bin_buf_size, bool skip_kfunc)
+{
+	void *bpf_bin_buffer;
+	int buffer_sz;
+	char sys_type_str[16];
+	memset(sys_type_str, 0, sizeof(sys_type_str));
+	if (fetch_system_type(sys_type_str, sizeof(sys_type_str) - 1) != ETR_OK) {
+		ebpf_warning("Fetch system type faild.\n");
+	}
+
+	if (is_rt_kernel()) {
+		g_k_type = K_TYPE_RT;
+		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-rt");
+		bpf_bin_buffer = (void *)socket_trace_rt_ebpf_data;
+		buffer_sz = sizeof(socket_trace_rt_ebpf_data);
+	} else if (!skip_kfunc && fentry_can_attach(TEST_KFUNC_NAME)
+		   && get_kfunc_params_num(TEST_KFUNC_NAME) ==
+		   TEST_KFUNC_PARAMS_NUM) {
+		g_k_type = K_TYPE_KFUNC;
+		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-kfunc");
+		bpf_bin_buffer = (void *)socket_trace_kfunc_ebpf_data;
+		buffer_sz = sizeof(socket_trace_kfunc_ebpf_data);
+	} else if (strcmp(sys_type_str, "ky10") == 0) {
+		g_k_type = K_TYPE_KYLIN;
+		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-kylin");
+		bpf_bin_buffer = (void *)socket_trace_kylin_ebpf_data;
+		buffer_sz = sizeof(socket_trace_kylin_ebpf_data);
+	} else if (major > 5 || (major == 5 && minor >= 2)) {
+		g_k_type = K_TYPE_VER_5_2_PLUS;
+		snprintf(load_name, NAME_LEN,
+			 "socket-trace-bpf-linux-5.2_plus");
+		bpf_bin_buffer = (void *)socket_trace_5_2_plus_ebpf_data;
+		buffer_sz = sizeof(socket_trace_5_2_plus_ebpf_data);
+	} else if (major == 3 && minor == 10) {
+		g_k_type = K_TYPE_VER_3_10;
+		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-3.10.0");
+		bpf_bin_buffer = (void *)socket_trace_3_10_0_ebpf_data;
+		buffer_sz = sizeof(socket_trace_3_10_0_ebpf_data);
+	} else {
+		g_k_type = K_TYPE_COMM;
+		snprintf(load_name, NAME_LEN, "socket-trace-bpf-linux-common");
+		bpf_bin_buffer = (void *)socket_trace_common_ebpf_data;
+		buffer_sz = sizeof(socket_trace_common_ebpf_data);
+	}
+
+	*bin_buffer = bpf_bin_buffer;
+	*bin_buf_size = buffer_sz;
+	return 0;
+}
+
+static void reconfig_load_resources(struct bpf_tracer *tracer, char *load_name,
+				    void *bin_buffer, int buffer_sz,
+				    struct tracer_probes_conf *tps)
+{
+	int i;
+	snprintf(tracer->bpf_load_name,
+		 sizeof(tracer->bpf_load_name), "%s", load_name);
+	tracer->bpf_load_name[sizeof(tracer->bpf_load_name) - 1] = '\0';
+	tracer->buffer_ptr = bin_buffer;
+	tracer->buffer_sz = buffer_sz;
+	for (i = 0; i < tps->kprobes_nr; i++)
+		free(tps->ksymbols[i].func);
+	tps->kprobes_nr = 0;
+	for (i = 0; i < tps->tps_nr; i++)
+		free(tps->tps[i].name);
+	tps->tps_nr = 0;
+	for (i = 0; i < tps->kfuncs_nr; i++)
+		free(tps->kfuncs[i].name);
+	tps->kfuncs_nr = 0;
+	socket_tracer_set_probes(tps);
 }
 
 /**
@@ -1772,7 +2250,8 @@ static int dispatch_worker(struct bpf_tracer *tracer, unsigned int queue_size)
  *     Callback interface for upper-layer Application.
  * @thread_nr
  *     Number of worker threads, which refers to the number of user mode threads involved
- *     in data processing.
+ *     in data processing, at the same time, it is also the number of threads reading the
+ *     perf buffer.
  * @perf_pages_cnt
  *     Number of page frames with kernel shared memory footprint, the value is a power of 2.
  * @queue_size
@@ -1802,36 +2281,23 @@ int running_socket_tracer(tracer_callback_t handle,
 	void *bpf_bin_buffer;
 	int buffer_sz;
 
-	if (check_kernel_version(4, 14) != 0) {
-		ebpf_warning
-		    ("[eBPF Kernel Adapt] Currnet linux %d.%d, not support, require Linux 4.14+\n",
-		     major, minor);
+	if (sys_cpus_count <= 0) {
+		ebpf_warning("sys_cpus_count(%d) <= 0, Please"
+			     " prioritize the execution of bpf_tracer_init().\n",
+			     sys_cpus_count);
+		return -EINVAL;
+	}
+	// Ensure that the number of worker threads does not exceed the
+	// number of CPUs
+	if (thread_nr > sys_cpus_count)
+		thread_nr = sys_cpus_count;
 
+	if (check_dependencies() != 0) {
 		return -EINVAL;
 	}
 
-	char sys_type[16];
-	memset(sys_type, 0, sizeof(sys_type));
-	if (fetch_system_type(sys_type, sizeof(sys_type) - 1) != ETR_OK) {
-		ebpf_warning("Fetch system type faild.\n");
-	}
-
-	if (strcmp(sys_type, "ky10") == 0) {
-		snprintf(bpf_load_buffer_name, NAME_LEN,
-			 "socket-trace-bpf-linux-kylin");
-		bpf_bin_buffer = (void *)socket_trace_kylin_ebpf_data;
-		buffer_sz = sizeof(socket_trace_kylin_ebpf_data);
-	} else if (major > 5 || (major == 5 && minor >= 2)) {
-		snprintf(bpf_load_buffer_name, NAME_LEN,
-			 "socket-trace-bpf-linux-5.2_plus");
-		bpf_bin_buffer = (void *)socket_trace_5_2_plus_ebpf_data;
-		buffer_sz = sizeof(socket_trace_5_2_plus_ebpf_data);
-	} else {
-		snprintf(bpf_load_buffer_name, NAME_LEN,
-			 "socket-trace-bpf-linux-common");
-		bpf_bin_buffer = (void *)socket_trace_common_ebpf_data;
-		buffer_sz = sizeof(socket_trace_common_ebpf_data);
-	}
+	select_bpf_binary(bpf_load_buffer_name, &bpf_bin_buffer, &buffer_sz,
+			  false);
 
 	/*
 	 * Initialize datadump
@@ -1856,16 +2322,19 @@ int running_socket_tracer(tracer_callback_t handle,
 	memset(tps, 0, sizeof(*tps));
 	init_list_head(&tps->uprobe_syms_head);
 	socket_tracer_set_probes(tps);
-
+	golang_trace_init();
+	openssl_trace_init();
 	create_and_init_proc_info_caches();
 
 	struct bpf_tracer *tracer =
 	    setup_bpf_tracer(SK_TRACER_NAME, bpf_load_buffer_name,
 			     bpf_bin_buffer, buffer_sz, tps,
-			     thread_nr, NULL, NULL, (void *)handle, 0);
+			     thread_nr, NULL, NULL, (void *)handle, NULL,
+			     0);
 	if (tracer == NULL)
 		return -EINVAL;
 
+	g_tracer = tracer;
 	probes_act = ACT_NONE;
 	tracer->adapt_success = false;
 
@@ -1884,8 +2353,19 @@ int running_socket_tracer(tracer_callback_t handle,
 
 	conf_max_trace_entries = max_trace_entries;
 
-	if (tracer_bpf_load(tracer))
+	bool has_attempted = false;
+retry_load:
+	if (tracer_bpf_load(tracer)) {
+		if (!has_attempted && g_k_type == K_TYPE_KFUNC) {
+			has_attempted = true;
+			select_bpf_binary(bpf_load_buffer_name, &bpf_bin_buffer,
+					  &buffer_sz, true);
+			reconfig_load_resources(tracer, bpf_load_buffer_name,
+						bpf_bin_buffer, buffer_sz, tps);
+			goto retry_load;
+		}
 		return -EINVAL;
+	}
 
 	/*
 	 * create reader for read perf buffer data. 
@@ -1896,7 +2376,7 @@ int running_socket_tracer(tracer_callback_t handle,
 					   reader_raw_cb,
 					   reader_lost_cb,
 					   perf_pages_cnt,
-					   PERF_READER_TIMEOUT_DEF);
+					   thread_nr, PERF_READER_TIMEOUT_DEF);
 	if (reader == NULL)
 		return -EINVAL;
 
@@ -1907,7 +2387,7 @@ int running_socket_tracer(tracer_callback_t handle,
 	if (update_offset_map_from_btf_vmlinux(tracer) != ETR_OK) {
 		ebpf_info
 		    ("[eBPF Kernel Adapt] Set offsets map from btf_vmlinux, not support.\n");
-		if (update_offset_map_default(tracer) != ETR_OK) {
+		if (update_offset_map_default(tracer, g_k_type) != ETR_OK) {
 			ebpf_error
 			    ("Fatal error, failed to update default offset\n");
 		}
@@ -1926,26 +2406,26 @@ int running_socket_tracer(tracer_callback_t handle,
 		return -EINVAL;
 
 	uint16_t cpu;
-	struct trace_conf_t t_conf[MAX_CPU_NR];
+	struct tracer_ctx_s t_conf[MAX_CPU_NR];
+	memset(&t_conf, 0, sizeof(t_conf));
 	for (cpu = 0; cpu < MAX_CPU_NR; cpu++) {
 		t_conf[cpu].socket_id = (uint64_t) cpu << 56 | uid_base;
 		t_conf[cpu].coroutine_trace_id = t_conf[cpu].socket_id;
 		t_conf[cpu].thread_trace_id = t_conf[cpu].socket_id;
 		t_conf[cpu].data_limit_max = socket_data_limit_max;
-		t_conf[cpu].go_tracing_timeout = go_tracing_timeout;
 		t_conf[cpu].io_event_collect_mode = io_event_collect_mode;
 		t_conf[cpu].io_event_minimal_duration =
 		    io_event_minimal_duration;
+		t_conf[cpu].disable_tracing = g_disable_syscall_tracing;
+		if (!g_disable_syscall_tracing)
+			t_conf[cpu].go_tracing_timeout = go_tracing_timeout;
 	}
 
 	if (!bpf_table_set_value
-	    (tracer, MAP_TRACE_CONF_NAME, 0, (void *)&t_conf))
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&t_conf))
 		return -EINVAL;
 
 	tracer->data_limit_max = socket_data_limit_max;
-
-	// Update go offsets to eBPF "proc_info_map"
-	update_proc_info_to_map(tracer);
 
 	// Insert prog of output data into map for using BPF Tail Calls.
 	insert_output_prog_to_map(tracer);
@@ -1956,15 +2436,27 @@ int running_socket_tracer(tracer_callback_t handle,
 	// Update protocol filter array
 	update_protocol_filter_array(tracer);
 
+	// Update '__allow_reasm_protos_map'
+	update_allow_reasm_protos_array(tracer);
+
 	update_kprobe_port_bitmap(tracer);
 
 	// Configure l7 protocol ports
 	config_proto_ports_bitmap(tracer);
 
+	/*
+	 * Enable periodic perf events and periodically poll to push
+	 * socket data residing in the kernel to a user-space program.
+	 */
+	tracer->enable_sample = true;
+
 	if (tracer_hooks_attach(tracer))
 		return -EINVAL;
 
-	if ((ret = dispatch_worker(tracer, queue_size)))
+	if ((ret = dispatch_workers_setup(tracer, queue_size)))
+		return ret;
+
+	if ((ret = perf_read_workers_setup(tracer)))
 		return ret;
 
 	// use for inference struct offset.
@@ -2081,26 +2573,41 @@ static bool bpf_stats_map_collect(struct bpf_tracer *tracer,
 		return false;
 
 	memset(stats_total, 0, sizeof(*stats_total));
-	stats_total->socket_map_count += value.socket_map_count;
-	stats_total->trace_map_count += value.trace_map_count;
-
+	stats_total->socket_map_count = value.socket_map_count;
+	stats_total->trace_map_count = value.trace_map_count;
+	stats_total->push_conflict_count = value.push_conflict_count;
+	stats_total->period_event_max_delay = value.period_event_max_delay;
+	stats_total->period_event_total_time = value.period_event_total_time;
+	stats_total->period_event_count = value.period_event_count;
 	return true;
 }
 
 static bool bpf_stats_map_update(struct bpf_tracer *tracer,
-				 int socket_num, int trace_num)
+				 int socket_num, int trace_num,
+				 int conflict_count,
+				 int max_delay, int total_time, int event_count)
 {
 	struct trace_stats value = { 0 };
 	if (!bpf_table_get_value(tracer, MAP_TRACE_STATS_NAME, 0, &value))
 		return false;
 
-	if (socket_num != -1) {
+	if (socket_num != -1)
 		value.socket_map_count = socket_num;
-	}
 
-	if (trace_num != -1) {
+	if (trace_num != -1)
 		value.trace_map_count = trace_num;
-	}
+
+	if (conflict_count != -1)
+		value.push_conflict_count = conflict_count;
+
+	if (total_time != -1)
+		value.period_event_max_delay = max_delay;
+
+	if (total_time != -1)
+		value.period_event_total_time = total_time;
+
+	if (event_count != -1)
+		value.period_event_count = event_count;
 
 	if (!bpf_table_set_value(tracer,
 				 MAP_TRACE_STATS_NAME, 0, (void *)&value)) {
@@ -2112,12 +2619,13 @@ static bool bpf_stats_map_update(struct bpf_tracer *tracer,
 
 // Update offsets tables for all cpus
 static int update_offsets_table(struct bpf_tracer *t,
-				struct bpf_offset_param *offset)
+				bpf_offset_param_t * offset)
 {
-	struct bpf_offset_param offs[MAX_CPU_NR];
+	int nr_cpus = get_num_possible_cpus();
+	bpf_offset_param_t offs[nr_cpus];
 	int i;
 	memset(&offs, 0, sizeof(offs));
-	for (i = 0; i < MAX_CPU_NR; i++) {
+	for (i = 0; i < nr_cpus; i++) {
 		offs[i] = *offset;
 	}
 
@@ -2133,7 +2641,7 @@ static bool is_adapt_success(struct bpf_tracer *t)
 	int i;
 
 	if (sys_cpus_count > 0) {
-		struct bpf_offset_param *offset;
+		bpf_offset_param_t *offset;
 		struct bpf_offset_param_array *array =
 		    malloc(sizeof(*array) + sizeof(*offset) * sys_cpus_count);
 		if (array == NULL) {
@@ -2148,7 +2656,7 @@ static bool is_adapt_success(struct bpf_tracer *t)
 			return false;
 		}
 
-		offset = (struct bpf_offset_param *)(array + 1);
+		offset = (bpf_offset_param_t *) (array + 1);
 		for (i = 0; i < sys_cpus_count; i++) {
 			if (!cpu_online[i])
 				continue;
@@ -2171,6 +2679,51 @@ static bool is_adapt_success(struct bpf_tracer *t)
 	return is_success;
 }
 
+static u64 prev_stats[STATS_TYPE_NUM];
+static u64 update_pkts_stats(struct bpf_tracer *t, enum pkts_stats_type type)
+{
+	u64 curr_num, diff;
+	if (!bpf_table_get_value
+	    (t, MAP_PKTS_STATES_NAME, type, (void *)&curr_num))
+		curr_num = prev_stats[type];
+
+	if (prev_stats[type] == 0)
+		prev_stats[type] = curr_num;
+
+	diff = curr_num - prev_stats[type];
+	prev_stats[type] = curr_num;
+
+	return diff;
+}
+
+static void pkts_stats(struct bpf_tracer *t, struct socket_trace_stats *stats)
+{
+	if (bpf_table_get_fd(t, MAP_PKTS_STATES_NAME) == -1) {
+		stats->rx_packets = 0;
+		stats->tx_packets = 0;
+		stats->rx_bytes = 0;
+		stats->tx_bytes = 0;
+		stats->dropped_packets = 0;
+		stats->kern_missed_packets = 0;
+		stats->invalid_packets = 0;
+		return;
+	}
+
+	stats->rx_packets = atomic64_read(&t->rx_pkts);
+	stats->tx_packets = atomic64_read(&t->tx_pkts);
+	stats->rx_bytes = atomic64_read(&t->rx_bytes);
+	stats->tx_bytes = atomic64_read(&t->tx_bytes);
+	stats->dropped_packets = atomic64_read(&t->dropped_pkts);
+	stats->kern_missed_packets = update_pkts_stats(t, STATS_MISS_PKTS);
+	stats->invalid_packets = update_pkts_stats(t, STATS_INVAL_PKTS);
+
+	atomic64_init(&t->rx_pkts);
+	atomic64_init(&t->tx_pkts);
+	atomic64_init(&t->rx_bytes);
+	atomic64_init(&t->tx_bytes);
+	atomic64_init(&t->dropped_pkts);
+}
+
 struct socket_trace_stats socket_tracer_stats(void)
 {
 	struct socket_trace_stats stats;
@@ -2190,12 +2743,39 @@ struct socket_trace_stats socket_tracer_stats(void)
 	stats.socket_map_max_reclaim = conf_socket_map_max_reclaim;
 	stats.probes_count = t->probes_count;
 	stats.data_limit_max = socket_data_limit_max;
+	pkts_stats(t, &stats);
 
+	static int skip_count = 2;
+	static int curr_count = 0;
 	struct trace_stats stats_total;
-
+	memset(&stats_total, 0, sizeof(stats_total));
 	if (bpf_stats_map_collect(t, &stats_total)) {
 		stats.kern_socket_map_used = stats_total.socket_map_count;
 		stats.kern_trace_map_used = stats_total.trace_map_count;
+		stats.period_push_conflict_count =
+		    stats_total.push_conflict_count;
+		if (stats_total.period_event_total_time > 0
+		    && stats_total.period_event_count > 0)
+			stats.period_push_avg_delay =
+			    (stats_total.period_event_total_time /
+			     stats_total.period_event_count) / NS_IN_USEC;
+
+		if (stats_total.period_event_max_delay > 0) {
+			stats.period_push_max_delay =
+			    PUSH_DELAY_EXCEEDED_MARKER;
+		} else {
+			stats.period_push_max_delay =
+			    stats.period_push_avg_delay;
+		}
+
+		if (curr_count++ < skip_count) {
+			stats.period_push_max_delay = 0;
+			stats.period_push_avg_delay = 0;
+		}
+
+		if (!bpf_stats_map_update(t, -1, -1, 0, 0, 0, 0)) {
+			ebpf_warning("Update trace statistics failed.\n");
+		}
 	}
 
 	int i;
@@ -2222,6 +2802,11 @@ struct socket_trace_stats socket_tracer_stats(void)
 
 	// 相邻两次系统启动时间更新后的差值
 	stats.boot_time_update_diff = sys_boot_time_ns - prev_sys_boot_time_ns;
+
+	stats.proc_exec_event_count = get_proc_exec_event_count();
+	stats.proc_exit_event_count = get_proc_exit_event_count();
+	clear_proc_exec_event_count();
+	clear_proc_exit_event_count();
 
 	return stats;
 }
@@ -2313,28 +2898,25 @@ int print_uprobe_http2_info(const char *data, int len, char *buf, int buf_len)
 
 int print_io_event_info(const char *data, int len, char *buf, int buf_len)
 {
-	struct {
-		__u32 bytes_count;
-		__u32 operation;
-		__u64 latency;
-		char filename[64];
-	} __attribute__ ((packed)) event;
 
 	int bytes = 0;
+	struct user_io_event_buffer *event =
+	    (struct user_io_event_buffer *)data;
 
-	memcpy(&event, data, sizeof(event));
-
+	int path_len = strlen(event->filename) + 1;
 	if (datadump_enable) {
 		bytes = snprintf(buf, buf_len,
-				 "bytes_count=[%u]\noperation=[%u]\nlatency=[%lu]"
-				 "\nfilename=[%s]\n",
-				 event.bytes_count, event.operation,
-				 event.latency, event.filename);
+				 "bytes_count=[%u]\noperation=[%u]\noffset=[%lu]\n"
+				 "latency=[%lu]\nfilename=[%s](len %d)\n",
+				 event->bytes_count, event->operation,
+				 event->offset, event->latency, event->filename,
+				 path_len);
 	} else {
 		fprintf(stdout,
-			"bytes_count=[%u]\noperation=[%u]\nlatency=[%lu]\nfilename=[%s]\n",
-			event.bytes_count, event.operation,
-			event.latency, event.filename);
+			"bytes_count=[%u]\noperation=[%u]\noffset=[%lu]\n"
+			"latency=[%lu]\nfilename=[%s](len %d)\n",
+			event->bytes_count, event->operation, event->offset,
+			event->latency, event->filename, path_len);
 
 		fflush(stdout);
 	}
@@ -2527,15 +3109,16 @@ static bool allow_datadump(struct socket_bpf_data *sd)
 	return output;
 }
 
-#define DATADUMP_FORMAT						\
-	"%s [datadump] <%s> DIR %s TYPE %s(%d) PID %u "		\
-	"THREAD_ID %u COROUTINE_ID %" PRIu64 " ROLE %s"		\
-	" CONTAINER_ID %s SOURCE %d COMM %s "			\
-	"%s LEN %d SYSCALL_LEN %" PRIu64 " SOCKET_ID %" PRIu64	\
-	" " "TRACE_ID %" PRIu64 " TCP_SEQ %" PRIu64		\
-	" DATA_SEQ %" PRIu64 " TLS %s TimeStamp %" PRIu64 "\n"
+#define DATADUMP_FORMAT							\
+	"%s [datadump] SEQ %" PRIu64 " <%s> DIR %s TYPE %s(%d) PID %u "	\
+	"THREAD_ID %u COROUTINE_ID %" PRIu64 " ROLE %s"			\
+	" CONTAINER_ID %s SOURCE %d COMM %s "				\
+	"%s LEN %d SYSCALL_LEN %" PRIu64 " SOCKET_ID %" PRIu64		\
+	" " "TRACE_ID %" PRIu64 " TCP_SEQ %" PRIu64			\
+	" DATA_SEQ %" PRIu64 " TLS %s KernCapTime %s "			\
+	"KernMonoTime %llu us\n"
 
-static void print_socket_data(struct socket_bpf_data *sd)
+static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 {
 	if (!allow_datadump(sd))
 		return;
@@ -2544,16 +3127,28 @@ static void print_socket_data(struct socket_bpf_data *sd)
 	if (timestamp == NULL)
 		return;
 
+	int64_t k_fetch_time_us;
+	k_fetch_time_us = (sd->timestamp + boot_time) / NS_IN_USEC;
+
+	char *kern_cap_time = get_timestamp_from_us(k_fetch_time_us);
+	if (kern_cap_time == NULL) {
+		free(timestamp);
+		return;
+	}
+
 	char *proto_tag = get_proto_name(sd->l7_protocal_hint);
 	char *type, *role_str;
 	char *flow_str = flow_info(sd);
 	if (flow_str == NULL) {
 		free(timestamp);
+		free(kern_cap_time);
 		return;
 	}
 
 	if (sd->msg_type == MSG_REQUEST)
 		type = "req";
+	else if (sd->msg_type == MSG_RESPONSE)
+		type = "res";
 	else if (sd->msg_type == MSG_RESPONSE)
 		type = "res";
 	else
@@ -2570,7 +3165,8 @@ static void print_socket_data(struct socket_bpf_data *sd)
 	int len = 0;
 	len +=
 	    snprintf(buff, sizeof(buff), DATADUMP_FORMAT, timestamp,
-		     proto_tag,
+		     datadump_seq++,
+		     sd->source == DATA_SOURCE_DPDK ? "Pkt" : proto_tag,
 		     sd->direction == T_EGRESS ? "out" : "in", type,
 		     sd->msg_type, sd->process_id, sd->thread_id,
 		     sd->coroutine_id, role_str,
@@ -2579,7 +3175,8 @@ static void print_socket_data(struct socket_bpf_data *sd)
 		     sd->process_kname, flow_str, sd->cap_len,
 		     sd->syscall_len, sd->socket_id,
 		     sd->syscall_trace_id_call, sd->tcp_seq,
-		     sd->cap_seq, sd->is_tls ? "true" : "false", sd->timestamp);
+		     sd->cap_seq, sd->is_tls ? "true" : "false",
+		     kern_cap_time, sd->timestamp / NS_IN_USEC);
 
 	if (sd->source == DATA_SOURCE_GO_HTTP2_UPROBE) {
 		len +=
@@ -2593,6 +3190,11 @@ static void print_socket_data(struct socket_bpf_data *sd)
 		len +=
 		    print_uprobe_grpc_dataframe(sd->cap_data, sd->cap_len,
 						buff + len, sizeof(buff) - len);
+	} else if (sd->source == DATA_SOURCE_DPDK) {
+		len +=
+		    print_extra_pkt_info(datadump_enable, sd->cap_data,
+					 sd->cap_len, buff + len,
+					 sizeof(buff) - len, sd->direction);
 	} else {
 		int i;
 		uint8_t v;
@@ -2629,6 +3231,7 @@ static void print_socket_data(struct socket_bpf_data *sd)
 	}
 
 	free(timestamp);
+	free(kern_cap_time);
 	free(flow_str);
 
 	if (datadump_use_remote) {
@@ -2640,12 +3243,12 @@ static void print_socket_data(struct socket_bpf_data *sd)
 	}
 }
 
-static void datadump_process(void *data)
+static void datadump_process(void *data, int64_t boot_time)
 {
 	struct socket_bpf_data *sd = data;
 	pthread_mutex_lock(&datadump_mutex);
 	if (unlikely(datadump_enable))
-		print_socket_data(sd);
+		print_socket_data(sd, boot_time);
 	pthread_mutex_unlock(&datadump_mutex);
 }
 
@@ -2708,4 +3311,19 @@ failed:
 	    ("failed to get proto_type %d mask, ports %s err %d\n",
 	     proto_type, ports, err);
 	return -1;
+}
+
+int disable_syscall_trace_id(void)
+{
+	g_disable_syscall_tracing = true;
+	ebpf_info("Disable tracing feature.\n");
+	return 0;
+}
+
+void uprobe_match_pid_handle(int feat, int pid, enum match_pids_act act)
+{
+	if (feat == FEATURE_UPROBE_GOLANG)
+		golang_trace_handle(pid, act);
+	else if (feat == FEATURE_UPROBE_OPENSSL)
+		openssl_trace_handle(pid, act);
 }

@@ -41,9 +41,10 @@ const (
 )
 
 type ExtMetrics struct {
-	Config        *config.Config
-	Telegraf      *Metricsor
-	MetaflowStats *Metricsor
+	Config             *config.Config
+	Telegraf           *Metricsor
+	DeepflowAgentStats *Metricsor
+	DeepflowStats      *Metricsor
 }
 
 type Metricsor struct {
@@ -51,28 +52,33 @@ type Metricsor struct {
 	Decoders            []*decoder.Decoder
 	PlatformDataEnabled bool
 	PlatformDatas       []*grpc.PlatformInfoTable
-	Writer              *dbwriter.ExtMetricsWriter
+	Writers             [dbwriter.MAX_DB_ID]*dbwriter.ExtMetricsWriter
 }
 
 func NewExtMetrics(config *config.Config, recv *receiver.Receiver, platformDataManager *grpc.PlatformDataManager) (*ExtMetrics, error) {
 	manager := dropletqueue.NewManager(ingesterctl.INGESTERCTL_EXTMETRICS_QUEUE)
 
-	telegraf, err := NewMetricsor(datatype.MESSAGE_TYPE_TELEGRAF, dbwriter.EXT_METRICS_DB, config, platformDataManager, manager, recv, true)
+	telegraf, err := NewMetricsor(datatype.MESSAGE_TYPE_TELEGRAF, []dbwriter.WriterDBID{dbwriter.EXT_METRICS_DB_ID}, config, platformDataManager, manager, recv, true)
 	if err != nil {
 		return nil, err
 	}
-	deepflowStats, err := NewMetricsor(datatype.MESSAGE_TYPE_DFSTATS, dbwriter.DEEPFLOW_SYSTEM_DB, config, platformDataManager, manager, recv, false)
+	deepflowAgentStats, err := NewMetricsor(datatype.MESSAGE_TYPE_DFSTATS, []dbwriter.WriterDBID{dbwriter.DEEPFLOW_ADMIN_DB_ID, dbwriter.DEEPFLOW_TENANT_DB_ID}, config, platformDataManager, manager, recv, false)
+	if err != nil {
+		return nil, err
+	}
+	deepflowStats, err := NewMetricsor(datatype.MESSAGE_TYPE_SERVER_DFSTATS, []dbwriter.WriterDBID{dbwriter.DEEPFLOW_ADMIN_DB_ID, dbwriter.DEEPFLOW_TENANT_DB_ID}, config, platformDataManager, manager, recv, false)
 	if err != nil {
 		return nil, err
 	}
 	return &ExtMetrics{
-		Config:        config,
-		Telegraf:      telegraf,
-		MetaflowStats: deepflowStats,
+		Config:             config,
+		Telegraf:           telegraf,
+		DeepflowAgentStats: deepflowAgentStats,
+		DeepflowStats:      deepflowStats,
 	}, nil
 }
 
-func NewMetricsor(msgType datatype.MessageType, db string, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, platformDataEnabled bool) (*Metricsor, error) {
+func NewMetricsor(msgType datatype.MessageType, flowTagTablePrefixs []dbwriter.WriterDBID, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, platformDataEnabled bool) (*Metricsor, error) {
 	queueCount := config.DecoderQueueCount
 	decodeQueues := manager.NewQueues(
 		"1-receive-to-decode-"+msgType.String(),
@@ -96,16 +102,20 @@ func NewMetricsor(msgType datatype.MessageType, db string, config *config.Config
 				return nil, err
 			}
 		}
-		metricsWriter, err := dbwriter.NewExtMetricsWriter(i, msgType, db, config)
-		if err != nil {
-			return nil, err
+		var metricsWriters [dbwriter.MAX_DB_ID]*dbwriter.ExtMetricsWriter
+		for _, tableId := range flowTagTablePrefixs {
+			metricsWriter, err := dbwriter.NewExtMetricsWriter(i, msgType, tableId.String(), config)
+			if err != nil {
+				return nil, err
+			}
+			metricsWriters[tableId] = metricsWriter
 		}
 		decoders[i] = decoder.NewDecoder(
 			i,
 			msgType,
 			platformDatas[i],
 			queue.QueueReader(decodeQueues.FixedMultiQueue[i]),
-			metricsWriter,
+			metricsWriters,
 			config,
 		)
 	}
@@ -139,11 +149,13 @@ func (m *Metricsor) Close() {
 
 func (s *ExtMetrics) Start() {
 	s.Telegraf.Start()
-	s.MetaflowStats.Start()
+	s.DeepflowAgentStats.Start()
+	s.DeepflowStats.Start()
 }
 
 func (s *ExtMetrics) Close() error {
 	s.Telegraf.Close()
-	s.MetaflowStats.Close()
+	s.DeepflowAgentStats.Close()
+	s.DeepflowStats.Close()
 	return nil
 }

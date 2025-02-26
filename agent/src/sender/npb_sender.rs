@@ -15,6 +15,7 @@
  */
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::{Error as IOError, ErrorKind, Result as IOResult};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddrV4, SocketAddrV6};
 #[cfg(unix)]
@@ -52,10 +53,11 @@ use crate::config::NpbConfig;
 #[cfg(unix)]
 use crate::dispatcher::af_packet::{Options, Tpacket};
 use crate::exception::ExceptionHandler;
-use crate::utils::stats::{self, StatsOption};
+use crate::utils::stats;
 use npb_handler::{NpbHeader, NOT_SUPPORT};
+use npb_sender::ZmqSender;
 use public::counter::{Countable, CounterType, CounterValue, OwnedCountable};
-use public::proto::trident::{Exception, SocketType};
+use public::proto::agent::{Exception, SocketType};
 use public::queue::Receiver;
 #[cfg(unix)]
 use public::utils::net::MAC_ADDR_LEN;
@@ -416,13 +418,7 @@ impl TcpSender {
         arp: &Arc<NpbArpTable>,
     ) -> IOResult<usize> {
         self.connect_check()?;
-        let seq = arp.lookup_counter(&self.dst_ip);
-        serialize_seq(
-            &mut packet,
-            seq,
-            underlay_l2_opt_size,
-            self.underlay_is_ipv6,
-        );
+        let _ = arp.lookup_counter(&self.dst_ip);
         let overlay_packet_offset = self.overlay_packet_offset + underlay_l2_opt_size;
         let packet = &mut packet.as_mut_slice()[overlay_packet_offset..];
 
@@ -457,6 +453,7 @@ enum NpbSender {
     #[cfg(unix)]
     RawSender(AfpacketSender),
     TcpSender(TcpSender),
+    ZmqSender(ZmqSender),
 }
 
 impl NpbSender {
@@ -473,6 +470,10 @@ impl NpbSender {
             #[cfg(unix)]
             Self::RawSender(s) => s.send(timestamp, underlay_l2_opt_size, packet, arp),
             Self::TcpSender(s) => s.send(underlay_l2_opt_size, packet, arp),
+            Self::ZmqSender(s) => {
+                let _ = arp.lookup_counter(&s.dst_ip);
+                s.send(underlay_l2_opt_size, packet)
+            }
         }
     }
 }
@@ -481,13 +482,7 @@ impl NpbSender {
 pub struct NpbSenderCounter {
     pub tx: AtomicUsize,
     pub tx_bytes: AtomicUsize,
-}
-
-impl NpbSenderCounter {
-    fn reset(&self) {
-        self.tx.store(0, Ordering::Relaxed);
-        self.tx_bytes.store(0, Ordering::Relaxed);
-    }
+    pub tx_dropped: AtomicUsize,
 }
 
 pub struct StatsNpbSenderCounter(Weak<NpbSenderCounter>);
@@ -500,18 +495,21 @@ impl OwnedCountable for StatsNpbSenderCounter {
     fn get_counters(&self) -> Vec<public::counter::Counter> {
         match self.0.upgrade() {
             Some(x) => {
-                let (tx, tx_bytes) = (
-                    x.tx.load(Ordering::Relaxed) as u64,
-                    x.tx_bytes.load(Ordering::Relaxed) as u64,
-                );
-                x.reset();
-
                 vec![
-                    ("tx", CounterType::Counted, CounterValue::Unsigned(tx)),
+                    (
+                        "tx",
+                        CounterType::Counted,
+                        CounterValue::Unsigned(x.tx.swap(0, Ordering::Relaxed) as u64),
+                    ),
                     (
                         "tx_bytes",
                         CounterType::Counted,
-                        CounterValue::Unsigned(tx_bytes),
+                        CounterValue::Unsigned(x.tx_bytes.swap(0, Ordering::Relaxed) as u64),
+                    ),
+                    (
+                        "tx_dropped",
+                        CounterType::Counted,
+                        CounterValue::Unsigned(x.tx_dropped.swap(0, Ordering::Relaxed) as u64),
                     ),
                 ]
             }
@@ -799,9 +797,8 @@ impl NpbConnectionPool {
     ) -> Self {
         let counter = Arc::new(NpbSenderCounter::default());
         stats_collector.register_countable(
-            "npb_packet_sender",
+            &stats::SingleTagModule("npb_packet_sender", "id", id),
             Countable::Owned(Box::new(StatsNpbSenderCounter(Arc::downgrade(&counter)))),
-            vec![StatsOption::Tag("id", id.to_string())],
         );
 
         #[cfg(windows)]
@@ -828,19 +825,22 @@ impl NpbConnectionPool {
         // Trigger to create ARP table entry.
         self.arp.add(remote);
         match self.socket_type {
-            SocketType::Udp if protocol != IpProtocol::TCP => {
+            #[cfg(unix)]
+            SocketType::RawUdp if protocol != IpProtocol::TCP => {
+                Ok(NpbSender::RawSender(AfpacketSender::new(remote)))
+            }
+            _ if protocol != IpProtocol::TCP => {
                 let sender = IpSender::new(remote, protocol);
                 if sender.is_err() {
                     return Err(format!("IpSender error: {:?}.", sender.unwrap_err()));
                 }
                 Ok(NpbSender::IpSender(sender.unwrap()))
             }
-            SocketType::Tcp if protocol == IpProtocol::TCP => {
-                Ok(NpbSender::TcpSender(TcpSender::new(remote, self.npb_port)))
+            SocketType::Zmq if protocol == IpProtocol::TCP => {
+                Ok(NpbSender::ZmqSender(ZmqSender::new(remote, self.npb_port)))
             }
-            #[cfg(unix)]
-            SocketType::RawUdp if protocol != IpProtocol::TCP => {
-                Ok(NpbSender::RawSender(AfpacketSender::new(remote)))
+            _ if protocol == IpProtocol::TCP => {
+                Ok(NpbSender::TcpSender(TcpSender::new(remote, self.npb_port)))
             }
             _ => Err(format!(
                 "NPB socket type {:?} not support tunnel ip {} and protocol {}.",
@@ -908,6 +908,7 @@ impl NpbConnectionPool {
         let bytes = packet.len();
         let ret = self.send_to(timestamp, underlay_l2_opt_size, packet);
         if ret.is_err() {
+            self.counter.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return ret;
         }
         self.counter.tx.fetch_add(1, Ordering::Relaxed);

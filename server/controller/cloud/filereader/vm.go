@@ -22,6 +22,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (f *FileReader) getVMs(fileInfo *FileInfo) ([]model.VM, []model.VInterface, []model.IP, error) {
@@ -37,17 +38,17 @@ func (f *FileReader) getVMs(fileInfo *FileInfo) ([]model.VM, []model.VInterface,
 		azLcuuid, ok := f.azNameToLcuuid[vm.AZ]
 		if !ok {
 			err := errors.New(fmt.Sprintf("az (%s) not in file", vm.AZ))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(f.orgID))
 			return nil, nil, nil, err
 		}
 		vpcLcuuid, ok := f.vpcNameToLcuuid[vm.VPC]
 		if !ok {
 			err := errors.New(fmt.Sprintf("vpc (%s) not in file", vm.VPC))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(f.orgID))
 			return nil, nil, nil, err
 		}
 
-		lcuuid := common.GenerateUUID(f.UuidGenerate + "_vm_" + vm.Name)
+		lcuuid := common.GenerateUUIDByOrgID(f.orgID, f.UuidGenerate+"_vm_"+vm.Name)
 		retVMs = append(retVMs, model.VM{
 			Lcuuid:       lcuuid,
 			Name:         vm.Name,
@@ -64,17 +65,17 @@ func (f *FileReader) getVMs(fileInfo *FileInfo) ([]model.VM, []model.VInterface,
 			networkLcuuid, ok := f.subnetNameToNetworkLcuuid[port.Subnet]
 			if !ok {
 				err := errors.New(fmt.Sprintf("subnet (%s) not in file", port.Subnet))
-				log.Error(err)
+				log.Error(err, logger.NewORGPrefix(f.orgID))
 				return nil, nil, nil, err
 			}
 			netType, ok := f.networkLcuuidToNetType[networkLcuuid]
 			if !ok {
 				err := errors.New(fmt.Sprintf("subnet (%s) network not in file", port.Subnet))
-				log.Error(err)
+				log.Error(err, logger.NewORGPrefix(f.orgID))
 				return nil, nil, nil, err
 			}
 
-			vinterfaceLcuuid := common.GenerateUUID(f.UuidGenerate + port.Mac)
+			vinterfaceLcuuid := common.GenerateUUIDByOrgID(f.orgID, f.UuidGenerate+port.Mac)
 			retVInterfaces = append(retVInterfaces, model.VInterface{
 				Lcuuid:        vinterfaceLcuuid,
 				Type:          netType,
@@ -89,11 +90,11 @@ func (f *FileReader) getVMs(fileInfo *FileInfo) ([]model.VM, []model.VInterface,
 			subnetLcuuid, ok := f.subnetNameToLcuuid[port.Subnet]
 			if !ok {
 				err := errors.New(fmt.Sprintf("subnet (%s) not in file", port.Subnet))
-				log.Error(err)
+				log.Error(err, logger.NewORGPrefix(f.orgID))
 				return nil, nil, nil, err
 			}
 			retIPs = append(retIPs, model.IP{
-				Lcuuid:           common.GenerateUUID(port.IP + port.Mac),
+				Lcuuid:           common.GenerateUUIDByOrgID(f.orgID, port.IP+port.Mac),
 				VInterfaceLcuuid: vinterfaceLcuuid,
 				IP:               port.IP,
 				SubnetLcuuid:     subnetLcuuid,

@@ -19,66 +19,67 @@ package tagrecorder
 import (
 	"encoding/json"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 type ChChostCloudTags struct {
-	UpdaterBase[mysql.ChChostCloudTags, CloudTagsKey]
+	SubscriberComponent[*message.VMFieldsUpdate, message.VMFieldsUpdate, metadbmodel.VM, metadbmodel.ChChostCloudTags, CloudTagsKey]
 }
 
 func NewChChostCloudTags() *ChChostCloudTags {
-	updater := &ChChostCloudTags{
-		UpdaterBase[mysql.ChChostCloudTags, CloudTagsKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_VM_CLOUD_TAGS,
-		},
+	mng := &ChChostCloudTags{
+		newSubscriberComponent[*message.VMFieldsUpdate, message.VMFieldsUpdate, metadbmodel.VM, metadbmodel.ChChostCloudTags, CloudTagsKey](
+			common.RESOURCE_TYPE_VM_EN, RESOURCE_TYPE_CH_VM_CLOUD_TAGS,
+		),
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (c *ChChostCloudTags) generateNewData() (map[CloudTagsKey]mysql.ChChostCloudTags, bool) {
-	var vms []mysql.VM
-	err := mysql.Db.Unscoped().Find(&vms).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(c.resourceTypeName, err))
-		return nil, false
-	}
-
-	keyToItem := make(map[CloudTagsKey]mysql.ChChostCloudTags)
-	for _, vm := range vms {
-		cloudTagsMap := map[string]string{}
-		for k, v := range vm.CloudTags {
-			cloudTagsMap[k] = v
-		}
-		if len(cloudTagsMap) > 0 {
-			cloudTagsStr, err := json.Marshal(cloudTagsMap)
-			if err != nil {
-				log.Error(err)
-				return nil, false
-			}
-			key := CloudTagsKey{
-				ID: vm.ID,
-			}
-			keyToItem[key] = mysql.ChChostCloudTags{
-				ID:        vm.ID,
-				CloudTags: string(cloudTagsStr),
-			}
-		}
-	}
-	return keyToItem, true
-}
-
-func (c *ChChostCloudTags) generateKey(dbItem mysql.ChChostCloudTags) CloudTagsKey {
-	return CloudTagsKey{ID: dbItem.ID}
-}
-
-func (c *ChChostCloudTags) generateUpdateInfo(oldItem, newItem mysql.ChChostCloudTags) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) onResourceUpdated(sourceID int, fieldsUpdate *message.VMFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.CloudTags != newItem.CloudTags {
-		updateInfo["cloud_tags"] = newItem.CloudTags
+	if fieldsUpdate.CloudTags.IsDifferent() {
+		bytes, err := json.Marshal(fieldsUpdate.CloudTags.GetNew())
+		if err != nil {
+			log.Error(err, db.LogPrefixORGID)
+			return
+		}
+		updateInfo["cloud_tags"] = string(bytes)
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem metadbmodel.ChChostCloudTags
+		db.Where("id = ?", sourceID).First(&chItem)
+		if chItem.ID == 0 {
+			c.SubscriberComponent.dbOperator.add(
+				[]CloudTagsKey{{ID: sourceID}},
+				[]metadbmodel.ChChostCloudTags{{ID: sourceID, CloudTags: updateInfo["cloud_tags"].(string)}},
+				db,
+			)
+		} else {
+			c.SubscriberComponent.dbOperator.update(chItem, updateInfo, CloudTagsKey{ID: sourceID}, db)
+		}
 	}
-	return nil, false
+}
+
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) sourceToTarget(md *message.Metadata, item *metadbmodel.VM) (keys []CloudTagsKey, targets []metadbmodel.ChChostCloudTags) {
+	if len(item.CloudTags) == 0 {
+		return
+	}
+	bytes, err := json.Marshal(item.CloudTags)
+	if err != nil {
+		log.Error(err, logger.NewORGPrefix(md.ORGID))
+		return
+	}
+	return []CloudTagsKey{{ID: item.ID}}, []metadbmodel.ChChostCloudTags{{ID: item.ID, CloudTags: string(bytes), TeamID: md.TeamID, DomainID: md.DomainID}}
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChChostCloudTags) softDeletedTargetsUpdated(targets []metadbmodel.ChChostCloudTags, db *metadb.DB) {
+
 }

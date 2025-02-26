@@ -18,7 +18,8 @@ package rebalance
 
 import (
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 // //go:generate mockgen -source=analyzer.go -destination=./mocks/mock_analyzer.go -package=mocks DB
@@ -27,58 +28,75 @@ type DB interface {
 }
 
 type DBInfo struct {
-	AZs             []mysql.AZ
-	Analyzers       []mysql.Analyzer
-	AZAnalyzerConns []mysql.AZAnalyzerConnection
-	VTaps           []mysql.VTap
+	Regions         []metadbmodel.Region
+	AZs             []metadbmodel.AZ
+	Analyzers       []metadbmodel.Analyzer
+	AZAnalyzerConns []metadbmodel.AZAnalyzerConnection
+	VTaps           []metadbmodel.VTap
 
 	// get query data
-	Controllers       []mysql.Controller
-	AZControllerConns []mysql.AZControllerConnection
+	Controllers       []metadbmodel.Controller
+	AZControllerConns []metadbmodel.AZControllerConnection
 }
 
 type AnalyzerInfo struct {
-	dbInfo                    *DBInfo
-	regionToVTapNameToTraffic map[string]map[string]int64
+	onlyWeight bool
 
-	db    DB
-	query Querier
+	dbInfo *DBInfo
+	db     DB
+	query  Querier
+
+	RebalanceData
 }
 
-func NewAnalyzerInfo() *AnalyzerInfo {
+type RebalanceData struct {
+	RegionToVTapNameToTraffic map[string]map[string]int64        `json:"RegionToVTapNameToTraffic"`
+	RegionToAZLcuuids         map[string][]string                `json:"RegionToAZLcuuids"`
+	AZToRegion                map[string]string                  `json:"AZToRegion"`
+	AZToVTaps                 map[string][]*metadbmodel.VTap     `json:"AZToVTaps"`
+	AZToAnalyzers             map[string][]*metadbmodel.Analyzer `json:"AZToAnalyzers"`
+}
+
+func NewAnalyzerInfo(onlyWeight bool) *AnalyzerInfo {
 	return &AnalyzerInfo{
-		db:    &DBInfo{},
-		query: &Query{},
+		onlyWeight: onlyWeight,
+		dbInfo:     &DBInfo{},
+		query: &Query{
+			onlyWeight: onlyWeight,
+		},
 	}
 }
 
-func (r *DBInfo) Get() error {
-	if err := mysql.Db.Find(&r.AZs).Error; err != nil {
+func (r *DBInfo) Get(db *metadb.DB) error {
+	if err := db.Find(&r.Regions).Error; err != nil {
 		return err
 	}
-	if err := mysql.Db.Find(&r.Analyzers).Error; err != nil {
+	if err := db.Find(&r.AZs).Error; err != nil {
 		return err
 	}
-	if err := mysql.Db.Find(&r.AZAnalyzerConns).Error; err != nil {
+	if err := db.Find(&r.Analyzers).Error; err != nil {
 		return err
 	}
-	if err := mysql.Db.Where("type != ?", common.VTAP_TYPE_TUNNEL_DECAPSULATION).Find(&r.VTaps).Error; err != nil {
+	if err := db.Find(&r.AZAnalyzerConns).Error; err != nil {
+		return err
+	}
+	if err := db.Where("type != ?", common.VTAP_TYPE_TUNNEL_DECAPSULATION).Find(&r.VTaps).Error; err != nil {
 		return err
 	}
 
-	if err := mysql.Db.Find(&r.Controllers).Error; err != nil {
+	if err := db.Find(&r.Controllers).Error; err != nil {
 		return err
 	}
-	if err := mysql.Db.Find(&r.AZControllerConns).Error; err != nil {
+	if err := db.Find(&r.AZControllerConns).Error; err != nil {
 		return err
 	}
 	return nil
 }
 
-func GetAZToAnalyzers(azAnalyzerConns []mysql.AZAnalyzerConnection, regionToAZLcuuids map[string][]string,
-	ipToAnalyzer map[string]*mysql.Analyzer) map[string][]*mysql.Analyzer {
+func GetAZToAnalyzers(azAnalyzerConns []metadbmodel.AZAnalyzerConnection, regionToAZLcuuids map[string][]string,
+	ipToAnalyzer map[string]*metadbmodel.Analyzer) map[string][]*metadbmodel.Analyzer {
 
-	azToAnalyzers := make(map[string][]*mysql.Analyzer)
+	azToAnalyzers := make(map[string][]*metadbmodel.Analyzer)
 	for _, conn := range azAnalyzerConns {
 		if conn.AZ == "ALL" {
 			if azLcuuids, ok := regionToAZLcuuids[conn.Region]; ok {

@@ -23,16 +23,15 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getNetworks(
-	region model.Region, zoneNameToAZLcuuid map[string]string, vpcIdToLcuuid map[string]string,
-) ([]model.Network, []model.Subnet, map[string]string, error) {
+func (b *BaiduBce) getNetworks(zoneNameToAZLcuuid map[string]string, vpcIdToLcuuid map[string]string) ([]model.Network, []model.Subnet, map[string]string, error) {
 	var retNetworks []model.Network
 	var retSubnets []model.Subnet
 	var networkIdToLcuuid map[string]string
 
-	log.Debug("get networks starting")
+	log.Debug("get networks starting", logger.NewORGPrefix(b.orgID))
 
 	vpcClient, _ := vpc.NewClient(b.secretID, b.secretKey, "bcc."+b.endpoint)
 	vpcClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -44,7 +43,7 @@ func (b *BaiduBce) getNetworks(
 		startTime := time.Now()
 		result, err := vpcClient.ListSubnets(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("ListSubnets", len(result.Subnets), startTime)
@@ -61,16 +60,16 @@ func (b *BaiduBce) getNetworks(
 		for _, subnet := range r.Subnets {
 			azLcuuid, ok := zoneNameToAZLcuuid[subnet.ZoneName]
 			if !ok {
-				log.Infof("network (%s) az (%s) not found", subnet.SubnetId, subnet.ZoneName)
+				log.Infof("network (%s) az (%s) not found", subnet.SubnetId, subnet.ZoneName, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			vpcLcuuid, ok := vpcIdToLcuuid[subnet.VPCId]
 			if !ok {
-				log.Infof("network (%s) vpc (%s) not found", subnet.SubnetId, subnet.VPCId)
+				log.Infof("network (%s) vpc (%s) not found", subnet.SubnetId, subnet.VPCId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 
-			networkLcuuid := common.GenerateUUID(subnet.SubnetId)
+			networkLcuuid := common.GenerateUUIDByOrgID(b.orgID, subnet.SubnetId)
 			retNetwork := model.Network{
 				Lcuuid:       networkLcuuid,
 				Name:         subnet.Name,
@@ -79,15 +78,14 @@ func (b *BaiduBce) getNetworks(
 				External:     false,
 				NetType:      common.NETWORK_TYPE_LAN,
 				AZLcuuid:     azLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			}
 			retNetworks = append(retNetworks, retNetwork)
 			networkIdToLcuuid[subnet.SubnetId] = networkLcuuid
 			b.azLcuuidToResourceNum[retNetwork.AZLcuuid]++
-			b.regionLcuuidToResourceNum[retNetwork.RegionLcuuid]++
 
 			retSubnet := model.Subnet{
-				Lcuuid:        common.GenerateUUID(networkLcuuid),
+				Lcuuid:        common.GenerateUUIDByOrgID(b.orgID, networkLcuuid),
 				Name:          subnet.Name,
 				CIDR:          subnet.Cidr,
 				NetworkLcuuid: networkLcuuid,
@@ -96,6 +94,6 @@ func (b *BaiduBce) getNetworks(
 			retSubnets = append(retSubnets, retSubnet)
 		}
 	}
-	log.Debug("Get networks complete")
+	log.Debug("Get networks complete", logger.NewORGPrefix(b.orgID))
 	return retNetworks, retSubnets, networkIdToLcuuid, nil
 }

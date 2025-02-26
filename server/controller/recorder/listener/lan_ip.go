@@ -18,37 +18,30 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/event"
-	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type LANIP struct {
-	cache         *cache.Cache
-	eventProducer *event.LANIP
+	cache *cache.Cache
 }
 
-func NewLANIP(c *cache.Cache, eq *queue.OverwriteQueue) *LANIP {
+func NewLANIP(c *cache.Cache) *LANIP {
 	listener := &LANIP{
-		cache:         c,
-		eventProducer: event.NewLANIP(c.ToolDataSet, eq),
+		cache: c,
 	}
 	return listener
 }
 
-func (i *LANIP) OnUpdaterAdded(addedDBItems []*mysql.LANIP) {
-	i.eventProducer.ProduceByAdd(addedDBItems)
+func (i *LANIP) OnUpdaterAdded(addedDBItems []*metadbmodel.LANIP) {
 	i.cache.AddLANIPs(addedDBItems)
 }
 
 func (i *LANIP) OnUpdaterUpdated(cloudItem *cloudmodel.IP, diffBase *diffbase.LANIP) {
-	i.eventProducer.ProduceByUpdate(cloudItem, diffBase)
 	diffBase.Update(cloudItem)
 }
 
 func (i *LANIP) OnUpdaterDeleted(lcuuids []string) {
-	i.eventProducer.ProduceByDelete(lcuuids)
 	i.cache.DeleteLANIPs(lcuuids)
 }

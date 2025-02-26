@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type NATGateway struct {
-	UpdaterBase[cloudmodel.NATGateway, mysql.NATGateway, *diffbase.NATGateway]
+	UpdaterBase[
+		cloudmodel.NATGateway,
+		*diffbase.NATGateway,
+		*metadbmodel.NATGateway,
+		metadbmodel.NATGateway,
+		*message.NATGatewayAdd,
+		message.NATGatewayAdd,
+		*message.NATGatewayUpdate,
+		message.NATGatewayUpdate,
+		*message.NATGatewayFieldsUpdate,
+		message.NATGatewayFieldsUpdate,
+		*message.NATGatewayDelete,
+		message.NATGatewayDelete]
 }
 
 func NewNATGateway(wholeCache *cache.Cache, cloudData []cloudmodel.NATGateway) *NATGateway {
 	updater := &NATGateway{
-		UpdaterBase[cloudmodel.NATGateway, mysql.NATGateway, *diffbase.NATGateway]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewNATGateway(),
-			diffBaseData: wholeCache.DiffBaseDataSet.NATGateways,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.NATGateway,
+			*diffbase.NATGateway,
+			*metadbmodel.NATGateway,
+			metadbmodel.NATGateway,
+			*message.NATGatewayAdd,
+			message.NATGatewayAdd,
+			*message.NATGatewayUpdate,
+			message.NATGatewayUpdate,
+			*message.NATGatewayFieldsUpdate,
+			message.NATGatewayFieldsUpdate,
+			*message.NATGatewayDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN,
+			wholeCache,
+			db.NewNATGateway().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.NATGateways,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,22 +73,22 @@ func (g *NATGateway) getDiffBaseByCloudItem(cloudItem *cloudmodel.NATGateway) (d
 	return
 }
 
-func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*mysql.NATGateway, bool) {
+func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*metadbmodel.NATGateway, bool) {
 	vpcID, exists := g.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN, cloudItem.VPCLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cloudItem.Lcuuid,
-		))
+		), g.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.NATGateway{
+	dbItem := &metadbmodel.NATGateway{
 		Name:        cloudItem.Name,
 		Label:       cloudItem.Label,
 		UID:         cloudItem.Label,
 		FloatingIPs: cloudItem.FloatingIPs,
-		Domain:      g.cache.DomainLcuuid,
+		Domain:      g.metadata.Domain.Lcuuid,
 		Region:      cloudItem.RegionLcuuid,
 		VPCID:       vpcID,
 	}
@@ -71,20 +96,21 @@ func (g *NATGateway) generateDBItemToAdd(cloudItem *cloudmodel.NATGateway) (*mys
 	return dbItem, true
 }
 
-func (g *NATGateway) generateUpdateInfo(diffBase *diffbase.NATGateway, cloudItem *cloudmodel.NATGateway) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (g *NATGateway) generateUpdateInfo(diffBase *diffbase.NATGateway, cloudItem *cloudmodel.NATGateway) (*message.NATGatewayFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.NATGatewayFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.FloatingIPs != cloudItem.FloatingIPs {
-		updateInfo["floating_ips"] = cloudItem.FloatingIPs
+		mapInfo["floating_ips"] = cloudItem.FloatingIPs
+		structInfo.FloatingIPs.Set(diffBase.FloatingIPs, cloudItem.FloatingIPs)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

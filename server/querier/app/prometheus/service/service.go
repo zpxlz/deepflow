@@ -34,8 +34,11 @@ import (
 
 var log = logging.MustGetLogger("prometheus")
 
-// equals defaultLookbackDelta in prometheus engine
-const defaultLookbackDelta = 5 * time.Minute
+const (
+	// equals defaultLookbackDelta in prometheus engine
+	defaultLookbackDelta          = 5 * time.Minute
+	defaultNoStepSubQueryInterval = 1 * time.Minute
+)
 
 type PrometheusService struct {
 	// keep only 1 instance of prometheus engine during server lifetime
@@ -53,7 +56,7 @@ func NewPrometheusService() *PrometheusService {
 		MaxSamples:               config.Cfg.Prometheus.MaxSamples,
 		LookbackDelta:            defaultLookbackDelta,
 		Timeout:                  100 * time.Second,
-		NoStepSubqueryIntervalFn: func(int64) int64 { return durationMilliseconds(1 * time.Minute) },
+		NoStepSubqueryIntervalFn: func(int64) int64 { return durationMilliseconds(defaultNoStepSubQueryInterval) },
 		EnableAtModifier:         true,
 		EnableNegativeOffset:     true,
 		EnablePerStepStats:       true,
@@ -65,11 +68,11 @@ func NewPrometheusService() *PrometheusService {
 	}
 }
 
-func (s *PrometheusService) PromRemoteReadService(req *prompb.ReadRequest, ctx context.Context, offloading bool) (resp *prompb.ReadResponse, err error) {
+func (s *PrometheusService) PromRemoteReadService(req *prompb.ReadRequest, ctx context.Context, offloading bool, orgID string) (resp *prompb.ReadResponse, err error) {
 	if offloading {
-		return s.executor.promRemoteReadOffloadingExecute(ctx, req)
+		return s.executor.promRemoteReadOffloadingExecute(ctx, req, orgID)
 	} else {
-		return s.executor.promRemoteReadExecute(ctx, req)
+		return s.executor.promRemoteReadExecute(ctx, req, orgID)
 	}
 }
 
@@ -97,8 +100,8 @@ func (s *PrometheusService) PromSeriesQueryService(args *model.PromQueryParams, 
 	return s.executor.series(ctx, args)
 }
 
-func (s *PrometheusService) PromQLAnalysis(ctx context.Context, metric string, targetLabels []string, appLabels []string, startTime string, endTime string) (*common.Result, error) {
-	return s.executor.promQLAnalysis(ctx, metric, targetLabels, appLabels, startTime, endTime)
+func (s *PrometheusService) PromQLAnalysis(ctx context.Context, metric string, targetLabels []string, appLabels []string, startTime string, endTime string, orgID string) (*common.Result, error) {
+	return s.executor.promQLAnalysis(ctx, metric, targetLabels, appLabels, startTime, endTime, orgID)
 }
 
 func (s *PrometheusService) PromQLAdapter(m *model.PromQueryResponse) *model.PromQueryWrapper {

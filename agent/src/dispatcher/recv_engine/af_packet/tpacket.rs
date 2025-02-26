@@ -19,28 +19,35 @@ use std::io;
 use std::mem;
 use std::net::Shutdown;
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::process;
 
 use libc::{
-    c_int, c_uint, c_void, getsockopt, mmap, munmap, off_t, poll, pollfd, setsockopt, size_t,
-    sockaddr, sockaddr_ll, socket, socklen_t, write, AF_PACKET, ETH_P_ALL, MAP_LOCKED,
-    MAP_NORESERVE, MAP_SHARED, POLLERR, POLLIN, PROT_READ, PROT_WRITE, SOL_PACKET, SOL_SOCKET,
-    SO_ATTACH_FILTER,
+    c_int, c_uint, c_void, getsockopt, mmap, munmap, off_t, packet_mreq, poll, pollfd, setsockopt,
+    size_t, sockaddr, sockaddr_ll, socket, socklen_t, write, AF_PACKET, ETH_P_ALL, MAP_LOCKED,
+    MAP_NORESERVE, MAP_SHARED, PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP, PACKET_MR_PROMISC,
+    POLLERR, POLLIN, PROT_READ, PROT_WRITE, SOL_PACKET, SOL_SOCKET, SO_ATTACH_FILTER,
 };
-use log::warn;
+use log::{info, warn};
 use public::error::*;
 use public::packet::Packet;
 use socket2::Socket;
 
 use super::{bpf, header, options};
 
+#[cfg(feature = "extended_observability")]
+use crate::ebpf::set_socket_fanout_ebpf;
+use crate::utils::environment::is_kernel_available;
 use crate::utils::stats;
 use public::utils::net::{self, link_by_name};
 
 const PACKET_VERSION: c_int = 10;
 const PACKET_RX_RING: c_int = 5;
+const PACKET_FANOUT: c_int = 18;
 const PACKET_STATISTICS: c_int = 6;
 const MILLI_SECONDS: u32 = 1000000;
-
+const MIN_KERNEL_VERSION_SUPPORT_PACKET_FANOUT: &'static str = "3.1";
+#[cfg(feature = "extended_observability")]
+const FANOUT_MODE_EBPF: u32 = 7;
 // https://www.ietf.org/archive/id/draft-gharris-opsawg-pcap-01.html
 const LINKTYPE_ETHERNET: c_int = 1;
 
@@ -127,19 +134,23 @@ impl Tpacket {
         Ok(())
     }
 
-    // TODO: 这里看起来不需要，golang版本未涉及该配置，后续有需要再添加
-    #[allow(dead_code)]
-    fn set_promisc(&self) -> Result<()> {
-        // 设置混杂模式
-
-        //raw_socket.set_flag(IFF_PROMISC as u64)?;
-
-        // TODO:
-        //let mut mreq: packet_mreq = std::mem::zeroed();
-        //mreq.mr_ifindex = interface.index as i32;
-        //mreq.mr_type = PACKET_MR_PROMISC as u16;
-
-        //raw_socket.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, (&mreq as *const packet_mreq) as *const libc::c_void);
+    pub fn set_promisc(&self, if_indices: &Vec<i32>, enabled: bool) -> Result<()> {
+        for i in if_indices {
+            let mreq = packet_mreq {
+                mr_type: PACKET_MR_PROMISC as u16,
+                mr_ifindex: *i,
+                mr_alen: 0,
+                mr_address: [0, 0, 0, 0, 0, 0, 0, 0],
+            };
+            let err = if enabled {
+                self.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+            } else {
+                self.setsockopt(SOL_PACKET, PACKET_DROP_MEMBERSHIP, mreq)
+            };
+            if err.is_err() {
+                warn!("Ifindex {} set promisc {} error: {:?}", i, enabled, err);
+            }
+        }
         Ok(())
     }
 
@@ -208,6 +219,31 @@ impl Tpacket {
         } else {
             Err(af_packet::Error::InvalidTpVersion(self.tp_version as isize))
         }
+    }
+
+    fn set_fanout(&self) -> af_packet::Result<()> {
+        // refer to https://man7.org/linux/man-pages/man7/packet.7.html
+        if !is_kernel_available(MIN_KERNEL_VERSION_SUPPORT_PACKET_FANOUT) {
+            info!("kernel version is lower than 3.1, skip the packet fanout setting");
+            return Ok(());
+        }
+        let Some(packet_fanout_mode) = self.opts.packet_fanout_mode else {
+            info!("Packet fanout disabled.");
+            return Ok(());
+        };
+        // The first 16 bits encode the fanout group ID, and the second set of 16 bits encode the fanout mode and options.
+        let fanout_group_id = process::id() & 0xffff;
+        let fanout_arg: c_uint = fanout_group_id | (packet_fanout_mode << 16);
+        self.setsockopt(SOL_PACKET, PACKET_FANOUT, fanout_arg)?;
+        #[cfg(feature = "extended_observability")]
+        if packet_fanout_mode == FANOUT_MODE_EBPF {
+            unsafe {
+                if set_socket_fanout_ebpf(self.raw_socket.as_raw_fd(), fanout_group_id as i32) < 0 {
+                    return Err(af_packet::Error::FanoutError("set FANOUT_MODE_EBPF failed"));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn mmap_ring(&mut self) -> af_packet::Result<()> {
@@ -390,6 +426,7 @@ impl Tpacket {
         tpacket.set_version()?;
         tpacket.set_ring()?;
         tpacket.mmap_ring()?;
+        tpacket.set_fanout()?;
         tpacket.set_bpf(vec![bpf::BpfSyntax::RetConstant(bpf::RetConstant {
             val: 0,
         })

@@ -20,12 +20,19 @@ import (
 	"sync"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type metricName struct {
+	org *common.ORG
+
 	nameToID sync.Map
 	idToName sync.Map
+}
+
+func newMetricName(org *common.ORG) *metricName {
+	return &metricName{org: org}
 }
 
 func (mn *metricName) Get() *sync.Map {
@@ -65,8 +72,8 @@ func (mn *metricName) refresh(args ...interface{}) error {
 	return nil
 }
 
-func (mn *metricName) load() ([]*mysql.PrometheusMetricName, error) {
-	var metricNames []*mysql.PrometheusMetricName
-	err := mysql.Db.Find(&metricNames).Error
+func (mn *metricName) load() ([]*metadbmodel.PrometheusMetricName, error) {
+	var metricNames []*metadbmodel.PrometheusMetricName
+	err := mn.org.DB.Find(&metricNames).Error
 	return metricNames, err
 }

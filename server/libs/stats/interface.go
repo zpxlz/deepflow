@@ -33,7 +33,8 @@ const (
 )
 
 const (
-	TICK_CYCLE = 10 * time.Second
+	TICK_COUNT = 10
+	TICK_CYCLE = TICK_COUNT * time.Second
 )
 
 type Option = interface{}
@@ -70,6 +71,10 @@ func SetDFRemote(addr string) {
 	setDFRemote(addr)
 }
 
+func GetDFRemote() string {
+	return dfRemote
+}
+
 // 指定远程服务器类型，默认influxdb
 func SetRemoteType(t RemoteType) {
 	remoteType = t
@@ -77,6 +82,10 @@ func SetRemoteType(t RemoteType) {
 
 func SetHostname(name string) {
 	setHostname(name)
+}
+
+func GetHostname() string {
+	return hostname
 }
 
 func SetProcessName(name string) {

@@ -21,25 +21,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBRedisInstance() *mysql.RedisInstance {
-	return &mysql.RedisInstance{Base: mysql.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
+func newDBRedisInstance() *metadbmodel.RedisInstance {
+	return &metadbmodel.RedisInstance{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
 }
 
 func (t *SuiteTest) TestAddRedisInstanceBatchSuccess() {
 	operator := NewRedisInstance()
 	itemToAdd := newDBRedisInstance()
 
-	_, ok := operator.AddBatch([]*mysql.RedisInstance{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.RedisInstance{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.RedisInstance
+	var addedItem *metadbmodel.RedisInstance
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Lcuuid, itemToAdd.Lcuuid)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.RedisInstance{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.RedisInstance{})
 }
 
 func (t *SuiteTest) TestUpdateRedisInstanceSuccess() {
@@ -52,11 +52,11 @@ func (t *SuiteTest) TestUpdateRedisInstanceSuccess() {
 	_, ok := operator.Update(addedItem.Lcuuid, updateInfo)
 	assert.True(t.T(), ok)
 
-	var updatedItem *mysql.RedisInstance
+	var updatedItem *metadbmodel.RedisInstance
 	t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&updatedItem)
 	assert.Equal(t.T(), updatedItem.Name, updateInfo["name"])
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.RedisInstance{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.RedisInstance{})
 }
 
 func (t *SuiteTest) TestDeleteRedisInstanceBatchSuccess() {
@@ -66,7 +66,7 @@ func (t *SuiteTest) TestDeleteRedisInstanceBatchSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.RedisInstance
+	var deletedItem *metadbmodel.RedisInstance
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }

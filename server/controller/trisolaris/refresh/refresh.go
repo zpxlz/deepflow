@@ -19,17 +19,18 @@ package refresh
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"time"
 
-	"github.com/op/go-logging"
 	"gorm.io/gorm"
 
 	"github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/refresh")
+var log = logger.MustGetLogger("trisolaris.refresh")
 
 type RefreshOP struct {
 	db               *gorm.DB
@@ -51,20 +52,22 @@ func NewRefreshOP(db *gorm.DB, nodeIP string) *RefreshOP {
 
 var urlFormat = "http://%s:%d/v1/caches/?"
 
-func RefreshCache(dataTypes []common.DataChanged) {
+// orgid equal to 0 means refreshing all organization data
+func RefreshCache(orgID int, dataTypes []common.DataChanged) {
 	if refreshOP != nil {
-		go refreshOP.refreshCache(dataTypes)
+		go refreshOP.refreshCache(orgID, dataTypes)
 	}
 }
 
-func (r *RefreshOP) refreshCache(dataTypes []common.DataChanged) {
+func (r *RefreshOP) refreshCache(orgID int, dataTypes []common.DataChanged) {
 	localControllerIPs := r.localRefreshIPs
 	remoteControllerIPs := r.remoteRefreshIPs
 	if len(dataTypes) == 0 || (len(localControllerIPs) == 0 && len(remoteControllerIPs) == 0) {
 		return
 	}
-	log.Infof("refresh cache for trisolaris(%v %v)", localControllerIPs, remoteControllerIPs)
+	log.Infof("refresh cache for trisolaris(%v %v), orgID(%d), dataTypes(%v)", localControllerIPs, remoteControllerIPs, orgID, dataTypes)
 	params := url.Values{}
+	params.Add("org_id", strconv.Itoa(orgID))
 	for _, dataType := range dataTypes {
 		params.Add("type", string(dataType))
 	}
@@ -96,7 +99,7 @@ func (r *RefreshOP) refreshCache(dataTypes []common.DataChanged) {
 }
 
 func (r *RefreshOP) generateRefreshIPs() {
-	dbControllers, err := dbmgr.DBMgr[models.Controller](r.db).Gets()
+	dbControllers, err := dbmgr.DBMgr[metadbmodel.Controller](r.db).Gets()
 	if err != nil {
 		log.Error(err)
 		return
@@ -107,7 +110,7 @@ func (r *RefreshOP) generateRefreshIPs() {
 
 	controllerIPToRegion := make(map[string]string)
 	var localRegion string
-	azCons, _ := dbmgr.DBMgr[models.AZControllerConnection](r.db).Gets()
+	azCons, _ := dbmgr.DBMgr[metadbmodel.AZControllerConnection](r.db).Gets()
 	for _, azCon := range azCons {
 		if azCon.ControllerIP == r.nodeIP {
 			localRegion = azCon.Region

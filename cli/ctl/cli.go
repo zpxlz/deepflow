@@ -42,6 +42,7 @@ func Execute(version string) {
 	root.PersistentFlags().Uint32P("api-port", "", 30417, "deepflow-server service node port")
 	root.PersistentFlags().Uint32P("rpc-port", "", 30035, "deepflow-server service grpc port")
 	root.PersistentFlags().Uint32P("svc-port", "", 20417, "deepflow-server service http port")
+	root.PersistentFlags().Uint32P("org-id", "", common.DEFAULT_ORG_ID, "organization id")
 	root.PersistentFlags().DurationP("timeout", "", time.Second*30, "deepflow-ctl timeout")
 	root.ParseFlags(os.Args[1:])
 
@@ -65,8 +66,9 @@ func Execute(version string) {
 	root.AddCommand(RegisterServerCommand())
 	root.AddCommand(RegisterRepoCommand())
 	root.AddCommand(RegisterPluginCommand())
-	root.AddCommand(RegisterPrometheusCacheCommand())
+	root.AddCommand(RegisterPrometheusCommand())
 	root.AddCommand(RegisterPromQLCommand())
+	root.AddCommand(AgentCheckRegisterCommand())
 
 	cmd.RegisterIngesterCommand(root)
 

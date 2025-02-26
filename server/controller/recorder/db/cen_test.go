@@ -21,25 +21,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBCEN() *mysql.CEN {
-	return &mysql.CEN{Base: mysql.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
+func newDBCEN() *metadbmodel.CEN {
+	return &metadbmodel.CEN{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
 }
 
 func (t *SuiteTest) TestAddCENBatchSuccess() {
 	operator := NewCEN()
 	itemToAdd := newDBCEN()
 
-	_, ok := operator.AddBatch([]*mysql.CEN{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.CEN{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.CEN
+	var addedItem *metadbmodel.CEN
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Lcuuid, itemToAdd.Lcuuid)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.CEN{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.CEN{})
 }
 
 func (t *SuiteTest) TestUpdateCENSuccess() {
@@ -52,11 +52,11 @@ func (t *SuiteTest) TestUpdateCENSuccess() {
 	_, ok := operator.Update(addedItem.Lcuuid, updateInfo)
 	assert.True(t.T(), ok)
 
-	var updatedItem *mysql.CEN
+	var updatedItem *metadbmodel.CEN
 	t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&updatedItem)
 	assert.Equal(t.T(), updatedItem.Name, updateInfo["name"])
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.CEN{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.CEN{})
 }
 
 func (t *SuiteTest) TestDeleteCENBatchSuccess() {
@@ -66,27 +66,27 @@ func (t *SuiteTest) TestDeleteCENBatchSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.CEN
+	var deletedItem *metadbmodel.CEN
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }
 
 func (t *SuiteTest) TestCENCreateAndFind() {
 	lcuuid := uuid.New().String()
-	cen := &mysql.CEN{
-		Base: mysql.Base{Lcuuid: lcuuid},
+	cen := &metadbmodel.CEN{
+		Base: metadbmodel.Base{Lcuuid: lcuuid},
 	}
 	t.db.Create(cen)
-	var resultCEN *mysql.CEN
+	var resultCEN *metadbmodel.CEN
 	err := t.db.Where("lcuuid = ? and name='' and label='' and alias='' and epc_ids=''", lcuuid).First(&resultCEN).Error
 	assert.Equal(t.T(), nil, err)
 	assert.Equal(t.T(), cen.Base.Lcuuid, resultCEN.Base.Lcuuid)
 
-	resultCEN = new(mysql.CEN)
+	resultCEN = new(metadbmodel.CEN)
 	t.db.Where("lcuuid = ?", lcuuid).Find(&resultCEN)
 	assert.Equal(t.T(), cen.Base.Lcuuid, resultCEN.Base.Lcuuid)
 
-	resultCEN = new(mysql.CEN)
+	resultCEN = new(metadbmodel.CEN)
 	result := t.db.Where("lcuuid = ? and name = null", lcuuid).Find(&resultCEN)
 	assert.Equal(t.T(), nil, result.Error)
 	assert.Equal(t.T(), int64(0), result.RowsAffected)

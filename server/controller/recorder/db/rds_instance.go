@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type RDSInstance struct {
-	OperatorBase[mysql.RDSInstance]
+	OperatorBase[*metadbmodel.RDSInstance, metadbmodel.RDSInstance]
 }
 
 func NewRDSInstance() *RDSInstance {
 	operater := &RDSInstance{
-		OperatorBase[mysql.RDSInstance]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.RDSInstance](
+			ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *RDSInstance) setDBItemID(dbItem *mysql.RDSInstance, id int) {
-	dbItem.ID = id
 }

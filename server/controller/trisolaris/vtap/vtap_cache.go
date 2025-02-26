@@ -17,6 +17,8 @@
 package vtap
 
 import (
+	"bytes"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -27,20 +29,24 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/golang/protobuf/proto"
+	"github.com/mohae/deepcopy"
+	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
 
+	"github.com/deepflowio/deepflow/message/agent"
 	"github.com/deepflowio/deepflow/message/trident"
+	"github.com/deepflowio/deepflow/server/agent_config"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
-	cmodel "github.com/deepflowio/deepflow/server/controller/model"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata"
+	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata/agentmetadata"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils/atomicbool"
 )
 
 type VTapConfig struct {
-	models.RVTapGroupConfiguration
+	agent_config.AgentGroupConfigModel
 	ConvertedL4LogTapTypes       []uint32
 	ConvertedL4LogIgnoreTapSides []uint32
 	ConvertedL7LogIgnoreTapSides []uint32
@@ -50,53 +56,73 @@ type VTapConfig struct {
 	ConvertedWasmPlugins         []string
 	ConvertedSoPlugins           []string
 	PluginNewUpdateTime          uint32
+	UserConfig                   *viper.Viper
+}
+
+func (f *VTapConfig) GetUserConfig() string {
+	b, err := yaml.Marshal(f.UserConfig.AllSettings())
+	if err != nil {
+		log.Error(err)
+		return ""
+	}
+	return string(b)
 }
 
 func (f *VTapConfig) convertData() {
 	var err error
-	f.ConvertedL4LogTapTypes, err = ConvertStrToU32List(f.L4LogTapTypes)
-	if err != nil {
-		log.Error(err)
+	if f.L4LogTapTypes != nil {
+		f.ConvertedL4LogTapTypes, err = ConvertStrToU32List(*f.L4LogTapTypes)
+		if err != nil {
+			log.Error(err)
+		}
 	}
-	f.ConvertedL4LogIgnoreTapSides, err = ConvertStrToU32List(f.L4LogIgnoreTapSides)
-	if err != nil {
-		log.Error(err)
+	if f.L4LogIgnoreTapSides != nil {
+		f.ConvertedL4LogIgnoreTapSides, err = ConvertStrToU32List(*f.L4LogIgnoreTapSides)
+		if err != nil {
+			log.Error(err)
+		}
 	}
-	f.ConvertedL7LogIgnoreTapSides, err = ConvertStrToU32List(f.L7LogIgnoreTapSides)
-	if err != nil {
-		log.Error(err)
+	if f.L7LogIgnoreTapSides != nil {
+		f.ConvertedL7LogIgnoreTapSides, err = ConvertStrToU32List(*f.L7LogIgnoreTapSides)
+		if err != nil {
+			log.Error(err)
+		}
 	}
-	f.ConvertedL7LogStoreTapTypes, err = ConvertStrToU32List(f.L7LogStoreTapTypes)
-	if err != nil {
-		log.Error(err)
+	if f.L7LogStoreTapTypes != nil {
+		f.ConvertedL7LogStoreTapTypes, err = ConvertStrToU32List(*f.L7LogStoreTapTypes)
+		if err != nil {
+			log.Error(err)
+		}
 	}
-	f.ConvertedDecapType, err = ConvertStrToU32List(f.DecapType)
-	if err != nil {
-		log.Error(err)
+	if f.DecapType != nil {
+		f.ConvertedDecapType, err = ConvertStrToU32List(*f.DecapType)
+		if err != nil {
+			log.Error(err)
+		}
 	}
-	if len(f.Domains) != 0 {
-		f.ConvertedDomains = strings.Split(f.Domains, ",")
+	if f.Domains != nil && len(*f.Domains) != 0 {
+		f.ConvertedDomains = strings.Split(*f.Domains, ",")
 	}
 	sort.Strings(f.ConvertedDomains)
 
-	if len(f.WasmPlugins) != 0 {
-		f.ConvertedWasmPlugins = strings.Split(f.WasmPlugins, ",")
+	if f.WasmPlugins != nil && len(*f.WasmPlugins) != 0 {
+		f.ConvertedWasmPlugins = strings.Split(*f.WasmPlugins, ",")
 	}
-	if len(f.SoPlugins) != 0 {
-		f.ConvertedSoPlugins = strings.Split(f.SoPlugins, ",")
+	if f.SoPlugins != nil && len(*f.SoPlugins) != 0 {
+		f.ConvertedSoPlugins = strings.Split(*f.SoPlugins, ",")
 	}
 
-	if f.HTTPLogProxyClient == SHUT_DOWN_STR {
-		f.HTTPLogProxyClient = ""
+	if f.HTTPLogProxyClient != nil && *f.HTTPLogProxyClient == SHUT_DOWN_STR {
+		f.HTTPLogProxyClient = proto.String("")
 	}
-	if f.HTTPLogTraceID == SHUT_DOWN_STR {
-		f.HTTPLogTraceID = ""
+	if f.HTTPLogTraceID != nil && *f.HTTPLogTraceID == SHUT_DOWN_STR {
+		f.HTTPLogTraceID = proto.String("")
 	}
-	if f.HTTPLogSpanID == SHUT_DOWN_STR {
-		f.HTTPLogSpanID = ""
+	if f.HTTPLogSpanID != nil && *f.HTTPLogSpanID == SHUT_DOWN_STR {
+		f.HTTPLogSpanID = proto.String("")
 	}
-	if f.HTTPLogXRequestID == SHUT_DOWN_STR {
-		f.HTTPLogXRequestID = ""
+	if f.HTTPLogXRequestID != nil && *f.HTTPLogXRequestID == SHUT_DOWN_STR {
+		f.HTTPLogXRequestID = proto.String("")
 	}
 	if Find[uint32](f.ConvertedL4LogTapTypes, SHUT_DOWN_UINT) {
 		f.ConvertedL4LogTapTypes = []uint32{}
@@ -106,27 +132,49 @@ func (f *VTapConfig) convertData() {
 	}
 }
 
-func (f *VTapConfig) modifyConfig(v *VTapInfo) {
-	for _, plugin := range f.ConvertedWasmPlugins {
-		if updateTime, ok := v.pluginNameToUpdateTime[plugin]; ok {
-			if f.PluginNewUpdateTime < updateTime {
-				f.PluginNewUpdateTime = updateTime
-			}
-		}
+func (f *VTapConfig) modifyUserConfig(c *VTapCache) {
+	if f.UserConfig == nil {
+		log.Error("vtap configure is nil")
+		return
 	}
-
-	for _, plugin := range f.ConvertedSoPlugins {
-		if updateTime, ok := v.pluginNameToUpdateTime[plugin]; ok {
-			if f.PluginNewUpdateTime < updateTime {
-				f.PluginNewUpdateTime = updateTime
-			}
-		}
+	if !f.UserConfig.IsSet(CONFIG_KEY_PROXY_CONTROLLER_IP) {
+		f.UserConfig.Set(CONFIG_KEY_PROXY_CONTROLLER_IP, c.GetControllerIP())
 	}
+	if !f.UserConfig.IsSet(CONFIG_KEY_INGESTER_IP) {
+		f.UserConfig.Set(CONFIG_KEY_INGESTER_IP, c.GetTSDBIP())
+	}
+	domainFilters := f.UserConfig.GetStringSlice(CONFIG_KEY_DOMAIN_FILTER)
+	if len(domainFilters) > 0 {
+		sort.Strings(domainFilters)
+	} else {
+		domainFilters = []string{"0"}
+	}
+	f.UserConfig.Set(CONFIG_KEY_DOMAIN_FILTER, domainFilters)
 }
 
-func NewVTapConfig(config *models.RVTapGroupConfiguration) *VTapConfig {
+func (f *VTapConfig) getDomainFilters() []string {
+	if f.UserConfig == nil {
+		return nil
+	}
+	return f.UserConfig.GetStringSlice(CONFIG_KEY_DOMAIN_FILTER)
+}
+
+func (f *VTapConfig) getPodClusterInternalIP() bool {
+	if f.UserConfig == nil {
+		return true
+	}
+
+	return f.UserConfig.GetBool("inputs.resources.pull_resource_from_controller.only_kubernetes_pod_ip_in_local_cluster")
+}
+
+func NewVTapConfig(agentConfigYaml string) *VTapConfig {
 	vTapConfig := &VTapConfig{}
-	vTapConfig.RVTapGroupConfiguration = *config
+	v := viper.New()
+	v.SetConfigType("yaml")
+	if err := v.ReadConfig(bytes.NewBufferString(agentConfigYaml)); err != nil {
+		log.Error(err)
+	}
+	vTapConfig.UserConfig = v
 	vTapConfig.convertData()
 	return vTapConfig
 }
@@ -134,6 +182,7 @@ func NewVTapConfig(config *models.RVTapGroupConfiguration) *VTapConfig {
 type VTapCache struct {
 	id                 int
 	name               *string
+	rawHostname        *string
 	state              int
 	enable             int
 	vTapType           int
@@ -160,8 +209,11 @@ type VTapCache struct {
 	os                 *string
 	kernelVersion      *string
 	processName        *string
+	currentK8sImage    *string
 	licenseType        int
 	tapMode            int
+	teamID             int
+	organizeID         int
 	lcuuid             *string
 	licenseFunctions   *string
 	licenseFunctionSet mapset.Set
@@ -173,6 +225,7 @@ type VTapCache struct {
 	enabledFunctionMonitoring    atomicbool.Bool
 	enabledApplicationMonitoring atomicbool.Bool
 	enabledIndicatorMonitoring   atomicbool.Bool
+	enabledLogMonitoring         atomicbool.Bool
 
 	cachedAt         time.Time
 	expectedRevision *string
@@ -190,6 +243,10 @@ type VTapCache struct {
 	localSegments  []*trident.Segment
 	remoteSegments []*trident.Segment
 
+	// agent segments
+	agentLocalSegments  []*agent.Segment
+	agentRemoteSegments []*agent.Segment
+
 	// vtap version
 	pushVersionPlatformData uint64
 	pushVersionPolicy       uint64
@@ -203,12 +260,39 @@ type VTapCache struct {
 	VPCID int
 	// vtap platform data
 	PlatformData *atomic.Value //*PlatformData
+	// new agent  platform data
+	AgentPlatformData *atomic.Value //*agentmetadata.PlatformData
+
+	vTapInfo *VTapInfo
 }
 
-func NewVTapCache(vtap *models.VTap) *VTapCache {
+func (c *VTapCache) String() string {
+	return fmt.Sprintf(
+		"{id: %d, name: %s, rawHostname: %s, state: %d, enable: %d, vTapType: %d, "+
+			"ctrlIP:%s, ctrlMac:%s, tsdbIP: %s, curTSDBIP: %s, controllerIP: %s, "+
+			"curControllerIP: %s, launchServer: %s, launchServerID: %d, syncedControllerAt: %s, "+
+			"syncedTSDBAt: %s, bootTime: %d, exceptions: %d, vTapGroupLcuuid: %s, licenseType: %d, "+
+			"tapMode: %d, teamID: %d, organizeID: %d, licenseFunctionSet: %v, enabledTrafficDistribution: %v, "+
+			"enabledNetworkMonitoring: %v, enabledCallMonitoring: %v, enabledFunctionMonitoring: %v, "+
+			"enabledApplicationMonitoring: %v, enabledIndicatorMonitoring: %v, enabledLogMonitoring: %v, "+
+			"podDomains: %v, pushVersionPlatformData: %d, pushVersionPolicy: %d, pushVersionGroups: %d, "+
+			"expectedRevision: %s, upgradePackage: %s, podClusterID: %d, VPCID: %d}",
+		c.GetVTapID(), c.GetVTapHost(), c.GetVTapRawHostname(), c.state, c.enable, c.vTapType,
+		c.GetCtrlIP(), c.GetCtrlMac(), c.GetTSDBIP(), c.GetCurTSDBIP(), c.GetControllerIP(),
+		c.GetCurControllerIP(), c.GetLaunchServer(), c.GetLaunchServerID(), c.GetSyncedControllerAt(),
+		c.GetSyncedTSDBAt(), c.GetBootTime(), c.GetExceptions(), c.GetVTapGroupLcuuid(), c.licenseType,
+		c.tapMode, c.teamID, c.organizeID, c.licenseFunctionSet.ToSlice(), c.EnabledTrafficDistribution(),
+		c.EnabledNetworkMonitoring(), c.EnabledCallMonitoring(), c.EnabledFunctionMonitoring(),
+		c.EnabledApplicationMonitoring(), c.EnabledIndicatorMonitoring(), c.EnabledLogMonitoring(),
+		c.podDomains, c.pushVersionPlatformData, c.pushVersionPolicy, c.pushVersionGroups,
+		c.GetExpectedRevision(), c.GetUpgradePackage(), c.podClusterID, c.VPCID)
+}
+
+func NewVTapCache(vtap *metadbmodel.VTap, vTapInfo *VTapInfo) *VTapCache {
 	vTapCache := &VTapCache{}
 	vTapCache.id = vtap.ID
 	vTapCache.name = proto.String(vtap.Name)
+	vTapCache.rawHostname = proto.String(vtap.RawHostname)
 	vTapCache.state = vtap.State
 	vTapCache.enable = vtap.Enable
 	vTapCache.vTapType = vtap.Type
@@ -238,8 +322,11 @@ func NewVTapCache(vtap *models.VTap) *VTapCache {
 	vTapCache.os = proto.String(vtap.Os)
 	vTapCache.kernelVersion = proto.String(vtap.KernelVersion)
 	vTapCache.processName = proto.String(vtap.ProcessName)
+	vTapCache.currentK8sImage = proto.String(vtap.CurrentK8sImage)
 	vTapCache.licenseType = vtap.LicenseType
 	vTapCache.tapMode = vtap.TapMode
+	vTapCache.teamID = vtap.TeamID
+	vTapCache.organizeID = vTapInfo.GetORGID()
 	vTapCache.lcuuid = proto.String(vtap.Lcuuid)
 	vTapCache.licenseFunctions = proto.String(vtap.LicenseFunctions)
 	vTapCache.licenseFunctionSet = mapset.NewSet()
@@ -249,12 +336,17 @@ func NewVTapCache(vtap *models.VTap) *VTapCache {
 	vTapCache.enabledFunctionMonitoring = atomicbool.NewBool(false)
 	vTapCache.enabledApplicationMonitoring = atomicbool.NewBool(false)
 	vTapCache.enabledIndicatorMonitoring = atomicbool.NewBool(false)
+	vTapCache.enabledLogMonitoring = atomicbool.NewBool(false)
 
 	vTapCache.cachedAt = time.Now()
 	vTapCache.config = &atomic.Value{}
 	vTapCache.podDomains = []string{}
 	vTapCache.localSegments = []*trident.Segment{}
 	vTapCache.remoteSegments = []*trident.Segment{}
+
+	vTapCache.agentLocalSegments = []*agent.Segment{}
+	vTapCache.agentRemoteSegments = []*agent.Segment{}
+
 	vTapCache.pushVersionPlatformData = 0
 	vTapCache.pushVersionPolicy = 0
 	vTapCache.pushVersionGroups = 0
@@ -263,8 +355,10 @@ func NewVTapCache(vtap *models.VTap) *VTapCache {
 	vTapCache.podClusterID = 0
 	vTapCache.VPCID = 0
 	vTapCache.PlatformData = &atomic.Value{}
+	vTapCache.AgentPlatformData = &atomic.Value{}
 	vTapCache.expectedRevision = proto.String(vtap.ExpectedRevision)
 	vTapCache.upgradePackage = proto.String(vtap.UpgradePackage)
+	vTapCache.vTapInfo = vTapInfo
 	vTapCache.convertLicenseFunctions()
 	return vTapCache
 }
@@ -294,18 +388,20 @@ func (c *VTapCache) unsetLicenseFunctionEnable() {
 	c.enabledFunctionMonitoring.Unset()
 	c.enabledApplicationMonitoring.Unset()
 	c.enabledIndicatorMonitoring.Unset()
+	c.enabledLogMonitoring.Unset()
 }
 
 func (c *VTapCache) convertLicenseFunctions() {
+	v := c.vTapInfo
 	c.unsetLicenseFunctionEnable()
 	if c.licenseFunctions == nil || *c.licenseFunctions == "" {
 		c.licenseFunctionSet = mapset.NewSet()
-		log.Warningf("vtap(%s) no license functions", c.GetKey())
+		log.Warningf(v.Logf("vtap(%s) no license functions", c.GetKey()))
 		return
 	}
 	licenseFunctionsInt, err := ConvertStrToIntList(*c.licenseFunctions)
 	if err != nil {
-		log.Errorf("convert licence functions failed err :%s", err)
+		log.Errorf(v.Logf("convert licence functions failed err :%s", err))
 		return
 	}
 
@@ -316,6 +412,9 @@ func (c *VTapCache) convertLicenseFunctions() {
 	c.licenseFunctionSet = functionSet
 
 	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_CALL_MONITORING) {
+		c.enabledCallMonitoring.Set()
+	}
+	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_DATABASE_MONITORING) {
 		c.enabledCallMonitoring.Set()
 	}
 	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_NETWORK_MONITORING) {
@@ -330,6 +429,9 @@ func (c *VTapCache) convertLicenseFunctions() {
 	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_APPLICATION_MONITORING) {
 		c.enabledApplicationMonitoring.Set()
 	}
+	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_LOG_MONITORING) {
+		c.enabledLogMonitoring.Set()
+	}
 	if Find[int](licenseFunctionsInt, VTAP_LICENSE_FUNCTION_INDICATOR_MONITORING) {
 		c.enabledIndicatorMonitoring.Set()
 	}
@@ -340,82 +442,57 @@ func (c *VTapCache) GetLocalConfig() string {
 	if configure == nil {
 		return ""
 	}
+	if configure.YamlConfig == nil {
+		return ""
+	}
 
-	return configure.YamlConfig
+	return *configure.YamlConfig
 }
 
 var NetWorkL7ProtocolEnabled = []string{"HTTP", "DNS"}
 
 func (c *VTapCache) modifyVTapConfigByLicense(configure *VTapConfig) {
-	if configure == nil {
+	if configure == nil || configure.UserConfig == nil {
+		log.Error("vtap configure is nil")
 		return
 	}
-	if c.EnabledCallMonitoring() == false &&
-		c.EnabledNetworkMonitoring() == false {
-		configure.L7MetricsEnabled = DISABLED
-		configure.ConvertedL7LogStoreTapTypes = nil
+	if c.EnabledCallMonitoring() == false && c.EnabledNetworkMonitoring() == false {
+		configure.UserConfig.Set("outputs.flow_metrics.filters.apm_metrics", false)
+		configure.UserConfig.Set("outputs.flow_log.filters.l7_capture_network_types", []int{-1})
 	}
 
 	if c.EnabledNetworkMonitoring() == false {
-		configure.L4PerformanceEnabled = DISABLED
-		configure.ConvertedL4LogTapTypes = nil
+		configure.UserConfig.Set("outputs.flow_metrics.filters.npm_metrics", false)
+		configure.UserConfig.Set("outputs.flow_log.filters.l4_capture_network_types", []int{-1})
 	}
 
-	// modify static config
-	yamlConfig := &cmodel.StaticConfig{}
-	err := yaml.Unmarshal([]byte(configure.YamlConfig), yamlConfig)
-	if err != nil {
-		log.Error(err)
-		return
-	}
-
-	if c.EnabledNetworkMonitoring() == true &&
-		c.EnabledCallMonitoring() == false {
-		yamlConfig.L7ProtocolEnabled = NetWorkL7ProtocolEnabled
-	} else if c.EnabledNetworkMonitoring() == false &&
-		c.EnabledCallMonitoring() == false {
-		yamlConfig.L7ProtocolEnabled = nil
+	if c.EnabledNetworkMonitoring() == true && c.EnabledCallMonitoring() == false {
+		configure.UserConfig.Set("processors.request_log.application_protocol_inference.enabled_protocols", NetWorkL7ProtocolEnabled)
+	} else if c.EnabledNetworkMonitoring() == false && c.EnabledCallMonitoring() == false {
+		configure.UserConfig.Set("processors.request_log.application_protocol_inference.enabled_protocols", []string{})
 	}
 
 	if c.EnabledCallMonitoring() == false {
-		if yamlConfig.Ebpf == nil {
-			yamlConfig.Ebpf = &cmodel.EbpfConfig{
-				Disabled: proto.Bool(true),
-			}
-		} else {
-			yamlConfig.Ebpf.Disabled = proto.Bool(true)
-		}
+		configure.UserConfig.Set("inputs.ebpf.disabled", true)
+		configure.UserConfig.Set("inputs.ebpf.file.io_event.collect_mode", 0)
 	}
 
 	if c.EnabledFunctionMonitoring() == false {
-		if yamlConfig.Ebpf == nil {
-			yamlConfig.Ebpf = &cmodel.EbpfConfig{}
-		}
-		if yamlConfig.Ebpf.OnCpuProfile == nil {
-			yamlConfig.Ebpf.OnCpuProfile = &cmodel.OnCpuProfile{
-				Disabled: proto.Bool(true),
-			}
-		} else {
-			yamlConfig.Ebpf.OnCpuProfile.Disabled = proto.Bool(true)
-		}
-
-		yamlConfig.ExternalProfileIntegrationDisabled = proto.Bool(true)
+		configure.UserConfig.Set("inputs.ebpf.profile.on_cpu.disabled", true)
+		configure.UserConfig.Set("inputs.ebpf.profile.off_cpu.disabled", true)
+		configure.UserConfig.Set("inputs.integration.feature_control.profile_integration_disabled", true)
 	}
 
 	if c.EnabledApplicationMonitoring() == false {
-		yamlConfig.ExternalTraceIntegrationDisabled = proto.Bool(true)
+		configure.UserConfig.Set("inputs.integration.feature_control.trace_integration_disabled", true)
 	}
 
 	if c.EnabledIndicatorMonitoring() == false {
-		yamlConfig.ExternalMetricIntegrationDisabled = proto.Bool(true)
+		configure.UserConfig.Set("inputs.integration.feature_control.metric_integration_disabled", true)
 	}
-
-	b, err := yaml.Marshal(yamlConfig)
-	if err != nil {
-		log.Error(err)
-		return
+	if c.EnabledLogMonitoring() == false {
+		configure.UserConfig.Set("inputs.integration.feature_control.log_integration_disabled", true)
 	}
-	configure.YamlConfig = string(b)
 }
 
 func (c *VTapCache) EnabledCallMonitoring() bool {
@@ -440,6 +517,10 @@ func (c *VTapCache) EnabledApplicationMonitoring() bool {
 
 func (c *VTapCache) EnabledIndicatorMonitoring() bool {
 	return c.enabledIndicatorMonitoring.IsSet()
+}
+
+func (c *VTapCache) EnabledLogMonitoring() bool {
+	return c.enabledLogMonitoring.IsSet()
 }
 
 func (c *VTapCache) updateLicenseFunctions(licenseFunctions string) {
@@ -491,6 +572,22 @@ func (c *VTapCache) GetSimplePlatformDataStr() []byte {
 	return platformData.GetPlatformDataStr()
 }
 
+func (c *VTapCache) GetAgentPlatformDataVersion() uint64 {
+	platformData := c.GetAgentPlatformData()
+	if platformData == nil {
+		return 0
+	}
+	return platformData.GetVersion()
+}
+
+func (c *VTapCache) GetAgentPlatformDataStr() []byte {
+	platformData := c.GetAgentPlatformData()
+	if platformData == nil {
+		return nil
+	}
+	return platformData.GetPlatformDataStr()
+}
+
 func (c *VTapCache) GetVTapID() uint32 {
 	return uint32(c.id)
 }
@@ -518,13 +615,39 @@ func (c *VTapCache) GetVTapHost() string {
 	return ""
 }
 
+func (c *VTapCache) GetVTapRawHostname() string {
+	if c.rawHostname != nil {
+		return *c.rawHostname
+	}
+	return ""
+
+}
+
+func (c *VTapCache) UpdateVTapRawHostname(name string) {
+	if name != "" {
+		c.rawHostname = &name
+	}
+}
+
 func (c *VTapCache) GetConfigSyncInterval() int {
 	config := c.GetVTapConfig()
 	if config == nil {
 		return DefaultSyncInterval
 	}
+	if config.SyncInterval == nil {
+		return DefaultSyncInterval
+	}
 
-	return config.SyncInterval
+	return *config.SyncInterval
+}
+
+func (c *VTapCache) GetUserConfig() string {
+	config := c.GetVTapConfig()
+	if config == nil {
+		return ""
+	}
+
+	return config.GetUserConfig()
 }
 
 func (c *VTapCache) updateVTapHost(host string) {
@@ -612,12 +735,7 @@ func (c *VTapCache) GetLaunchServer() string {
 
 var regV = regexp.MustCompile("B_LC_RELEASE_v6_[12]")
 
-func (c *VTapCache) GetExternalAgentHTTPProxyEnabledConfig(v *VTapInfo) int {
-	if enabled, ok := v.vtapGroupLcuuidToEAHPEnabled[c.GetVTapGroupLcuuid()]; ok {
-		if enabled != nil {
-			return *enabled
-		}
-	}
+func (c *VTapCache) GetExternalAgentHTTPProxyEnabledConfig() int {
 	if regV.MatchString(c.GetRevision()) {
 		return 0
 	}
@@ -626,8 +744,11 @@ func (c *VTapCache) GetExternalAgentHTTPProxyEnabledConfig(v *VTapInfo) int {
 	if config == nil {
 		return 0
 	}
+	if config.ExternalAgentHTTPProxyEnabled == nil {
+		return 0
+	}
 
-	return config.ExternalAgentHTTPProxyEnabled
+	return *config.ExternalAgentHTTPProxyEnabled
 }
 
 func (c *VTapCache) UpdateLaunchServer(launcherServer string) {
@@ -774,12 +895,39 @@ func (c *VTapCache) updateProcessName(processName string) {
 	c.processName = &processName
 }
 
+func (c *VTapCache) GetCurrentK8SImage() string {
+	if c.currentK8sImage != nil {
+		return *c.currentK8sImage
+	}
+	return ""
+}
+
+func (c *VTapCache) updateCurrentK8SImage(currentK8sImage string) {
+	c.currentK8sImage = &currentK8sImage
+}
+
 func (c *VTapCache) GetTapMode() int {
 	return c.tapMode
 }
 
 func (c *VTapCache) updateTapMode(tapMode int) {
 	c.tapMode = tapMode
+}
+
+func (c *VTapCache) GetTeamID() int {
+	return c.teamID
+}
+
+func (c *VTapCache) updateTeamID(teamID int) {
+	c.teamID = teamID
+}
+
+func (c *VTapCache) updateOrganizeID(organizeID int) {
+	c.organizeID = organizeID
+}
+
+func (c *VTapCache) GetOrganizeID() int {
+	return c.organizeID
 }
 
 func (c *VTapCache) UpdateRevision(revision string) {
@@ -836,13 +984,14 @@ func (c *VTapCache) GetExceptions() int64 {
 
 // 只更新采集器返回的异常，控制器异常不用更新，由控制器处理其异常
 func (c *VTapCache) UpdateExceptions(exceptions int64) {
-	log.Infof(
+	v := c.vTapInfo
+	log.Infof(v.Logf(
 		"modify vtap(%s) exception %d to %d",
-		c.GetVTapHost(), c.GetExceptions(), exceptions)
+		c.GetVTapHost(), c.GetExceptions(), exceptions))
 	atomic.StoreInt64(&c.exceptions, int64(exceptions))
 }
 
-func (c *VTapCache) UpdateSystemInfoFromGrpc(cpuNum int, memorySize int64, arch, os, kernelVersion, processName string) {
+func (c *VTapCache) UpdateSystemInfoFromGrpc(cpuNum int, memorySize int64, arch, os, kernelVersion, processName, currentK8sImage string) {
 	if cpuNum != 0 {
 		c.updateCPUNum(cpuNum)
 	}
@@ -861,31 +1010,37 @@ func (c *VTapCache) UpdateSystemInfoFromGrpc(cpuNum int, memorySize int64, arch,
 	if processName != "" {
 		c.updateProcessName(processName)
 	}
+	if currentK8sImage != "" {
+		c.updateCurrentK8SImage(currentK8sImage)
+	}
 }
 
 func (c *VTapCache) UpdateCtrlMacFromGrpc(ctrlMac string) {
+	v := c.vTapInfo
 	if c.GetCtrlMac() == "" || c.GetCtrlMac() != ctrlMac {
 		c.updateCtrlMac(ctrlMac)
-		log.Infof("grpc modify vtap(%s) ctrl_mac (%s) to (%s)",
-			c.GetVTapHost(), c.GetCtrlMac(), ctrlMac)
+		log.Infof(v.Logf("grpc modify vtap(%s) ctrl_mac (%s) to (%s)",
+			c.GetVTapHost(), c.GetCtrlMac(), ctrlMac))
 	}
 }
 
 func (c *VTapCache) updateCtrlMacFromDB(ctrlMac string) {
+	v := c.vTapInfo
 	if c.GetCtrlMac() == "" && ctrlMac != "" {
 		c.updateCtrlMac(ctrlMac)
-		log.Infof("db modify vtap(%s) ctrl_mac (%s) to (%s)",
-			c.GetVTapHost(), c.GetCtrlMac(), ctrlMac)
+		log.Infof(v.Logf("db modify vtap(%s) ctrl_mac (%s) to (%s)",
+			c.GetVTapHost(), c.GetCtrlMac(), ctrlMac))
 	}
 }
 
-func (c *VTapCache) init(v *VTapInfo) {
-	c.modifyVTapCache(v)
-	c.initVTapPodDomains(v)
-	c.initVTapConfig(v)
+func (c *VTapCache) init() {
+	c.modifyVTapCache()
+	c.initVTapPodDomains()
+	c.initVTapConfig()
 }
 
-func (c *VTapCache) modifyVTapCache(v *VTapInfo) {
+func (c *VTapCache) modifyVTapCache() {
+	v := c.vTapInfo
 	if c.state == VTAP_STATE_PENDING {
 		c.enable = 0
 	}
@@ -895,11 +1050,11 @@ func (c *VTapCache) modifyVTapCache(v *VTapInfo) {
 	if vTapType == VTAP_TYPE_POD_HOST || vTapType == VTAP_TYPE_POD_VM {
 		c.podClusterID, ok = v.lcuuidToPodClusterID[c.GetLcuuid()]
 		if ok == false {
-			log.Warningf("vtap(%s) not found podClusterID", c.GetVTapHost())
+			log.Warningf(v.Logf("vtap(%s) not found podClusterID", c.GetVTapHost()))
 		}
 		c.VPCID, ok = v.lcuuidToVPCID[c.GetLcuuid()]
 		if ok == false {
-			log.Warningf("vtap(%s) not found VPCID", c.GetVTapHost())
+			log.Warningf(v.Logf("vtap(%s) not found VPCID", c.GetVTapHost()))
 		}
 	} else if vTapType == VTAP_TYPE_K8S_SIDECAR {
 		pod := v.metaData.GetPlatformDataOP().GetRawData().GetPod(c.GetLaunchServerID())
@@ -910,65 +1065,89 @@ func (c *VTapCache) modifyVTapCache(v *VTapInfo) {
 	} else if vTapType == VTAP_TYPE_WORKLOAD_V || vTapType == VTAP_TYPE_WORKLOAD_P {
 		c.VPCID, ok = v.lcuuidToVPCID[c.GetLcuuid()]
 		if ok == false {
-			log.Warningf("vtap(%s) not found VPCID", c.GetVTapHost())
+			log.Warningf(v.Logf("vtap(%s) not found VPCID", c.GetVTapHost()))
 		}
 	} else if vTapType == VTAP_TYPE_HYPER_V && v.hypervNetworkHostIds.Contains(c.GetLaunchServerID()) {
 		c.vTapType = VTAP_TYPE_HYPER_V_NETWORK
 		c.VPCID, ok = v.hostIDToVPCID[c.GetLaunchServerID()]
 		if ok == false {
-			log.Warningf("vtap(%s) not found VPCID", c.GetVTapHost())
+			log.Warningf(v.Logf("vtap(%s) not found VPCID", c.GetVTapHost()))
 		}
 	} else if vTapType == VTAP_TYPE_KVM || vTapType == VTAP_TYPE_HYPER_V {
 		c.VPCID, ok = v.hostIDToVPCID[c.GetLaunchServerID()]
 		if ok == false {
-			log.Warningf("vtap(%s) not found VPCID", c.GetVTapHost())
+			log.Warningf(v.Logf("vtap(%s) not found VPCID", c.GetVTapHost()))
 		}
 	}
 }
 
-func (c *VTapCache) initVTapPodDomains(v *VTapInfo) {
-	c.podDomains = v.getVTapPodDomains(c)
+func (c *VTapCache) initVTapPodDomains() {
+	c.podDomains = c.vTapInfo.getVTapPodDomains(c)
 }
 
-func (c *VTapCache) initVTapConfig(v *VTapInfo) {
+func (c *VTapCache) initVTapConfig() {
+	v := c.vTapInfo
 	realConfig := VTapConfig{}
-	config, ok := v.vtapGroupLcuuidToConfiguration[c.GetVTapGroupLcuuid()]
-	if ok {
-		realConfig = *config
+	vtapGroupLcuuid := c.GetVTapGroupLcuuid()
+
+	var agentConfigYaml string
+	if config, ok := v.vtapGroupLcuuidToConfiguration[vtapGroupLcuuid]; ok {
+		agentConfigYaml = config.GetUserConfig()
+		realConfig = deepcopy.Copy(*config).(VTapConfig)
 	} else {
 		if v.realDefaultConfig != nil {
-			realConfig = *v.realDefaultConfig
+			realConfig = deepcopy.Copy(*v.realDefaultConfig).(VTapConfig)
 		}
 	}
-	if v.config.BillingMethod == BILLING_METHOD_LICENSE {
-		c.modifyVTapConfigByLicense(&realConfig)
+
+	// viper object include map, not support deepcopy
+	viperConfig := viper.New()
+	viperConfig.SetConfigType("yaml")
+	if err := viperConfig.ReadConfig(bytes.NewBufferString(agentConfigYaml)); err != nil {
+		log.Errorf(v.Logf("viper read agent group (%s) config yaml error: %v", vtapGroupLcuuid, err))
 	}
-	realConfig.modifyConfig(v)
+	realConfig.UserConfig = viperConfig
+
+	c.modifyVTapConfigByLicense(&realConfig)
+	realConfig.modifyUserConfig(c)
 	c.updateVTapConfig(&realConfig)
 }
 
-func (c *VTapCache) updateVTapConfigFromDB(v *VTapInfo) {
+func (c *VTapCache) updateVTapConfigFromDB() {
+	v := c.vTapInfo
 	newConfig := VTapConfig{}
+
+	var agentConfigYaml string
 	config, ok := v.vtapGroupLcuuidToConfiguration[c.GetVTapGroupLcuuid()]
 	if ok {
-		newConfig = *config
+		agentConfigYaml = config.GetUserConfig()
+		newConfig = deepcopy.Copy(*config).(VTapConfig)
 	} else {
 		if v.realDefaultConfig != nil {
-			newConfig = *v.realDefaultConfig
+			newConfig = deepcopy.Copy(*v.realDefaultConfig).(VTapConfig)
 		}
 	}
 	oldConfig := c.GetVTapConfig()
 	if oldConfig != nil {
 		// 采集器配置发生变化 重新生成平台数据
-		if newConfig.Domains != oldConfig.Domains || newConfig.PodClusterInternalIP != oldConfig.PodClusterInternalIP {
+		oldDomainFilterStr := strings.Join(oldConfig.getDomainFilters(), "")
+		newDomainFilterStr := strings.Join(newConfig.getDomainFilters(), "")
+		if newDomainFilterStr != oldDomainFilterStr ||
+			newConfig.getPodClusterInternalIP() != oldConfig.getPodClusterInternalIP() {
 			v.setVTapChangedForPD()
 		}
 	}
 
-	if v.config.BillingMethod == BILLING_METHOD_LICENSE {
-		c.modifyVTapConfigByLicense(&newConfig)
+	// viper object include map, not support deepcopy
+	viperConfig := viper.New()
+	viperConfig.SetConfigType("yaml")
+	if err := viperConfig.ReadConfig(bytes.NewBufferString(agentConfigYaml)); err != nil {
+		log.Errorf(v.Logf("viper read agent group (%s) config yaml error: %v", c.GetVTapGroupLcuuid(), err))
 	}
-	newConfig.modifyConfig(v)
+	newConfig.UserConfig = viperConfig
+
+	c.modifyVTapConfigByLicense(&newConfig)
+	newConfig.modifyUserConfig(c)
 	c.updateVTapConfig(&newConfig)
 }
 
@@ -977,17 +1156,17 @@ func (c *VTapCache) GetConfigTapMode() int {
 	if config == nil {
 		return -1
 	}
-	return config.TapMode
+	return config.UserConfig.GetInt(CONFIG_KEY_CAPTURE_MODE)
 }
 
-func (c *VTapCache) updateVTapCacheFromDB(vtap *models.VTap, v *VTapInfo) {
+func (c *VTapCache) updateVTapCacheFromDB(vtap *metadbmodel.VTap) {
+	v := c.vTapInfo
 	c.updateCtrlMacFromDB(vtap.CtrlMac)
 	c.state = vtap.State
 	c.enable = vtap.Enable
-	if v.config.BillingMethod == BILLING_METHOD_LICENSE {
-		c.updateLicenseFunctions(vtap.LicenseFunctions)
-	}
+	c.updateLicenseFunctions(vtap.LicenseFunctions)
 	c.updateTapMode(vtap.TapMode)
+	c.updateTeamID(vtap.TeamID)
 	if c.vTapType != vtap.Type {
 		c.vTapType = vtap.Type
 		v.setVTapChangedForSegment()
@@ -1028,13 +1207,13 @@ func (c *VTapCache) updateVTapCacheFromDB(vtap *models.VTap, v *VTapInfo) {
 	if c.GetRegion() != vtap.Region {
 		c.updateRegion(vtap.Region)
 	}
-	c.modifyVTapCache(v)
+	c.modifyVTapCache()
 	// 采集器组变化 重新生成平台数据
 	if c.GetVTapGroupLcuuid() != vtap.VtapGroupLcuuid {
 		c.updateVTapGroupLcuuid(vtap.VtapGroupLcuuid)
 		v.setVTapChangedForPD()
 	}
-	c.updateVTapConfigFromDB(v)
+	c.updateVTapConfigFromDB()
 	newPodDomains := v.getVTapPodDomains(c)
 	oldPodDomains := c.getPodDomains()
 	// podDomain 发生变化重新生成平台数据
@@ -1043,7 +1222,7 @@ func (c *VTapCache) updateVTapCacheFromDB(vtap *models.VTap, v *VTapInfo) {
 		v.setVTapChangedForPD()
 	}
 	if c.GetConfigTapMode() != c.GetTapMode() {
-		log.Warningf("config tap_mode(%d) is not equal to vtap(%s) tap_mode(%d)", c.GetConfigTapMode(), c.GetKey(), c.GetTapMode())
+		log.Warningf(v.Logf("config tap_mode(%d) is not equal to vtap(%s) tap_mode(%d)", c.GetConfigTapMode(), c.GetKey(), c.GetTapMode()))
 	}
 }
 
@@ -1070,9 +1249,10 @@ func (c *VTapCache) updateTSDBIP(ip string) {
 }
 
 func (c *VTapCache) GetVTapConfig() *VTapConfig {
+	v := c.vTapInfo
 	config := c.config.Load()
 	if config == nil {
-		log.Warningf("vtap(%s) no config", c.GetVTapHost())
+		log.Warningf(v.Logf("vtap(%s) no config", c.GetVTapHost()))
 		return nil
 	}
 	return config.(*VTapConfig)
@@ -1093,12 +1273,30 @@ func (c *VTapCache) setVTapPlatformData(d *metadata.PlatformData) {
 }
 
 func (c *VTapCache) GetVTapPlatformData() *metadata.PlatformData {
+	v := c.vTapInfo
 	platformData := c.PlatformData.Load()
 	if platformData == nil {
-		log.Warningf("vtap(%s) no platformData", c.GetVTapHost())
+		log.Warningf(v.Logf("vtap(%s) no platformData", c.GetVTapHost()))
 		return nil
 	}
 	return platformData.(*metadata.PlatformData)
+}
+
+func (c *VTapCache) setAgentPlatformData(d *agentmetadata.PlatformData) {
+	if d == nil {
+		return
+	}
+	c.AgentPlatformData.Store(d)
+}
+
+func (c *VTapCache) GetAgentPlatformData() *agentmetadata.PlatformData {
+	v := c.vTapInfo
+	platformData := c.AgentPlatformData.Load()
+	if platformData == nil {
+		log.Warningf(v.Logf("agent(%s) no platformData", c.GetVTapHost()))
+		return nil
+	}
+	return platformData.(*agentmetadata.PlatformData)
 }
 
 func (c *VTapCache) setVTapLocalSegments(segments []*trident.Segment) {
@@ -1115,6 +1313,22 @@ func (c *VTapCache) setVTapRemoteSegments(segments []*trident.Segment) {
 
 func (c *VTapCache) GetVTapRemoteSegments() []*trident.Segment {
 	return c.remoteSegments
+}
+
+func (c *VTapCache) setAgentLocalSegments(segments []*agent.Segment) {
+	c.agentLocalSegments = segments
+}
+
+func (c *VTapCache) GetAgentLocalSegments() []*agent.Segment {
+	return c.agentLocalSegments
+}
+
+func (c *VTapCache) setAgentRemoteSegments(segments []*agent.Segment) {
+	c.agentRemoteSegments = segments
+}
+
+func (c *VTapCache) GetAgentRemoteSegments() []*agent.Segment {
+	return c.agentRemoteSegments
 }
 
 type VTapCacheMap struct {

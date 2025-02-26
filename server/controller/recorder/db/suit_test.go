@@ -27,7 +27,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 )
 
@@ -44,12 +45,12 @@ func TestSuite(t *testing.T) {
 	if _, err := os.Stat(TEST_DB_FILE); err == nil {
 		os.Remove(TEST_DB_FILE)
 	}
-	mysql.Db = GetDB()
+	metadb.DefaultDB = GetDB()
 	suite.Run(t, new(SuiteTest))
 }
 
 func (t *SuiteTest) SetupSuite() {
-	t.db = mysql.Db
+	t.db = metadb.DefaultDB
 
 	for _, val := range getModels() {
 		t.db.AutoMigrate(val)
@@ -82,17 +83,17 @@ func GetDB() *gorm.DB {
 
 func getModels() []interface{} {
 	return []interface{}{
-		&mysql.Region{}, &mysql.AZ{}, &mysql.SubDomain{}, &mysql.Host{}, &mysql.VM{},
-		&mysql.VPC{}, &mysql.Network{}, &mysql.Subnet{}, &mysql.VRouter{}, &mysql.RoutingTable{},
-		&mysql.DHCPPort{}, &mysql.VInterface{}, &mysql.WANIP{}, &mysql.LANIP{}, &mysql.FloatingIP{},
-		&mysql.SecurityGroup{}, &mysql.SecurityGroupRule{}, &mysql.VMSecurityGroup{}, &mysql.LB{},
-		&mysql.LBListener{}, &mysql.LBTargetServer{}, &mysql.NATGateway{}, &mysql.NATRule{},
-		&mysql.NATVMConnection{}, &mysql.LBVMConnection{}, &mysql.CEN{}, &mysql.PeerConnection{},
-		&mysql.RDSInstance{}, &mysql.RedisInstance{},
-		&mysql.PodCluster{}, &mysql.PodNode{}, &mysql.PodNamespace{}, &mysql.VMPodNodeConnection{},
-		&mysql.PodIngress{}, &mysql.PodIngressRule{}, &mysql.PodIngressRuleBackend{},
-		&mysql.PodService{}, &mysql.PodServicePort{}, &mysql.PodGroup{}, &mysql.PodGroupPort{},
-		&mysql.PodReplicaSet{}, &mysql.Pod{},
+		&metadbmodel.Region{}, &metadbmodel.AZ{}, &metadbmodel.SubDomain{}, &metadbmodel.Host{}, &metadbmodel.VM{},
+		&metadbmodel.VPC{}, &metadbmodel.Network{}, &metadbmodel.Subnet{}, &metadbmodel.VRouter{}, &metadbmodel.RoutingTable{},
+		&metadbmodel.DHCPPort{}, &metadbmodel.VInterface{}, &metadbmodel.WANIP{}, &metadbmodel.LANIP{}, &metadbmodel.FloatingIP{},
+		&metadb.SecurityGroup{}, &metadb.SecurityGroupRule{}, &metadb.VMSecurityGroup{}, &metadbmodel.LB{},
+		&metadbmodel.LBListener{}, &metadbmodel.LBTargetServer{}, &metadbmodel.NATGateway{}, &metadbmodel.NATRule{},
+		&metadbmodel.NATVMConnection{}, &metadbmodel.LBVMConnection{}, &metadbmodel.CEN{}, &metadbmodel.PeerConnection{},
+		&metadbmodel.RDSInstance{}, &metadbmodel.RedisInstance{},
+		&metadbmodel.PodCluster{}, &metadbmodel.PodNode{}, &metadbmodel.PodNamespace{}, &metadbmodel.VMPodNodeConnection{},
+		&metadbmodel.PodIngress{}, &metadbmodel.PodIngressRule{}, &metadbmodel.PodIngressRuleBackend{},
+		&metadbmodel.PodService{}, &metadbmodel.PodServicePort{}, &metadbmodel.PodGroup{}, &metadbmodel.PodGroupPort{},
+		&metadbmodel.PodReplicaSet{}, &metadbmodel.Pod{},
 	}
 }
 

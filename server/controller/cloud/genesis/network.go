@@ -21,13 +21,11 @@ import (
 	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getNetworks() ([]model.Network, error) {
-	log.Debug("get networks starting")
+	log.Debug("get networks starting", logger.NewORGPrefix(g.orgID))
 	networks := []model.Network{}
 	networksData := g.genesisData.Networks
 
@@ -35,13 +33,8 @@ func (g *Genesis) getNetworks() ([]model.Network, error) {
 
 	for _, n := range networksData {
 		if n.SegmentationID == 0 {
-			log.Debug("segmentation id not found")
+			log.Debug("segmentation id not found", logger.NewORGPrefix(g.orgID))
 			continue
-		}
-		vpcLcuuid := n.VPCLcuuid
-		if vpcLcuuid == "" {
-			vpcLcuuid = common.GetUUID(g.defaultVpcName, uuid.Nil)
-			g.defaultVpc = true
 		}
 		networkName := n.Name
 		if networkName == "" {
@@ -51,15 +44,15 @@ func (g *Genesis) getNetworks() ([]model.Network, error) {
 			Lcuuid:         n.Lcuuid,
 			Name:           networkName,
 			SegmentationID: int(n.SegmentationID),
-			VPCLcuuid:      vpcLcuuid,
+			VPCLcuuid:      n.VPCLcuuid,
 			Shared:         false,
 			External:       n.External,
 			NetType:        int(n.NetType),
 			AZLcuuid:       g.azLcuuid,
-			RegionLcuuid:   g.regionUuid,
+			RegionLcuuid:   g.regionLcuuid,
 		}
 		networks = append(networks, network)
 	}
-	log.Debug("get networks complete")
+	log.Debug("get networks complete", logger.NewORGPrefix(g.orgID))
 	return networks, nil
 }

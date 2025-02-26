@@ -29,7 +29,7 @@ use public::packet;
 use crate::utils::stats;
 
 #[cfg(target_os = "linux")]
-pub use special_recv_engine::Dpdk;
+pub use special_recv_engine::{Dpdk, DpdkFromEbpf, VhostUser};
 pub use special_recv_engine::{Libpcap, LibpcapCounter};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
@@ -42,7 +42,11 @@ pub enum RecvEngine {
     AfPacket(Tpacket),
     #[cfg(target_os = "linux")]
     Dpdk(Dpdk),
+    #[cfg(target_os = "linux")]
+    DpdkFromEbpf(DpdkFromEbpf),
     Libpcap(Option<Libpcap>),
+    #[cfg(target_os = "linux")]
+    VhostUser(VhostUser),
 }
 
 impl RecvEngine {
@@ -54,7 +58,11 @@ impl RecvEngine {
             Self::AfPacket(_) => Ok(()),
             #[cfg(target_os = "linux")]
             Self::Dpdk(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::DpdkFromEbpf(_) => Ok(()),
             Self::Libpcap(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(_) => Ok(()),
         }
     }
 
@@ -80,10 +88,20 @@ impl RecvEngine {
                 Ok(p) => Ok(p),
                 _ => Err(Error::Timeout),
             },
+            #[cfg(target_os = "linux")]
+            Self::DpdkFromEbpf(d) => match d.read() {
+                Ok(p) => Ok(*p),
+                _ => Err(Error::Timeout),
+            },
             Self::Libpcap(w) => w
                 .as_mut()
                 .ok_or(Error::LibpcapError(Self::LIBPCAP_NONE.to_string()))
                 .and_then(|e| e.read()),
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(v) => match v.read() {
+                Ok(p) => Ok(p),
+                _ => Err(Error::Timeout),
+            },
         }
     }
 
@@ -98,6 +116,19 @@ impl RecvEngine {
                 .and_then(|e| e.set_bpf(syntax.to_str().unwrap())),
             #[cfg(target_os = "linux")]
             Self::Dpdk(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::DpdkFromEbpf(d) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(_) => Ok(()),
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn set_promisc(&mut self, if_index: &Vec<i32>, enabled: bool) -> Result<()> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Self::AfPacket(e) => e.set_promisc(if_index, enabled).map_err(|e| e.into()),
+            _ => return Ok(()),
         }
     }
 
@@ -106,11 +137,15 @@ impl RecvEngine {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::AfPacket(e) => Arc::new(e.get_counter_handle()),
             #[cfg(target_os = "linux")]
-            Self::Dpdk(_) => Arc::new(LibpcapCounter::default()),
+            Self::Dpdk(d) => d.get_counter_handle(),
+            #[cfg(target_os = "linux")]
+            Self::DpdkFromEbpf(d) => d.get_counter_handle(),
             Self::Libpcap(w) => match w {
                 Some(w) => w.get_counter_handle(),
                 None => Arc::new(LibpcapCounter::default()),
             },
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(v) => v.get_counter_handle(),
         }
     }
 }

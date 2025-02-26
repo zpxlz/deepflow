@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use flate2::{read::GzDecoder, write::ZlibEncoder, Compression};
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::HeaderMap;
@@ -45,6 +46,7 @@ use tokio::{
     task::JoinHandle,
     time,
 };
+use zstd::bulk::compress;
 
 use crate::{
     common::{
@@ -52,18 +54,23 @@ use crate::{
         lookup_key::LookupKey,
         TaggedFlow, Timestamp,
     },
-    config::{handler::LogParserConfig, PrometheusExtraConfig},
+    config::{handler::LogParserConfig, PrometheusExtraLabels},
     exception::ExceptionHandler,
     flow_generator::protocol_logs::{http::handle_endpoint, L7ResponseStatus},
     metric::document::{Direction, TapSide},
     policy::PolicyGetter,
 };
 
+use integration_skywalking::{
+    handle_skywalking_request, handle_skywalking_streaming_request, SkyWalkingExtra,
+};
 use public::{
     counter::{Counter, CounterType, CounterValue, OwnedCountable},
-    enums::{EthernetType, L4Protocol, TapType},
+    enums::{CaptureNetworkType, EthernetType, L4Protocol},
     l7_protocol::L7Protocol,
     proto::{
+        agent::Exception,
+        flow_log,
         integration::opentelemetry::proto::{
             common::v1::{
                 any_value::Value::{IntValue, StringValue},
@@ -72,9 +79,8 @@ use public::{
             trace::v1::{span::SpanKind, Span, TracesData},
         },
         metric,
-        trident::Exception,
     },
-    queue::{DebugSender, Error},
+    queue::DebugSender,
     utils::net::ipv6_enabled,
 };
 
@@ -82,10 +88,6 @@ type GenericError = Box<dyn std::error::Error + Send + Sync>;
 
 const NOT_FOUND: &[u8] = b"Not Found";
 const GZIP: &str = "gzip";
-const OPEN_TELEMETRY: u32 = 20220607;
-const OPEN_TELEMETRY_COMPRESSED: u32 = 20221024;
-const PROMETHEUS: u32 = 20220613;
-const TELEGRAF: u32 = 20220613;
 
 // Otel的protobuf数据
 // ingester使用该proto https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/trace/v1/trace.proto进行解析
@@ -102,10 +104,6 @@ impl Sendable for OpenTelemetry {
     fn message_type(&self) -> SendMessageType {
         SendMessageType::OpenTelemetry
     }
-
-    fn version(&self) -> u32 {
-        OPEN_TELEMETRY
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,10 +118,6 @@ impl Sendable for OpenTelemetryCompressed {
 
     fn message_type(&self) -> SendMessageType {
         SendMessageType::OpenTelemetryCompressed
-    }
-
-    fn version(&self) -> u32 {
-        OPEN_TELEMETRY_COMPRESSED
     }
 }
 
@@ -161,10 +155,6 @@ impl Sendable for BoxedPrometheusExtra {
     fn message_type(&self) -> SendMessageType {
         SendMessageType::Prometheus
     }
-
-    fn version(&self) -> u32 {
-        PROMETHEUS
-    }
 }
 
 /// Telegraf metric， 是influxDB标准行协议的UTF8编码的文本数据
@@ -180,10 +170,6 @@ impl Sendable for TelegrafMetric {
 
     fn message_type(&self) -> SendMessageType {
         SendMessageType::Telegraf
-    }
-
-    fn version(&self) -> u32 {
-        TELEGRAF
     }
 }
 
@@ -239,6 +225,35 @@ async fn aggregate_with_catch_exception(
                 .unwrap()
         }
     })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Datadog(flow_log::ThirdPartyTrace);
+
+impl Sendable for Datadog {
+    fn encode(self, buf: &mut Vec<u8>) -> Result<usize, prost::EncodeError> {
+        self.0.encode(buf).map(|_| self.0.encoded_len())
+    }
+
+    fn message_type(&self) -> SendMessageType {
+        SendMessageType::Datadog
+    }
+}
+
+// for log capture from vector
+#[derive(Debug, PartialEq)]
+pub struct ApplicationLog(Vec<u8>);
+
+impl Sendable for ApplicationLog {
+    fn encode(mut self, buf: &mut Vec<u8>) -> Result<usize, prost::EncodeError> {
+        let length = self.0.len();
+        buf.append(&mut self.0);
+        Ok(length)
+    }
+
+    fn message_type(&self) -> SendMessageType {
+        SendMessageType::ApplicationLog
+    }
 }
 
 fn decode_otel_trace_data(
@@ -517,7 +532,7 @@ fn fill_l7_stats(
     };
     let flow_perf_stats = FlowPerfStats {
         tcp: Default::default(),
-        l7: stats.clone(),
+        l7: AHashMap::new(),
         l4_protocol,
         l7_protocol,
         ..Default::default()
@@ -540,7 +555,7 @@ fn fill_l7_stats(
     let peer_dst = &mut flow.flow_metrics_peers[1];
     peer_dst.l3_epc_id = dst_info.l3_epc_id;
     peer_dst.nat_real_ip = flow.flow_key.ip_dst;
-    flow.flow_key.tap_type = TapType::Cloud;
+    flow.flow_key.tap_type = CaptureNetworkType::Cloud;
     let flow_stat_time = flow.flow_stat_time;
     let flow_endpoint = flow.last_endpoint.clone();
     let mut tagged_flow = TaggedFlow::default();
@@ -554,6 +569,8 @@ fn fill_l7_stats(
         l7_protocol,
         signal_source: SignalSource::OTel,
         time_in_second: flow_stat_time.into(),
+        biz_type: 0,
+        time_span: 0,
     }
 }
 
@@ -594,18 +611,23 @@ async fn handler(
     prometheus_sender: DebugSender<BoxedPrometheusExtra>,
     telegraf_sender: DebugSender<TelegrafMetric>,
     profile_sender: DebugSender<Profile>,
+    application_log_sender: DebugSender<ApplicationLog>,
+    skywalking_sender: DebugSender<SkyWalkingExtra>,
+    datadog_sender: DebugSender<Datadog>,
     exception_handler: ExceptionHandler,
     compressed: bool,
+    profile_compressed: bool,
     counter: Arc<CompressedMetric>,
     local_epc_id: u32,
     policy_getter: Arc<PolicyGetter>,
     time_diff: Arc<AtomicI64>,
-    prometheus_extra_config: Arc<PrometheusExtraConfig>,
+    prometheus_extra_config: Arc<PrometheusExtraLabels>,
     log_parser_config: Arc<LogParserConfig>,
     flow_id: Arc<AtomicU64>,
     external_profile_integration_disabled: bool,
     external_trace_integration_disabled: bool,
     external_metric_integration_disabled: bool,
+    external_log_integration_disabled: bool,
 ) -> Result<Response<Body>, GenericError> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => {
@@ -643,10 +665,8 @@ async fn handler(
                 e
             })?;
             if !decode_data.1.is_empty() {
-                if let Err(Error::Terminated(..)) =
-                    otel_l7_stats_sender.send_all(&mut decode_data.1)
-                {
-                    warn!("sender queue has terminated");
+                if let Err(e) = otel_l7_stats_sender.send_all(&mut decode_data.1) {
+                    warn!("otel_l7_stats_sender failed to send data, because {:?}", e);
                 }
             }
             if compressed {
@@ -657,14 +677,17 @@ async fn handler(
                 counter
                     .compressed
                     .fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
-                if let Err(Error::Terminated(..)) =
+                if let Err(e) =
                     compressed_otel_sender.send(OpenTelemetryCompressed(compressed_data))
                 {
-                    warn!("sender queue has terminated");
+                    warn!(
+                        "compressed_otel_sender failed to send data, because {:?}",
+                        e
+                    );
                 }
             } else {
-                if let Err(Error::Terminated(..)) = otel_sender.send(OpenTelemetry(decode_data.0)) {
-                    warn!("sender queue has terminated");
+                if let Err(e) = otel_sender.send(OpenTelemetry(decode_data.0)) {
+                    warn!("otel_sender failed to send data, because {:?}", e);
                 }
             }
 
@@ -676,9 +699,9 @@ async fn handler(
                 return Ok(Response::builder().body(Body::empty()).unwrap());
             }
             let headers = req.headers();
-            let labels = &prometheus_extra_config.labels;
-            let labels_limit = prometheus_extra_config.labels_limit;
-            let values_limit = prometheus_extra_config.values_limit;
+            let labels = &prometheus_extra_config.extra_labels;
+            let labels_limit = prometheus_extra_config.label_length;
+            let values_limit = prometheus_extra_config.value_length;
             let mut labels_count = 0;
             let mut values_count = 0;
             let mut extra_label_names = vec![];
@@ -693,8 +716,8 @@ async fn handler(
                             .to_str()
                             .unwrap_or_default()
                             .to_string();
-                        labels_count += label.len() as u32;
-                        values_count += value.len() as u32;
+                        labels_count += label.len();
+                        values_count += value.len();
                         if labels_count > labels_limit || values_count > values_limit {
                             debug!("labels_count exceeds the labels limit:{} or values_count exceeds the values limit:{} ", labels_limit, values_limit);
                             break;
@@ -720,10 +743,10 @@ async fn handler(
                 extra_label_names,
                 extra_label_values,
             };
-            if let Err(Error::Terminated(..)) =
+            if let Err(e) =
                 prometheus_sender.send(BoxedPrometheusExtra(Box::new(prometheus_with_extra)))
             {
-                warn!("sender queue has terminated");
+                warn!("prometheus_sender failed to send data, because {:?}", e);
             }
 
             Ok(Response::builder().body(Body::empty()).unwrap())
@@ -746,8 +769,8 @@ async fn handler(
                     debug!("telegraf metric: {}", r)
                 }
             }
-            if let Err(Error::Terminated(..)) = telegraf_sender.send(TelegrafMetric(metric)) {
-                warn!("sender queue has terminated");
+            if let Err(e) = telegraf_sender.send(TelegrafMetric(metric)) {
+                warn!("telegraf_sender failed to send data, because {:?}", e);
             }
             Ok(Response::builder().body(Body::empty()).unwrap())
         }
@@ -768,6 +791,22 @@ async fn handler(
                 }
             };
             profile.data = decode_metric(whole_body, &part.headers)?;
+            if profile_compressed {
+                match compress(&profile.data, 0) {
+                    Ok(compressed_data) => {
+                        profile.data_compressed = true;
+                        counter
+                            .uncompressed
+                            .fetch_add(profile.data.len() as u64, Ordering::Relaxed);
+                        counter
+                            .compressed
+                            .fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
+                        profile.data = compressed_data;
+                    }
+                    Err(e) => debug!("failed to compress: {:?}", e),
+                }
+            }
+
             profile.ip = match peer_addr.ip() {
                 IpAddr::V4(ip4) => ip4.octets().to_vec(),
                 IpAddr::V6(ip6) => ip6.octets().to_vec(),
@@ -777,8 +816,94 @@ async fn handler(
                 profile.content_type = content_type.as_bytes().to_vec();
             }
 
-            if let Err(Error::Terminated(..)) = profile_sender.send(Profile(profile)) {
-                warn!("profile sender queue has terminated");
+            if let Err(e) = profile_sender.send(Profile(profile)) {
+                warn!("profile_sender failed to send data, because {:?}", e);
+            }
+
+            Ok(Response::builder().body(Body::empty()).unwrap())
+        }
+        // log integration
+        (&Method::POST, "/api/v1/log") => {
+            if external_log_integration_disabled {
+                return Ok(Response::builder().body(Body::empty()).unwrap());
+            }
+            let (part, body) = req.into_parts();
+            let whole_body = match aggregate_with_catch_exception(body, &exception_handler).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(e);
+                }
+            };
+            let log_data = decode_metric(whole_body, &part.headers)?;
+            if let Err(e) = application_log_sender.send(ApplicationLog(log_data)) {
+                warn!(
+                    "application_log_sender failed to send data, because {:?}",
+                    e
+                );
+            }
+
+            Ok(Response::builder().body(Body::empty()).unwrap())
+        }
+        (
+            &Method::POST,
+            "/v3/segments" | "/skywalking.v3.TraceSegmentReportService/collectInSync",
+        ) => {
+            if external_trace_integration_disabled {
+                return Ok(Response::builder().body(Body::empty()).unwrap());
+            }
+            let (part, body) = req.into_parts();
+            let whole_body = match aggregate_with_catch_exception(body, &exception_handler).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(e);
+                }
+            };
+            let data = decode_metric(whole_body, &part.headers)?;
+            Ok(
+                handle_skywalking_request(peer_addr, data, part.uri.path(), skywalking_sender)
+                    .await,
+            )
+        }
+        (&Method::POST, "/skywalking.v3.TraceSegmentReportService/collect") => {
+            if external_trace_integration_disabled {
+                return Ok(Response::builder().body(Body::empty()).unwrap());
+            }
+            let (part, body) = req.into_parts();
+            Ok(handle_skywalking_streaming_request(
+                peer_addr,
+                body,
+                part.uri.path(),
+                skywalking_sender,
+            )
+            .await)
+        }
+        (
+            &Method::POST,
+            // https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.114.0/receiver/datadogreceiver/README.md?plain=1#L65
+            "/api/v0.2/traces" | "/v0.3/traces" | "/v0.4/traces" | "/v0.5/traces" | "/v0.7/traces",
+        ) => {
+            if external_trace_integration_disabled {
+                return Ok(Response::builder().body(Body::empty()).unwrap());
+            }
+            let (part, body) = req.into_parts();
+            let whole_body = match aggregate_with_catch_exception(body, &exception_handler).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(e);
+                }
+            };
+
+            let mut third_party_data = flow_log::ThirdPartyTrace::default();
+            parse_dd_headers(&part.headers, &mut third_party_data);
+            third_party_data.data = decode_metric(whole_body, &part.headers)?;
+            third_party_data.uri = part.uri.path().to_string();
+            third_party_data.peer_ip = match peer_addr.ip() {
+                IpAddr::V4(ip4) => ip4.octets().to_vec(),
+                IpAddr::V6(ip6) => ip6.octets().to_vec(),
+            };
+
+            if let Err(e) = datadog_sender.send(Datadog(third_party_data)) {
+                warn!("datadog_sender failed to send data, because {:?}", e);
             }
 
             Ok(Response::builder().body(Body::empty()).unwrap())
@@ -812,10 +937,20 @@ fn parse_profile_query(query: &str, profile: &mut metric::Profile) {
         profile.sample_rate = sample_rate.parse::<u32>().unwrap_or_default();
     };
     if let Some(from) = query_hash.get("from") {
-        profile.from = from.parse::<u32>().unwrap_or_default();
+        let from = from.parse::<u64>().unwrap_or_default();
+        if from > u32::MAX as u64 {
+            profile.from = (from / 1_000_000_000) as u32;
+        } else {
+            profile.from = from as u32;
+        }
     };
     if let Some(until) = query_hash.get("until") {
-        profile.until = until.parse::<u32>().unwrap_or_default();
+        let until = until.parse::<u64>().unwrap_or_default();
+        if until > u32::MAX as u64 {
+            profile.until = (until / 1_000_000_000) as u32;
+        } else {
+            profile.until = until as u32;
+        }
     };
     if let Some(spy_name) = query_hash.get("spyName") {
         profile.spy_name = spy_name.to_string();
@@ -823,6 +958,23 @@ fn parse_profile_query(query: &str, profile: &mut metric::Profile) {
     if let Some(format) = query_hash.get("format") {
         profile.format = format.to_string();
     };
+}
+
+fn parse_dd_headers(headers: &HeaderMap, third_party_data: &mut flow_log::ThirdPartyTrace) {
+    for key in vec![
+        "Datadog-Meta-Lang",           // headers.lang
+        "Datadog-Meta-Lang-Version",   // headers.lang_version
+        "Datadog-Meta-Tracer-Version", // headers.tracer_version
+        "Datadog-Container-Id",        // headers.container_id
+        "Content-Type",                // for decode format validate
+    ] {
+        if let Some(value) = headers.get(key) {
+            third_party_data.extend_keys.push(key.to_string());
+            third_party_data
+                .extend_values
+                .push(value.to_str().unwrap_or_default().to_string());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -882,19 +1034,24 @@ pub struct MetricServer {
     prometheus_sender: DebugSender<BoxedPrometheusExtra>,
     telegraf_sender: DebugSender<TelegrafMetric>,
     profile_sender: DebugSender<Profile>,
+    application_log_sender: DebugSender<ApplicationLog>,
+    skywalking_sender: DebugSender<SkyWalkingExtra>,
+    datadog_sender: DebugSender<Datadog>,
     port: Arc<AtomicU16>,
     exception_handler: ExceptionHandler,
     server_shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     counter: Arc<CompressedMetric>,
     compressed: Arc<AtomicBool>,
+    profile_compressed: Arc<AtomicBool>,
     local_epc_id: u32,
     policy_getter: Arc<PolicyGetter>,
     time_diff: Arc<AtomicI64>,
-    prometheus_extra_config: Arc<PrometheusExtraConfig>,
+    prometheus_extra_config: Arc<PrometheusExtraLabels>,
     log_parser_config: Arc<LogParserConfig>,
     external_profile_integration_disabled: bool,
     external_trace_integration_disabled: bool,
     external_metric_integration_disabled: bool,
+    external_log_integration_disabled: bool,
 }
 
 impl MetricServer {
@@ -906,17 +1063,22 @@ impl MetricServer {
         prometheus_sender: DebugSender<BoxedPrometheusExtra>,
         telegraf_sender: DebugSender<TelegrafMetric>,
         profile_sender: DebugSender<Profile>,
+        application_log_sender: DebugSender<ApplicationLog>,
+        skywalking_sender: DebugSender<SkyWalkingExtra>,
+        datadog_sender: DebugSender<Datadog>,
         port: u16,
         exception_handler: ExceptionHandler,
         compressed: bool,
+        profile_compressed: bool,
         local_epc_id: u32,
         policy_getter: PolicyGetter,
         time_diff: Arc<AtomicI64>,
-        prometheus_extra_config: PrometheusExtraConfig,
+        prometheus_extra_config: PrometheusExtraLabels,
         log_parser_config: LogParserConfig,
         external_profile_integration_disabled: bool,
         external_trace_integration_disabled: bool,
         external_metric_integration_disabled: bool,
+        external_log_integration_disabled: bool,
     ) -> (Self, IntegrationCounter) {
         let counter = IntegrationCounter::default();
         (
@@ -925,11 +1087,15 @@ impl MetricServer {
                 runtime,
                 thread: Arc::new(Mutex::new(None)),
                 compressed: Arc::new(AtomicBool::new(compressed)),
+                profile_compressed: Arc::new(AtomicBool::new(profile_compressed)),
                 otel_sender,
                 compressed_otel_sender,
                 prometheus_sender,
                 telegraf_sender,
                 profile_sender,
+                application_log_sender,
+                skywalking_sender,
+                datadog_sender,
                 port: Arc::new(AtomicU16::new(port)),
                 exception_handler,
                 server_shutdown_tx: Default::default(),
@@ -943,6 +1109,7 @@ impl MetricServer {
                 external_profile_integration_disabled,
                 external_trace_integration_disabled,
                 external_metric_integration_disabled,
+                external_log_integration_disabled,
             },
             counter,
         )
@@ -950,6 +1117,10 @@ impl MetricServer {
 
     pub fn enable_compressed(&self, enable: bool) {
         self.compressed.store(enable, Ordering::Relaxed);
+    }
+
+    pub fn enable_profile_compressed(&self, enable: bool) {
+        self.profile_compressed.store(enable, Ordering::Relaxed);
     }
 
     pub fn set_port(&self, port: u16) {
@@ -973,6 +1144,9 @@ impl MetricServer {
         let prometheus_sender = self.prometheus_sender.clone();
         let telegraf_sender = self.telegraf_sender.clone();
         let profile_sender = self.profile_sender.clone();
+        let application_log_sender = self.application_log_sender.clone();
+        let skywalking_sender = self.skywalking_sender.clone();
+        let datadog_sender = self.datadog_sender.clone();
         let port = self.port.clone();
         let monitor_port = Arc::new(AtomicU16::new(port.load(Ordering::Acquire)));
         let (mon_tx, mon_rx) = oneshot::channel();
@@ -980,6 +1154,7 @@ impl MetricServer {
         let running = self.running.clone();
         let counter = self.counter.clone();
         let compressed = self.compressed.clone();
+        let profile_compressed = self.profile_compressed.clone();
         let local_epc_id = self.local_epc_id.clone();
         let policy_getter = self.policy_getter.clone();
         let time_diff = self.time_diff.clone();
@@ -988,6 +1163,7 @@ impl MetricServer {
         let external_profile_integration_disabled = self.external_profile_integration_disabled;
         let external_trace_integration_disabled = self.external_trace_integration_disabled;
         let external_metric_integration_disabled = self.external_metric_integration_disabled;
+        let external_log_integration_disabled = self.external_log_integration_disabled;
         let (tx, mut rx) = mpsc::channel(8);
         self.runtime
             .spawn(Self::alive_check(monitor_port.clone(), tx.clone(), mon_rx));
@@ -1042,9 +1218,13 @@ impl MetricServer {
                     let prometheus_sender = prometheus_sender.clone();
                     let telegraf_sender = telegraf_sender.clone();
                     let profile_sender = profile_sender.clone();
+                    let application_log_sender = application_log_sender.clone();
+                    let skywalking_sender = skywalking_sender.clone();
+                    let datadog_sender = datadog_sender.clone();
                     let exception_handler_inner = exception_handler.clone();
                     let counter = counter.clone();
                     let compressed = compressed.clone();
+                    let profile_compressed = profile_compressed.clone();
                     let local_epc_id = local_epc_id.clone();
                     let policy_getter = policy_getter.clone();
                     let time_diff = time_diff.clone();
@@ -1057,10 +1237,14 @@ impl MetricServer {
                         let prometheus_sender = prometheus_sender.clone();
                         let telegraf_sender = telegraf_sender.clone();
                         let profile_sender = profile_sender.clone();
+                        let application_log_sender = application_log_sender.clone();
+                        let skywalking_sender = skywalking_sender.clone();
+                        let datadog_sender = datadog_sender.clone();
                         let exception_handler = exception_handler_inner.clone();
                         let peer_addr = conn.remote_addr();
                         let counter = counter.clone();
                         let compressed = compressed.clone();
+                        let profile_compressed = profile_compressed.clone();
                         let local_epc_id = local_epc_id.clone();
                         let policy_getter = policy_getter.clone();
                         let time_diff = time_diff.clone();
@@ -1078,8 +1262,12 @@ impl MetricServer {
                                     prometheus_sender.clone(),
                                     telegraf_sender.clone(),
                                     profile_sender.clone(),
+                                    application_log_sender.clone(),
+                                    skywalking_sender.clone(),
+                                    datadog_sender.clone(),
                                     exception_handler.clone(),
                                     compressed.load(Ordering::Relaxed),
+                                    profile_compressed.load(Ordering::Relaxed),
                                     counter.clone(),
                                     local_epc_id,
                                     policy_getter.clone(),
@@ -1090,6 +1278,7 @@ impl MetricServer {
                                     external_profile_integration_disabled,
                                     external_trace_integration_disabled,
                                     external_metric_integration_disabled,
+                                    external_log_integration_disabled,
                                 )
                             }))
                         }

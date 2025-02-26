@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodNamespace(dbItem *mysql.PodNamespace, seq int) {
+func (b *DataSet) AddPodNamespace(dbItem *metadbmodel.PodNamespace, seq int) {
 	b.PodNamespaces[dbItem.Lcuuid] = &PodNamespace{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -33,12 +33,12 @@ func (b *DataSet) AddPodNamespace(dbItem *mysql.PodNamespace, seq int) {
 		SubDomainLcuuid: dbItem.SubDomain,
 		CloudTags:       dbItem.CloudTags,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, b.PodNamespaces[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, b.PodNamespaces[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodNamespace(lcuuid string) {
 	delete(b.PodNamespaces, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodNamespace struct {

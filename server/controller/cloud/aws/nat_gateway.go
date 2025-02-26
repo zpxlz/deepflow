@@ -24,11 +24,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInterface, []model.IP, error) {
-	log.Debug("get nat gateways starting")
+func (a *Aws) getNatGateways(client *ec2.Client) ([]model.NATGateway, []model.VInterface, []model.IP, error) {
+	log.Debug("get nat gateways starting", logger.NewORGPrefix(a.orgID))
 	var natGateways []model.NATGateway
 	var natVinterfaces []model.VInterface
 	var natIPs []model.IP
@@ -43,9 +43,9 @@ func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInt
 		} else {
 			input = &ec2.DescribeNatGatewaysInput{MaxResults: &maxResults, NextToken: &nextToken}
 		}
-		result, err := a.ec2Client.DescribeNatGateways(context.TODO(), input)
+		result, err := client.DescribeNatGateways(context.TODO(), input)
 		if err != nil {
-			log.Errorf("nat gateway request aws api error: (%s)", err.Error())
+			log.Errorf("nat gateway request aws api error: (%s)", err.Error(), logger.NewORGPrefix(a.orgID))
 			return []model.NATGateway{}, []model.VInterface{}, []model.IP{}, err
 		}
 		retNatGateways = append(retNatGateways, result.NatGateways...)
@@ -58,7 +58,7 @@ func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInt
 	for _, nData := range retNatGateways {
 		natGatewayID := a.getStringPointerValue(nData.NatGatewayId)
 		if nData.State != "available" {
-			log.Infof("nat gateway (%s) is not available", natGatewayID)
+			log.Infof("nat gateway (%s) is not available", natGatewayID, logger.NewORGPrefix(a.orgID))
 			continue
 		}
 		floatingIPs := []string{}
@@ -67,8 +67,8 @@ func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInt
 				floatingIPs = append(floatingIPs, a.getStringPointerValue(nAddresses.PublicIp))
 			}
 		}
-		natGatewayLcuuid := common.GetUUID(natGatewayID, uuid.Nil)
-		vpcLcuuid := common.GetUUID(a.getStringPointerValue(nData.VpcId), uuid.Nil)
+		natGatewayLcuuid := common.GetUUIDByOrgID(a.orgID, natGatewayID)
+		vpcLcuuid := common.GetUUIDByOrgID(a.orgID, a.getStringPointerValue(nData.VpcId))
 		natGatewayName := a.getResultTagName(nData.Tags)
 		if natGatewayName == "" {
 			natGatewayName = natGatewayID
@@ -79,10 +79,10 @@ func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInt
 			Label:        natGatewayID,
 			FloatingIPs:  strings.Join(floatingIPs, ","),
 			VPCLcuuid:    vpcLcuuid,
-			RegionLcuuid: a.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid: a.regionLcuuid,
 		})
 
-		vinterfaceLcuuid := common.GetUUID(natGatewayLcuuid, uuid.Nil)
+		vinterfaceLcuuid := common.GetUUIDByOrgID(a.orgID, natGatewayLcuuid)
 		natVinterfaces = append(natVinterfaces, model.VInterface{
 			Lcuuid:        vinterfaceLcuuid,
 			Type:          common.VIF_TYPE_WAN,
@@ -91,18 +91,18 @@ func (a *Aws) getNatGateways(region awsRegion) ([]model.NATGateway, []model.VInt
 			DeviceType:    common.VIF_DEVICE_TYPE_NAT_GATEWAY,
 			NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 			VPCLcuuid:     vpcLcuuid,
-			RegionLcuuid:  a.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid:  a.regionLcuuid,
 		})
 
 		for _, ip := range floatingIPs {
 			natIPs = append(natIPs, model.IP{
 				IP:               ip,
 				VInterfaceLcuuid: vinterfaceLcuuid,
-				RegionLcuuid:     a.getRegionLcuuid(region.lcuuid),
-				Lcuuid:           common.GetUUID(vinterfaceLcuuid+ip, uuid.Nil),
+				RegionLcuuid:     a.regionLcuuid,
+				Lcuuid:           common.GetUUIDByOrgID(a.orgID, vinterfaceLcuuid+ip),
 			})
 		}
 	}
-	log.Debug("get nat gateways complete")
+	log.Debug("get nat gateways complete", logger.NewORGPrefix(a.orgID))
 	return natGateways, natVinterfaces, natIPs, nil
 }

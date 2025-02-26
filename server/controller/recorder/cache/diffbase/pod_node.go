@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodNode(dbItem *mysql.PodNode, seq int) {
+func (b *DataSet) AddPodNode(dbItem *metadbmodel.PodNode, seq int) {
 	b.PodNodes[dbItem.Lcuuid] = &PodNode{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -30,24 +30,28 @@ func (b *DataSet) AddPodNode(dbItem *mysql.PodNode, seq int) {
 		},
 		Type:            dbItem.Type,
 		State:           dbItem.State,
+		Hostname:        dbItem.Hostname,
+		IP:              dbItem.IP,
 		VCPUNum:         dbItem.VCPUNum,
 		MemTotal:        dbItem.MemTotal,
 		RegionLcuuid:    dbItem.Region,
 		AZLcuuid:        dbItem.AZ,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, b.PodNodes[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, b.PodNodes[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodNode(lcuuid string) {
 	delete(b.PodNodes, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_NODE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodNode struct {
 	DiffBase
 	Type            int    `json:"type"`
 	State           int    `json:"state"`
+	Hostname        string `json:"hostname"`
+	IP              string `json:"ip"`
 	VCPUNum         int    `json:"vcpu_num"`
 	MemTotal        int    `json:"mem_total"`
 	RegionLcuuid    string `json:"region_lcuuid"`
@@ -58,6 +62,8 @@ type PodNode struct {
 func (p *PodNode) Update(cloudItem *cloudmodel.PodNode) {
 	p.Type = cloudItem.Type
 	p.State = cloudItem.State
+	p.Hostname = cloudItem.Hostname
+	p.IP = cloudItem.IP
 	p.VCPUNum = cloudItem.VCPUNum
 	p.MemTotal = cloudItem.MemTotal
 	p.RegionLcuuid = cloudItem.RegionLcuuid

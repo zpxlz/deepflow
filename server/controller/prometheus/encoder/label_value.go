@@ -19,29 +19,32 @@ package encoder
 import (
 	"sync"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type labelValue struct {
+	org          *common.ORG
 	lock         sync.Mutex
 	resourceType string
 	strToID      sync.Map
 }
 
-func newLabelValue() *labelValue {
+func newLabelValue(org *common.ORG) *labelValue {
 	return &labelValue{
+		org:          org,
 		resourceType: "label_value",
 	}
 }
 
 func (lv *labelValue) refresh(args ...interface{}) error {
-	var items []*mysql.PrometheusLabelValue
-	err := mysql.Db.Unscoped().Find(&items).Error
+	var items []*metadbmodel.PrometheusLabelValue
+	err := lv.org.DB.Unscoped().Find(&items).Error
 	if err != nil {
-		log.Errorf("db query %s failed: %v", lv.resourceType, err)
+		log.Errorf("db query %s failed: %v", lv.resourceType, err, lv.org.LogPrefix)
 		return err
 	}
 	for _, item := range items {
@@ -55,22 +58,22 @@ func (lv *labelValue) encode(strs []string) ([]*controller.PrometheusLabelValue,
 	defer lv.lock.Unlock()
 
 	resp := make([]*controller.PrometheusLabelValue, 0)
-	dbToAdd := make([]*mysql.PrometheusLabelValue, 0)
+	dbToAdd := make([]*metadbmodel.PrometheusLabelValue, 0)
 	for i := range strs {
 		str := strs[i]
 		if id, ok := lv.getID(str); ok {
 			resp = append(resp, &controller.PrometheusLabelValue{Value: &str, Id: proto.Uint32(uint32(id))})
 			continue
 		}
-		dbToAdd = append(dbToAdd, &mysql.PrometheusLabelValue{Value: str})
+		dbToAdd = append(dbToAdd, &metadbmodel.PrometheusLabelValue{Value: str})
 	}
 	if len(dbToAdd) == 0 {
 		return resp, nil
 	}
 
-	err := addBatch(dbToAdd, lv.resourceType)
+	err := addBatch(lv.org.DB, dbToAdd, lv.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", lv.resourceType, err.Error())
+		log.Errorf("add %s error: %s", lv.resourceType, err.Error(), lv.org.LogPrefix)
 		return nil, err
 	}
 	for i := range dbToAdd {
@@ -87,6 +90,6 @@ func (lv *labelValue) getID(str string) (int, bool) {
 	return 0, false
 }
 
-func (lv *labelValue) store(item *mysql.PrometheusLabelValue) {
+func (lv *labelValue) store(item *metadbmodel.PrometheusLabelValue) {
 	lv.strToID.Store(item.Value, item.ID)
 }

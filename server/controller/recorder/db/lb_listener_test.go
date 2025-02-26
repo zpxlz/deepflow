@@ -23,25 +23,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBLBListener() *mysql.LBListener {
-	return &mysql.LBListener{Base: mysql.Base{Lcuuid: uuid.New().String()}, Port: rand.Intn(65535)}
+func newDBLBListener() *metadbmodel.LBListener {
+	return &metadbmodel.LBListener{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}, Port: rand.Intn(65535)}
 }
 
 func (t *SuiteTest) TestAddLBListenerBatchSuccess() {
 	operator := NewLBListener()
 	itemToAdd := newDBLBListener()
 
-	_, ok := operator.AddBatch([]*mysql.LBListener{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.LBListener{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.LBListener
+	var addedItem *metadbmodel.LBListener
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Port, itemToAdd.Port)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.LBListener{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.LBListener{})
 }
 
 func (t *SuiteTest) TestUpdateLBListenerSuccess() {
@@ -54,11 +54,11 @@ func (t *SuiteTest) TestUpdateLBListenerSuccess() {
 	_, ok := operator.Update(addedItem.Lcuuid, updateInfo)
 	assert.True(t.T(), ok)
 
-	var updatedItem *mysql.LBListener
+	var updatedItem *metadbmodel.LBListener
 	t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&updatedItem)
 	assert.Equal(t.T(), updatedItem.Port, updateInfo["port"])
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.LBListener{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.LBListener{})
 }
 
 func (t *SuiteTest) TestDeleteLBListenerBatchSuccess() {
@@ -68,7 +68,7 @@ func (t *SuiteTest) TestDeleteLBListenerBatchSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.LBListener
+	var deletedItem *metadbmodel.LBListener
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }

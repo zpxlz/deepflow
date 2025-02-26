@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddRoutingTable(dbItem *mysql.RoutingTable, seq int) {
+func (b *DataSet) AddRoutingTable(dbItem *metadbmodel.RoutingTable, seq int) {
 	b.RoutingTables[dbItem.Lcuuid] = &RoutingTable{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -32,12 +32,12 @@ func (b *DataSet) AddRoutingTable(dbItem *mysql.RoutingTable, seq int) {
 		Nexthop:     dbItem.Nexthop,
 		NexthopType: dbItem.NexthopType,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN, b.RoutingTables[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN, b.RoutingTables[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteRoutingTable(lcuuid string) {
 	delete(b.RoutingTables, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_ROUTING_TABLE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type RoutingTable struct {

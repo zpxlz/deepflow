@@ -19,14 +19,14 @@ package aws
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (a *Aws) getFloatingIPs() (floatingIPs []model.FloatingIP, err error) {
-	log.Debug("get floating ips starting")
+	log.Debug("get floating ips starting", logger.NewORGPrefix(a.orgID))
 	for ip, v := range a.publicIPToVinterface {
 		floatingIP := model.FloatingIP{
-			Lcuuid:        common.GetUUID(v.Lcuuid+ip, uuid.Nil),
+			Lcuuid:        common.GetUUIDByOrgID(a.orgID, v.Lcuuid+ip),
 			IP:            ip,
 			VMLcuuid:      v.DeviceLcuuid,
 			NetworkLcuuid: common.NETWORK_ISP_LCUUID,
@@ -35,6 +35,6 @@ func (a *Aws) getFloatingIPs() (floatingIPs []model.FloatingIP, err error) {
 		}
 		floatingIPs = append(floatingIPs, floatingIP)
 	}
-	log.Debug("get floating ips complete")
+	log.Debug("get floating ips complete", logger.NewORGPrefix(a.orgID))
 	return
 }

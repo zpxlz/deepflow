@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type AZ struct {
-	OperatorBase[mysql.AZ]
+	OperatorBase[*metadbmodel.AZ, metadbmodel.AZ]
 }
 
 func NewAZ() *AZ {
 	operater := &AZ{
-		OperatorBase[mysql.AZ]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_AZ_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.AZ](
+			ctrlrcommon.RESOURCE_TYPE_AZ_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *AZ) setDBItemID(dbItem *mysql.AZ, id int) {
-	dbItem.ID = id
 }

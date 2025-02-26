@@ -23,16 +23,17 @@ import (
 	"github.com/baidubce/bce-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getNatGateways(region model.Region, vpcIdToLcuuid map[string]string) (
+func (b *BaiduBce) getNatGateways(vpcIdToLcuuid map[string]string) (
 	[]model.NATGateway, []model.VInterface, []model.IP, error,
 ) {
 	var retNATGateways []model.NATGateway
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get nat_gateways starting")
+	log.Debug("get nat_gateways starting", logger.NewORGPrefix(b.orgID))
 
 	vpcClient, _ := vpc.NewClient(b.secretID, b.secretKey, "bcc."+b.endpoint)
 	vpcClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -44,7 +45,7 @@ func (b *BaiduBce) getNatGateways(region model.Region, vpcIdToLcuuid map[string]
 		startTime := time.Now()
 		result, err := vpcClient.ListNatGateway(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("ListNatGateway", len(result.Nats), startTime)
@@ -60,25 +61,24 @@ func (b *BaiduBce) getNatGateways(region model.Region, vpcIdToLcuuid map[string]
 		for _, nat := range r.Nats {
 			vpcLcuuid, ok := vpcIdToLcuuid[nat.VpcId]
 			if !ok {
-				log.Debugf("nat_gateway (%s) vpc (%s) not found", nat.Id, nat.VpcId)
+				log.Debugf("nat_gateway (%s) vpc (%s) not found", nat.Id, nat.VpcId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
-			natGatewayLcuuid := common.GenerateUUID(nat.Id)
+			natGatewayLcuuid := common.GenerateUUIDByOrgID(b.orgID, nat.Id)
 			retNATGateway := model.NATGateway{
 				Lcuuid:       natGatewayLcuuid,
 				Name:         nat.Name,
 				Label:        nat.Id,
 				FloatingIPs:  strings.Join(nat.Eips, ","),
 				VPCLcuuid:    vpcLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			}
 			retNATGateways = append(retNATGateways, retNATGateway)
-			b.regionLcuuidToResourceNum[retNATGateway.RegionLcuuid]++
 
 			// TODO: 目前Go sdk只能返回snat_ip，需要后续跟进dnat_ips
 			// 将nat_ip作为接口 + 公网IP返回
 			for _, ip := range nat.Eips {
-				vinterfaceLcuuid := common.GenerateUUID(natGatewayLcuuid + ip)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, natGatewayLcuuid+ip)
 				retVInterface := model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.VIF_TYPE_LAN,
@@ -87,20 +87,20 @@ func (b *BaiduBce) getNatGateways(region model.Region, vpcIdToLcuuid map[string]
 					DeviceLcuuid:  natGatewayLcuuid,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  region.Lcuuid,
+					RegionLcuuid:  b.regionLcuuid,
 				}
 				retVInterfaces = append(retVInterfaces, retVInterface)
 
 				retIP := model.IP{
-					Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + ip),
+					Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+ip),
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               ip,
-					RegionLcuuid:     region.Lcuuid,
+					RegionLcuuid:     b.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 			}
 		}
 	}
-	log.Debug("get nat_gateways complete")
+	log.Debug("get nat_gateways complete", logger.NewORGPrefix(b.orgID))
 	return retNATGateways, retVInterfaces, retIPs, nil
 }

@@ -28,18 +28,17 @@ use public::enums::IpProtocol;
 use crate::{
     common::{
         ebpf::EbpfType,
+        flow::PacketDirection,
         l7_protocol_info::L7ProtocolInfo,
+        l7_protocol_log::L7ProtocolParserInterface,
         l7_protocol_log::{EbpfParam, L7PerfCache, ParseParam},
     },
-    flow_generator::protocol_logs::plugin::shared_obj::get_so_parser,
-};
-use crate::{
-    common::{flow::PacketDirection, l7_protocol_log::L7ProtocolParserInterface},
-    flow_generator::protocol_logs::plugin::shared_obj::SoLog,
-};
-use crate::{
-    config::OracleParseConfig,
-    flow_generator::protocol_logs::{pb_adapter::KeyVal, L7ResponseStatus, LogMessageType},
+    config::OracleConfig,
+    flow_generator::protocol_logs::{
+        pb_adapter::KeyVal,
+        plugin::shared_obj::{get_so_parser, SoLog},
+        L7ResponseStatus, LogMessageType,
+    },
 };
 
 use super::{load_plugin, SoPluginFunc};
@@ -70,9 +69,10 @@ fn get_req_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345678,
         parse_log: true,
         parse_perf: true,
@@ -83,7 +83,9 @@ fn get_req_param<'a>(
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 0,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 0,
+        oracle_parse_conf: OracleConfig::default(),
+        icmp_data: None,
     }
 }
 
@@ -105,9 +107,10 @@ fn get_resp_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345679,
         parse_perf: true,
         parse_log: true,
@@ -118,7 +121,9 @@ fn get_resp_param<'a>(
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 0,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 0,
+        oracle_parse_conf: OracleConfig::default(),
+        icmp_data: None,
     }
 }
 

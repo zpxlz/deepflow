@@ -18,20 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type PodIngressRule struct {
-	OperatorBase[mysql.PodIngressRule]
+	OperatorBase[*metadbmodel.PodIngressRule, metadbmodel.PodIngressRule]
 }
 
 func NewPodIngressRule() *PodIngressRule {
 	o := &PodIngressRule{
-		OperatorBase[mysql.PodIngressRule]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.PodIngressRule](
+			ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_RULE_EN,
+			false,
+			false,
+		),
 	}
 	o.setFieldsNeededAfterCreate([]string{"id", "lcuuid", "sub_domain"})
 	return o

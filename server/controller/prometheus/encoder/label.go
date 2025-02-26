@@ -19,27 +19,30 @@ package encoder
 import (
 	"sync"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/prometheus/cache"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type label struct {
+	org          *common.ORG
 	lock         sync.Mutex
 	resourceType string
 	labelKeyToID sync.Map
 	labelIDToKey sync.Map
 }
 
-func newLabel() *label {
+func newLabel(org *common.ORG) *label {
 	return &label{
+		org:          org,
 		resourceType: "label",
 	}
 }
 
-func (l *label) store(item *mysql.PrometheusLabel) {
+func (l *label) store(item *metadbmodel.PrometheusLabel) {
 	l.labelKeyToID.Store(cache.NewLabelKey(item.Name, item.Value), item.ID)
 	l.labelIDToKey.Store(item.ID, cache.NewLabelKey(item.Name, item.Value))
 }
@@ -59,8 +62,8 @@ func (l *label) getID(key cache.LabelKey) (int, bool) {
 }
 
 func (l *label) refresh(args ...interface{}) error {
-	var items []*mysql.PrometheusLabel
-	err := mysql.Db.Find(&items).Error
+	var items []*metadbmodel.PrometheusLabel
+	err := l.org.DB.Find(&items).Error
 	if err != nil {
 		return err
 	}
@@ -75,7 +78,7 @@ func (l *label) encode(toAdd []*controller.PrometheusLabelRequest) ([]*controlle
 	defer l.lock.Unlock()
 
 	resp := make([]*controller.PrometheusLabel, 0)
-	var dbToAdd []*mysql.PrometheusLabel
+	var dbToAdd []*metadbmodel.PrometheusLabel
 	for _, item := range toAdd {
 		n := item.GetName()
 		v := item.GetValue()
@@ -87,15 +90,15 @@ func (l *label) encode(toAdd []*controller.PrometheusLabelRequest) ([]*controlle
 			})
 			continue
 		}
-		dbToAdd = append(dbToAdd, &mysql.PrometheusLabel{
+		dbToAdd = append(dbToAdd, &metadbmodel.PrometheusLabel{
 			Name:  n,
 			Value: v,
 		})
 	}
 
-	err := addBatch(dbToAdd, l.resourceType)
+	err := addBatch(l.org.DB, dbToAdd, l.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", l.resourceType, err.Error())
+		log.Errorf("add %s error: %s", l.resourceType, err.Error(), l.org.LogPrefix)
 		return nil, err
 	}
 	for _, item := range dbToAdd {

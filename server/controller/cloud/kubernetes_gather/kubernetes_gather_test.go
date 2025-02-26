@@ -17,9 +17,10 @@
 package kubernetes_gather
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"reflect"
 	"testing"
 
@@ -27,23 +28,24 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 
 	cloudconfig "github.com/deepflowio/deepflow/server/controller/cloud/config"
-	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
+	gcommon "github.com/deepflowio/deepflow/server/controller/genesis/common"
 )
 
 func TestKubernetes(t *testing.T) {
 	Convey("TestKubernetes", t, func() {
-		k8sConfig := mysql.SubDomain{
+		k8sConfig := metadbmodel.SubDomain{
 			Name:        "test_k8s",
 			DisplayName: "test_k8s",
 			ClusterID:   "d-01LMvvfQPZ",
 			Config:      fmt.Sprintf(`{"node_port_name_regex": "","pod_net_ipv4_cidr_max_mask": %v,"pod_net_ipv6_cidr_max_mask": %v,"region_uuid": "%s","vpc_uuid": ""}`, common.K8S_POD_IPV4_NETMASK, common.K8S_POD_IPV6_NETMASK, common.DEFAULT_REGION),
 		}
 
-		k8s := NewKubernetesGather(nil, &k8sConfig, cloudconfig.CloudConfig{}, false)
+		k8s := NewKubernetesGather(metadb.DefaultDB, nil, &k8sConfig, cloudconfig.CloudConfig{}, false)
 		type KResource struct {
 			Pod        []string `json:"*v1.Pod"`
 			Info       []string `json:"*version.Info"`
@@ -64,7 +66,7 @@ func TestKubernetes(t *testing.T) {
 			Resources KResource `json:"resources"`
 		}
 
-		kJsonData, _ := ioutil.ReadFile("./testfiles/kubernetes-info.json")
+		kJsonData, _ := os.ReadFile("./testfiles/kubernetes-info.json")
 		var kData KDataResp
 		json.Unmarshal(kJsonData, &kData)
 		k8sInfo := map[string][]string{}
@@ -83,20 +85,14 @@ func TestKubernetes(t *testing.T) {
 		})
 		defer k8sInfoPatch.Reset()
 
-		g := genesis.NewGenesis(&config.ControllerConfig{})
-		vJsonData, _ := ioutil.ReadFile("./testfiles/vinterfaces.json")
-		var vData genesis.GenesisSyncData
+		g := genesis.NewGenesis(context.Background(), &config.ControllerConfig{})
+		vJsonData, _ := os.ReadFile("./testfiles/vinterfaces.json")
+		var vData gcommon.GenesisSyncDataResponse
 		json.Unmarshal(vJsonData, &vData)
-		vinterfacesInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetGenesisSyncResponse", func(_ *genesis.Genesis) (genesis.GenesisSyncData, error) {
+		vinterfacesInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetGenesisSyncResponse", func(_ *genesis.Genesis, _ int) (gcommon.GenesisSyncDataResponse, error) {
 			return vData, nil
 		})
 		defer vinterfacesInfoPatch.Reset()
-
-		pData := []model.PrometheusTarget{}
-		prometheusTargetInfoPatch := gomonkey.ApplyMethod(reflect.TypeOf(g), "GetPrometheusResponse", func(_ *genesis.Genesis) ([]model.PrometheusTarget, error) {
-			return pData, nil
-		})
-		defer prometheusTargetInfoPatch.Reset()
 
 		k8sGatherData, _ := k8s.GetKubernetesGatherData()
 		Convey("k8sGatherResource number should be equal", func() {

@@ -27,6 +27,21 @@
 #include "table.h"
 #include "log.h"
 
+bool bpf_table_get(struct bpf_tracer *tracer,
+			 const char *tb_name, void *key, void *val)
+{
+	struct ebpf_map *map = ebpf_obj__get_map_by_name(tracer->obj, tb_name);
+	if (map == NULL) {
+		ebpf_warning("[%s] map name \"%s\" map is NULL.\n", __func__,
+			     tb_name);
+		return false;
+	}
+
+	int map_fd = map->fd;
+
+	return bpf_lookup_elem(map_fd, key, val) == 0;
+}
+
 bool bpf_table_get_value(struct bpf_tracer *tracer,
 			 const char *tb_name, uint64_t key, void *val_buf)
 {
@@ -106,4 +121,36 @@ bool bpf_table_delete_key(struct bpf_tracer *tracer,
 	}
 
 	return true;
+}
+
+void insert_prog_to_map(struct bpf_tracer *tracer, const char *map_name,
+					const char *prog_name, int key)
+{
+	struct ebpf_prog *prog = ebpf_obj__get_prog_by_name(tracer->obj, prog_name);
+	if (prog == NULL) {
+		ebpf_error("bpf_obj__get_prog_by_name() not find \"%s\"\n",
+			   prog_name);
+		return;
+	}
+
+	if (!bpf_table_set_value(tracer, map_name, key, &prog->prog_fd)) {
+		ebpf_error("bpf_table_set_value() failed, prog fd:%d\n",
+			   prog->prog_fd);
+		return;
+	}
+
+	ebpf_info("Insert into map('%s'), key %d, program name %s\n",
+		  map_name, key, prog_name);
+}
+
+int bpf_table_get_fd(struct bpf_tracer *tracer, const char *tb_name)
+{
+	struct ebpf_map *map = ebpf_obj__get_map_by_name(tracer->obj, tb_name);
+	if (map == NULL) {
+		ebpf_debug("[%s] map name \"%s\" map is NULL.\n", __func__,
+			   tb_name);
+		return -1;
+	}
+
+	return map->fd;
 }

@@ -43,6 +43,8 @@ type RebalanceType string
 
 const RebalanceTypeNull RebalanceType = "null"
 
+var isDebug, isAggIP bool
+
 func RegisterAgentCommand() *cobra.Command {
 	agent := &cobra.Command{
 		Use:   "agent",
@@ -94,6 +96,7 @@ func RegisterAgentCommand() *cobra.Command {
 	}
 
 	var typeStr string
+
 	rebalanceCmd := &cobra.Command{
 		Use:   "rebalance",
 		Short: "rebalance controller or analyzer",
@@ -117,6 +120,8 @@ deepflow-ctl agent rebalance --type=analyzer`,
 		},
 	}
 	rebalanceCmd.Flags().StringVarP(&typeStr, "type", "t", "", "request type controller/analyzer")
+	rebalanceCmd.Flags().BoolVarP(&isDebug, "debug", "d", false, "enable debug output")
+	rebalanceCmd.Flags().BoolVarP(&isAggIP, "agg-ip", "", false, "aggregation based on analyzer ip, type only support analzyer")
 
 	agent.AddCommand(list)
 	agent.AddCommand(delete)
@@ -131,9 +136,16 @@ func RegisterAgentUpgradeCommand() *cobra.Command {
 		Use:   "agent-upgrade",
 		Short: "agent upgrade operation commands",
 		Example: "deepflow-ctl agent-upgrade list\n" +
-			"deepflow-ctl agent-upgrade vtap-name --image-name=deepflow-agent\n",
+			"deepflow-ctl agent-upgrade agent-name --image-name=deepflow-agent\n" +
+			"deepflow-ctl agent-upgrade cancel agent-name\n",
 		Run: func(cmd *cobra.Command, args []string) {
-			if len(args) == 1 {
+			if len(args) == 2 {
+				if args[0] == "cancel" {
+					cancelUpgadeAgent(cmd, args)
+				} else {
+					fmt.Println(cmd.Example)
+				}
+			} else if len(args) == 1 {
 				if args[0] == "list" {
 					listAgentUpgrade(cmd, args)
 				} else if imageName != "" {
@@ -166,14 +178,16 @@ func listAgentUpgrade(cmd *cobra.Command, args []string) {
 	url := fmt.Sprintf("http://%s:%d/v1/vtaps/", server.IP, server.Port)
 
 	// 调用采集器API，并输出返回结果
-	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	cmdFormat := "%-40s%-48s%-48s%-50s\n"
-	fmt.Printf(cmdFormat, "NAME", "REVISION", "EXPECTED_REVISION", "UPGRADE_PACKAGE")
+	t := table.New()
+	t.SetHeader([]string{"NAME", "REVISION", "EXPECTED_REVISION", "UPGRADE_PACKAGE"})
+	tableItems := [][]string{}
 	for i := range response.Get("DATA").MustArray() {
 		vtap := response.Get("DATA").GetIndex(i)
 		revision := vtap.Get("REVISION").MustString()
@@ -181,12 +195,16 @@ func listAgentUpgrade(cmd *cobra.Command, args []string) {
 		oldRevision := revision + "-" + completeRevision
 		expectedRevision := vtap.Get("EXPECTED_REVISION").MustString()
 		if expectedRevision != "" {
-			fmt.Printf(
-				cmdFormat, vtap.Get("NAME").MustString(), oldRevision,
-				expectedRevision, vtap.Get("UPGRADE_PACKAGE").MustString(),
-			)
+			tableItems = append(tableItems, []string{
+				vtap.Get("NAME").MustString(),
+				oldRevision,
+				expectedRevision,
+				vtap.Get("UPGRADE_PACKAGE").MustString(),
+			})
 		}
 	}
+	t.AppendBulk(tableItems)
+	t.Render()
 }
 
 func listAgent(cmd *cobra.Command, args []string, output string) {
@@ -203,7 +221,8 @@ func listAgent(cmd *cobra.Command, args []string, output string) {
 	}
 
 	// 调用采集器API，并输出返回结果
-	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -215,7 +234,7 @@ func listAgent(cmd *cobra.Command, args []string, output string) {
 		fmt.Printf(string(dataYaml))
 	} else {
 		t := table.New()
-		t.SetHeader([]string{"ID", "NAME", "TYPE", "CTRL_IP", "CTRL_MAC", "STATE", "GROUP", "EXCEPTIONS", "REVISION", "UPGRADE_REVISION"})
+		t.SetHeader([]string{"ID", "NAME", "TYPE", "CTRL_IP", "CTRL_MAC", "STATE", "GROUP", "EXCEPTIONS", "REVISION", "UPGRADE_REVISION", "POD_CLUSTER"})
 
 		tableItems := [][]string{}
 		for i := range response.Get("DATA").MustArray() {
@@ -243,6 +262,7 @@ func listAgent(cmd *cobra.Command, args []string, output string) {
 				strings.Join(exceptionStrings, ","),
 				vtap.Get("REVISION").MustString(),
 				vtap.Get("UPGRADE_REVISION").MustString(),
+				vtap.Get("POD_CLUSTER_NAME").MustString(),
 			})
 		}
 		t.AppendBulk(tableItems)
@@ -259,7 +279,8 @@ func deleteAgent(cmd *cobra.Command, args []string) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/vtaps/?name=%s", server.IP, server.Port, args[0])
 	// curl vtap API，get lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -269,7 +290,8 @@ func deleteAgent(cmd *cobra.Command, args []string) {
 		lcuuid := response.Get("DATA").GetIndex(0).Get("LCUUID").MustString()
 		url := fmt.Sprintf("http://%s:%d/v1/vtaps/%s/", server.IP, server.Port, lcuuid)
 		// call vtap delete api
-		_, err := common.CURLPerform("DELETE", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+		_, err := common.CURLPerform("DELETE", url, nil, "",
+			[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
@@ -293,14 +315,15 @@ func updateAgent(cmd *cobra.Command, args []string, updateFilename string) {
 
 	vtapName, ok := updateMap["name"]
 	if !ok {
-		fmt.Fprintln(os.Stderr, "must specify vtap name")
+		fmt.Fprintln(os.Stderr, "must specify agent name")
 		return
 	}
 
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/vtaps/?name=%s", server.IP, server.Port, vtapName)
 	// call vtap api, get lcuuid
-	response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -320,7 +343,8 @@ func updateAgent(cmd *cobra.Command, args []string, updateFilename string) {
 		updateBody["TAP_MODE"] = common.GetVtapTapModeByName(tapMode.(string))
 
 		updateJson, _ := json.Marshal(updateBody)
-		_, err := common.CURLPerform("PATCH", url, nil, string(updateJson), []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+		_, err := common.CURLPerform("PATCH", url, nil, string(updateJson),
+			[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
@@ -334,22 +358,31 @@ func updateAgent(cmd *cobra.Command, args []string, updateFilename string) {
 	}
 
 	// update vtap_group_id
-	if vtapGroupID, ok := updateMap["vtap_group_id"]; ok {
-		url := fmt.Sprintf("http://%s:%d/v1/vtap-groups/?short_uuid=%s", server.IP, server.Port, vtapGroupID)
+	var agentGroupID interface{}
+	if id, ok := updateMap["vtap_group_id"]; ok {
+		agentGroupID = id
+		printutil.WarnWithColor("use agent_group_id instead of vtap_group_id")
+	}
+	if id, ok := updateMap["agent_group_id"]; ok {
+		agentGroupID = id
+	}
+	if agentGroupID != nil {
+		url := fmt.Sprintf("http://%s:%d/v1/vtap-groups/?short_uuid=%s", server.IP, server.Port, agentGroupID)
 		// call vtap-group api, get lcuuid
-		response, err := common.CURLPerform("GET", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+		response, err := common.CURLPerform("GET", url, nil, "",
+			[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
 		}
 
 		if len(response.Get("DATA").MustArray()) == 0 {
-			fmt.Fprintln(os.Stderr, "agent-group (%s) not exist\n")
+			fmt.Fprintf(os.Stderr, "agent-group (%s) not exist\n", agentGroupID)
 		}
 		group := response.Get("DATA").GetIndex(0)
 		groupLcuuid := group.Get("LCUUID").MustString()
 		updateMap["VTAP_GROUP_LCUUID"] = groupLcuuid
-		delete(updateMap, "vtap_group_id")
+		delete(updateMap, "agent_group_id")
 	}
 
 	// enable/disable
@@ -361,7 +394,8 @@ func updateAgent(cmd *cobra.Command, args []string, updateFilename string) {
 	// call vtap update api
 	updateJson, _ := json.Marshal(updateMap)
 	url = fmt.Sprintf("http://%s:%d/v1/vtaps/%s/", server.IP, server.Port, lcuuid)
-	_, err = common.CURLPerform("PATCH", url, nil, string(updateJson), []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	_, err = common.CURLPerform("PATCH", url, nil, string(updateJson),
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -389,7 +423,8 @@ func upgadeAgent(cmd *cobra.Command, args []string) {
 
 	server := common.GetServerInfo(cmd)
 	serverURL := fmt.Sprintf("http://%s:%d/v1/controllers/", server.IP, server.Port)
-	response, err := common.CURLPerform("GET", serverURL, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err := common.CURLPerform("GET", serverURL, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -412,7 +447,8 @@ func upgadeAgent(cmd *cobra.Command, args []string) {
 	}
 
 	vtapURL := fmt.Sprintf("http://%s:%d/v1/vtaps/?name=%s", server.IP, server.Port, vtapName)
-	response, err = common.CURLPerform("GET", vtapURL, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	response, err = common.CURLPerform("GET", vtapURL, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -421,19 +457,13 @@ func upgadeAgent(cmd *cobra.Command, args []string) {
 	var (
 		vtapController string
 		vtapLcuuid     string
-		vtapType       int
 	)
 
 	if len(response.Get("DATA").MustArray()) > 0 {
 		vtapLcuuid = response.Get("DATA").GetIndex(0).Get("LCUUID").MustString()
 		vtapController = response.Get("DATA").GetIndex(0).Get("CONTROLLER_IP").MustString()
-		vtapType = response.Get("DATA").GetIndex(0).Get("TYPE").MustInt()
 	} else {
 		fmt.Printf("get agent(%s) info failed, url: %s\n", vtapName, vtapURL)
-		return
-	}
-	if vtapType == int(common.VTAP_TYPE_POD_VM) || vtapType == int(common.VTAP_TYPE_POD_HOST) || vtapType == int(common.VTAP_TYPE_K8S_SIDECAR) {
-		fmt.Printf("agent (%s) type is %v, not supported upgrade by cli\n", vtapName, common.VtapType(vtapType))
 		return
 	}
 	if vtapController == "" || vtapLcuuid == "" {
@@ -448,7 +478,8 @@ func upgadeAgent(cmd *cobra.Command, args []string) {
 	}
 	for host, _ := range hosts {
 		url := fmt.Sprintf(url_format, host, server.Port, vtapLcuuid)
-		response, err := common.CURLPerform("PATCH", url, body, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+		response, err := common.CURLPerform("PATCH", url, body, "",
+			[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			fmt.Printf("upgrade agent %s server %s failed, response: %s\n", vtapName, host, response)
@@ -459,7 +490,84 @@ func upgadeAgent(cmd *cobra.Command, args []string) {
 	}
 }
 
+func cancelUpgadeAgent(cmd *cobra.Command, args []string) {
+	if len(args) != 2 {
+		fmt.Fprintf(os.Stderr, "must specify name. Examples: \n%s", cmd.Example)
+		return
+	}
+	vtapName := args[1]
+
+	server := common.GetServerInfo(cmd)
+	serverURL := fmt.Sprintf("http://%s:%d/v1/controllers/", server.IP, server.Port)
+	response, err := common.CURLPerform("GET", serverURL, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	controllerArray := response.Get("DATA").MustArray()
+	hosts := map[string]struct{}{
+		server.IP: struct{}{},
+	}
+	if len(controllerArray) > 0 {
+		for index, _ := range controllerArray {
+			nodeType := response.Get("DATA").GetIndex(index).Get("NODE_TYPE").MustInt()
+			ip := response.Get("DATA").GetIndex(index).Get("IP").MustString()
+			if nodeType == 1 && ip != "" {
+				hosts[ip] = struct{}{}
+			}
+		}
+	} else {
+		fmt.Printf("get server info failed, url: %s\n", serverURL)
+		return
+	}
+
+	vtapURL := fmt.Sprintf("http://%s:%d/v1/vtaps/?name=%s", server.IP, server.Port, vtapName)
+	response, err = common.CURLPerform("GET", vtapURL, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+
+	var (
+		vtapController string
+		vtapLcuuid     string
+	)
+
+	if len(response.Get("DATA").MustArray()) > 0 {
+		vtapLcuuid = response.Get("DATA").GetIndex(0).Get("LCUUID").MustString()
+		vtapController = response.Get("DATA").GetIndex(0).Get("CONTROLLER_IP").MustString()
+	} else {
+		fmt.Printf("get agent(%s) info failed, url: %s\n", vtapName, vtapURL)
+		return
+	}
+	if vtapController == "" || vtapLcuuid == "" {
+		fmt.Printf("get agent(%s) info failed, url: %s\n", vtapName, vtapURL)
+		return
+	}
+
+	hosts[vtapController] = struct{}{}
+	url_format := "http://%s:%d/v1/cancel-upgrade/vtap/%s/"
+	body := map[string]interface{}{}
+	for host, _ := range hosts {
+		url := fmt.Sprintf(url_format, host, server.Port, vtapLcuuid)
+		response, err := common.CURLPerform("PATCH", url, body, "",
+			[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Printf("cancel upgrade agent %s server %s failed, response: %s\n", vtapName, host, response)
+			continue
+		} else {
+			fmt.Printf("cancel agent %s upgrade to server(%s) success\n", vtapName, host)
+		}
+	}
+}
+
 func rebalance(cmd *cobra.Command, rebalanceType RebalanceType, typeVal string) error {
+	if isDebug {
+		return rebalanceDebug(cmd, typeVal)
+	}
 	isBalance, err := ifNeedRebalance(cmd, typeVal)
 	if err != nil {
 		return err
@@ -483,10 +591,69 @@ func rebalance(cmd *cobra.Command, rebalanceType RebalanceType, typeVal string) 
 	return nil
 }
 
+func rebalanceDebug(cmd *cobra.Command, typeVal string) error {
+	server := common.GetServerInfo(cmd)
+	url := fmt.Sprintf("http://%s:%d/v1/rebalance-vtap/?type=%s&is_debug=true", server.IP, server.Port, typeVal)
+	resp, err := common.CURLPerform("POST", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
+	if err != nil {
+		return err
+	}
+	data := resp.Get("DATA")
+
+	if data.Get("TRAFFIC_AZ") == nil ||
+		(data.Get("TRAFFIC_AZ") != nil && len(data.Get("TRAFFIC_AZ").MustArray()) == 0) {
+		return nil
+	}
+	fmt.Println()
+
+	t := table.New()
+	t.SetHeader([]string{"REGION", "AZ", "ANALYZER_IP", "ANALYZER_STATE", "AZ_TRAFFIC", "AGENT_COUNT", "ANALYZER_TRAFFIC"})
+	tableItems := [][]string{}
+	for i := range data.Get("TRAFFIC_AZ").MustArray() {
+		d := data.Get("TRAFFIC_AZ").GetIndex(i)
+		tableItems = append(tableItems, []string{
+			d.Get("REGION").MustString(),
+			d.Get("AZ").MustString(),
+			d.Get("ANALYZER_IP").MustString(),
+			strconv.Itoa(int(d.Get("ANALYZER_STATE").MustInt64())),
+			strconv.Itoa(int(d.Get("AZ_TRAFFIC").MustInt64())),
+			strconv.Itoa(int(d.Get("AGENT_COUNT").MustInt())),
+			strconv.Itoa(int(d.Get("ANALYZER_TRAFFIC").MustInt64())),
+		})
+	}
+	t.AppendBulk(tableItems)
+	t.Render()
+
+	if isAggIP {
+		fmt.Println()
+
+		t1 := table.New()
+		t1.SetHeader([]string{"REGION", "AZ", "ANALYZER_IP", "ANALYZER_STATE", "AGENT_COUNT", "ANALYZER_TRAFFIC"})
+		tableItems = [][]string{}
+		for i := range data.Get("TRAFFIC_ANALYZER").MustArray() {
+			d := data.Get("TRAFFIC_ANALYZER").GetIndex(i)
+			tableItems = append(tableItems, []string{
+				d.Get("REGION").MustString(),
+				d.Get("AZ").MustString(),
+				d.Get("ANALYZER_IP").MustString(),
+				strconv.Itoa(int(d.Get("ANALYZER_STATE").MustInt64())),
+				strconv.Itoa(int(d.Get("AGENT_COUNT").MustInt())),
+				strconv.Itoa(int(d.Get("ANALYZER_TRAFFIC").MustInt64())),
+			})
+		}
+		t1.AppendBulk(tableItems)
+		t1.Render()
+	}
+
+	return nil
+}
+
 func ifNeedRebalance(cmd *cobra.Command, typeStr string) (bool, error) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/rebalance-vtap/?check=false&type=%s", server.IP, server.Port, typeStr)
-	resp, err := common.CURLPerform("POST", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	resp, err := common.CURLPerform("POST", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		return false, err
 	}
@@ -499,7 +666,8 @@ func ifNeedRebalance(cmd *cobra.Command, typeStr string) (bool, error) {
 func execRebalance(cmd *cobra.Command, typeStr string) (*simplejson.Json, error) {
 	server := common.GetServerInfo(cmd)
 	url := fmt.Sprintf("http://%s:%d/v1/rebalance-vtap/?check=true&type=%s", server.IP, server.Port, typeStr)
-	resp, err := common.CURLPerform("POST", url, nil, "", []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	resp, err := common.CURLPerform("POST", url, nil, "",
+		[]common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 	if err != nil {
 		return nil, err
 	}
@@ -525,9 +693,9 @@ func printDetail(resp *simplejson.Json) {
 		ipMaxSize, "IP",
 		azMaxSize, "AZ",
 		stateMaxSize, "STATE",
-		beforeVTapNumMaxSize, "BEFORE_VTAP_NUM",
-		afertVTapNumMaxSize, "AFTER_VTAP_NUM",
-		switchVTapNumMaxSize, "SWITCH_VTAP_NUM")
+		beforeVTapNumMaxSize, "BEFORE_AGENT_NUM",
+		afertVTapNumMaxSize, "AFTER_AGENT_NUM",
+		switchVTapNumMaxSize, "SWITCH_AGENT_NUM")
 
 	for i := range details.MustArray() {
 		detail := resp.Get("DATA").Get("DETAILS").GetIndex(i)

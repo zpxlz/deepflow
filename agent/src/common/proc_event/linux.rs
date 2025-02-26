@@ -16,7 +16,7 @@
 
 use std::{
     fmt::{self, Debug, Formatter},
-    str,
+    slice, str,
 };
 
 use prost::Message;
@@ -32,14 +32,15 @@ use crate::common::{
 };
 use crate::ebpf::SK_BPF_DATA;
 
-const FILENAME_MAX_PADDING: usize = 64;
 const IO_BYTES_COUNT_OFFSET: usize = 4;
 const IO_OPERATION_OFFSET: usize = 8;
 const IO_LATENCY_OFFSET: usize = 16;
+const IO_OFF_BYTES_OFFSET: usize = 24;
 struct IoEventData {
     bytes_count: u32, // Number of bytes read and written
     operation: u32,   // 0: write 1: read
     latency: u64,     // Function call delay, in nanoseconds
+    off_bytes: u64,   // The number of bytes of offset within the file content
     filename: Vec<u8>,
 }
 
@@ -48,22 +49,23 @@ impl TryFrom<&[u8]> for IoEventData {
 
     fn try_from(raw_data: &[u8]) -> Result<Self, self::Error> {
         let length = raw_data.len();
-        if length <= FILENAME_MAX_PADDING {
+        if length < IO_OFF_BYTES_OFFSET {
             return Err(ParseEventData(format!(
-                "parse io event data failed, raw data length: {} < {}",
-                length, FILENAME_MAX_PADDING
+                "parse io event data failed, raw data length: {length} < {IO_OFF_BYTES_OFFSET}"
             )));
         }
         let io_event_data = Self {
             bytes_count: read_u32_le(&raw_data),
             operation: read_u32_le(&raw_data[IO_BYTES_COUNT_OFFSET..]),
             latency: read_u64_le(&raw_data[IO_OPERATION_OFFSET..]),
-            filename: raw_data[IO_LATENCY_OFFSET..]
-                .iter()
-                .position(|&b| b == b'\0') // filename ending with '\0'
-                .map(|index| &raw_data[IO_LATENCY_OFFSET..][..index])
-                .unwrap_or(&[])
-                .to_vec(),
+            off_bytes: read_u64_le(&raw_data[IO_LATENCY_OFFSET..]),
+            filename: {
+                let data = &raw_data[IO_OFF_BYTES_OFFSET..];
+                match data.iter().position(|&b| b == b'\0') {
+                    Some(index) => data[..index].to_vec(),
+                    None => vec![],
+                }
+            },
         };
         Ok(io_event_data)
     }
@@ -75,6 +77,7 @@ impl From<IoEventData> for metric::IoEventData {
             bytes_count: io_event_data.bytes_count,
             operation: io_event_data.operation as i32,
             latency: io_event_data.latency,
+            off_bytes: io_event_data.off_bytes,
             filename: io_event_data.filename,
         }
     }
@@ -89,11 +92,12 @@ impl Debug for EventData {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             EventData::IoEvent(d) => f.write_fmt(format_args!(
-                "IoEventData {{ filename: {}, operation: {}, bytes_count: {}, latency: {} }}",
+                "IoEventData {{ filename: {}, operation: {}, bytes_count: {}, latency: {}, off_bytes: {} }}",
                 str::from_utf8(&d.filename).unwrap_or(""),
                 d.operation,
                 d.bytes_count,
-                d.latency
+                d.latency,
+                d.off_bytes
             )),
             _ => f.write_str("other event"),
         }
@@ -144,25 +148,17 @@ pub struct ProcEvent {
 
 impl ProcEvent {
     pub unsafe fn from_ebpf(
-        data: *mut SK_BPF_DATA,
+        data: &mut SK_BPF_DATA,
         event_type: EventType,
     ) -> Result<BoxedProcEvents, Error> {
-        let data = &mut (*data);
-        let cap_len = data.cap_len as usize;
-        let mut raw_data = vec![0u8; cap_len as usize]; // Copy from data.cap_data where stores event's data
-        #[cfg(target_arch = "aarch64")]
-        data.cap_data
-            .copy_to_nonoverlapping(raw_data.as_mut_ptr() as *mut u8, cap_len);
-        #[cfg(target_arch = "x86_64")]
-        data.cap_data
-            .copy_to_nonoverlapping(raw_data.as_mut_ptr() as *mut i8, cap_len);
+        let raw_data = slice::from_raw_parts(data.cap_data as *const u8, data.cap_len as usize);
 
         let mut event_data: EventData = EventData::OtherEvent;
         let start_time = data.timestamp * 1000; // The unit of data.timestamp is microsecond, and the unit of start_time is nanosecond
         let mut end_time = 0;
         match event_type {
             EventType::IoEvent => {
-                let io_event_data = IoEventData::try_from(raw_data.as_ref())?; // Try to parse IoEventData from data.cap_data
+                let io_event_data = IoEventData::try_from(raw_data)?; // Try to parse IoEventData from data.cap_data
                 end_time = start_time + io_event_data.latency;
                 event_data = EventData::IoEvent(io_event_data);
             }

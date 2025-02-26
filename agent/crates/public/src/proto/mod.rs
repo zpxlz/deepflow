@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+pub mod agent;
 pub mod common;
 pub mod flow_log;
 pub mod integration;
 pub mod metric;
 pub mod stats;
-pub mod trident;

@@ -32,6 +32,11 @@ type SimpleEncoder struct {
 	pool.ReferenceCount
 }
 
+func (d *SimpleEncoder) Init(buf []byte) {
+	d.buf = buf
+	d.ReferenceCount.Reset()
+}
+
 type PBCodec interface {
 	Size() int
 	MarshalTo([]byte) (int, error)
@@ -186,12 +191,12 @@ func (e *SimpleEncoder) String() string {
 }
 
 // pool of encoder
-var simpleEncoderPool = pool.NewLockFreePool(func() interface{} {
+var simpleEncoderPool = pool.NewLockFreePool(func() *SimpleEncoder {
 	return new(SimpleEncoder)
 })
 
 func AcquireSimpleEncoder() *SimpleEncoder {
-	e := simpleEncoderPool.Get().(*SimpleEncoder)
+	e := simpleEncoderPool.Get()
 	e.ReferenceCount.Reset()
 	return e
 }

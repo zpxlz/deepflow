@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddVRouter(dbItem *mysql.VRouter, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddVRouter(dbItem *metadbmodel.VRouter, seq int, toolDataSet *tool.DataSet) {
 	vpcLcuuid, _ := toolDataSet.GetVPCLcuuidByID(dbItem.VPCID)
 	b.VRouters[dbItem.Lcuuid] = &VRouter{
 		DiffBase: DiffBase{
@@ -35,12 +35,12 @@ func (b *DataSet) AddVRouter(dbItem *mysql.VRouter, seq int, toolDataSet *tool.D
 		VPCLcuuid:    vpcLcuuid,
 		RegionLcuuid: dbItem.Region,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, b.VRouters[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, b.VRouters[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteVRouter(lcuuid string) {
 	delete(b.VRouters, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_VROUTER_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type VRouter struct {

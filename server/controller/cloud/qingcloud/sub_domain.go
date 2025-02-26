@@ -22,12 +22,13 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (q *QingCloud) GetSubDomains() ([]model.SubDomain, error) {
 	var retSubDomains []model.SubDomain
 
-	log.Info("get sub_domains starting")
+	log.Info("get sub_domains starting", logger.NewORGPrefix(q.orgID))
 
 	for regionId, regionLcuuid := range q.RegionIdToLcuuid {
 		kwargs := []*Param{
@@ -37,7 +38,7 @@ func (q *QingCloud) GetSubDomains() ([]model.SubDomain, error) {
 		}
 		response, err := q.GetResponse("DescribeClusters", "cluster_set", kwargs)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, err
 		}
 
@@ -57,7 +58,7 @@ func (q *QingCloud) GetSubDomains() ([]model.SubDomain, error) {
 				vpcLcuuid, _ := q.regionIdToDefaultVPCLcuuid[regionId]
 				vpcRouterId := cluster.Get("vxnet").Get("vpc_router_id").MustString()
 				if vpcRouterId != "" {
-					vpcLcuuid = common.GenerateUUID(vpcRouterId)
+					vpcLcuuid = common.GenerateUUIDByOrgID(q.orgID, vpcRouterId)
 				}
 
 				config := map[string]interface{}{
@@ -72,7 +73,8 @@ func (q *QingCloud) GetSubDomains() ([]model.SubDomain, error) {
 				}
 				configJson, _ := json.Marshal(config)
 				retSubDomains = append(retSubDomains, model.SubDomain{
-					Lcuuid:      common.GenerateUUID(clusterId),
+					TeamID:      q.teamID,
+					Lcuuid:      common.GenerateUUIDByOrgID(q.orgID, clusterId),
 					Name:        cluster.Get("name").MustString(),
 					DisplayName: clusterId,
 					ClusterID:   clusterId,
@@ -83,7 +85,7 @@ func (q *QingCloud) GetSubDomains() ([]model.SubDomain, error) {
 		}
 	}
 
-	log.Info("get sub_domains complete")
+	log.Info("get sub_domains complete", logger.NewORGPrefix(q.orgID))
 	return retSubDomains, nil
 
 }

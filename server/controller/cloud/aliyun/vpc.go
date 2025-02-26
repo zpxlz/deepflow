@@ -20,16 +20,17 @@ import (
 	vpc "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (a *Aliyun) getVPCs(region model.Region) ([]model.VPC, error) {
 	var retVPCs []model.VPC
 
-	log.Debug("get vpcs starting")
+	log.Debug("get vpcs starting", logger.NewORGPrefix(a.orgID))
 	request := vpc.CreateDescribeVpcsRequest()
 	response, err := a.getVpcResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(a.orgID))
 		return retVPCs, err
 	}
 
@@ -49,19 +50,18 @@ func (a *Aliyun) getVPCs(region model.Region) ([]model.VPC, error) {
 				}
 			}
 
-			vpcLcuuid := common.GenerateUUID(vpcId)
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, vpcId)
 			retVPC := model.VPC{
 				Lcuuid:       vpcLcuuid,
 				Name:         vpcName,
 				Label:        vpcId,
 				CIDR:         cidr,
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid: a.regionLcuuid,
 			}
 			retVPCs = append(retVPCs, retVPC)
-			a.regionLcuuidToResourceNum[retVPC.RegionLcuuid]++
 			a.vpcIDToLcuuids[vpcId] = vpcLcuuid
 		}
 	}
-	log.Debug("get vpcs complete")
+	log.Debug("get vpcs complete", logger.NewORGPrefix(a.orgID))
 	return retVPCs, nil
 }

@@ -22,16 +22,17 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/common"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 func TestHuaWei(t *testing.T) {
 	Convey("TestHuaWei", t, func() {
-		domain := mysql.Domain{
+		domain := metadbmodel.Domain{
 			DisplayName: "test_huawei",
 		}
 
-		huawei, _ := NewHuaWei(domain, config.CloudConfig{})
+		huawei, _ := NewHuaWei(common.DEFAULT_ORG_ID, domain, config.CloudConfig{})
 		data, _ := huawei.GetCloudData()
 		Convey("huaweiResource number should be equal", func() {
 			So(len(data.VPCs), ShouldEqual, 3)

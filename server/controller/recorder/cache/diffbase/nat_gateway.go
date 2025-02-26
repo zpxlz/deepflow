@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddNATGateway(dbItem *mysql.NATGateway, seq int) {
+func (b *DataSet) AddNATGateway(dbItem *metadbmodel.NATGateway, seq int) {
 	b.NATGateways[dbItem.Lcuuid] = &NATGateway{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -32,12 +32,12 @@ func (b *DataSet) AddNATGateway(dbItem *mysql.NATGateway, seq int) {
 		FloatingIPs:  dbItem.FloatingIPs,
 		RegionLcuuid: dbItem.Region,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, b.NATGateways[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, b.NATGateways[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteNATGateway(lcuuid string) {
 	delete(b.NATGateways, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type NATGateway struct {

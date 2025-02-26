@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type NATVMConnection struct {
-	OperatorBase[mysql.NATVMConnection]
+	OperatorBase[*metadbmodel.NATVMConnection, metadbmodel.NATVMConnection]
 }
 
 func NewNATVMConnection() *NATVMConnection {
 	return &NATVMConnection{
-		OperatorBase[mysql.NATVMConnection]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.NATVMConnection](
+			ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN,
+			false,
+			false,
+		),
 	}
 }

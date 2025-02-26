@@ -20,18 +20,19 @@ import (
 	vpc "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aliyun) getRouterAndTables(region model.Region) ([]model.VRouter, []model.RoutingTable, error) {
+func (a *Aliyun) getRouterAndTables(region model.Region) ([]model.VRouter, []model.RoutingTable) {
 	var retVRouters []model.VRouter
 	var retRoutingTables []model.RoutingTable
 
-	log.Debug("get routers starting")
+	log.Debug("get routers starting", logger.NewORGPrefix(a.orgID))
 	request := vpc.CreateDescribeRouteTableListRequest()
 	response, err := a.getRouterResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return retVRouters, retRoutingTables, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.VRouter{}, []model.RoutingTable{}
 	}
 
 	for _, r := range response {
@@ -51,42 +52,37 @@ func (a *Aliyun) getRouterAndTables(region model.Region) ([]model.VRouter, []mod
 			}
 			vpcId := router.Get("VpcId").MustString()
 
-			routerLcuuid := common.GenerateUUID(routerTableId)
+			routerLcuuid := common.GenerateUUIDByOrgID(a.orgID, routerTableId)
 			retVRouter := model.VRouter{
 				Lcuuid:       routerLcuuid,
 				Name:         routerTableName,
-				VPCLcuuid:    common.GenerateUUID(vpcId),
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				VPCLcuuid:    common.GenerateUUIDByOrgID(a.orgID, vpcId),
+				RegionLcuuid: a.regionLcuuid,
 			}
 			retVRouters = append(retVRouters, retVRouter)
-			a.regionLcuuidToResourceNum[retVRouter.RegionLcuuid]++
 
 			// 路由表规则
-			tmpRoutingTables, err := a.getRouterTables(region, routerTableId)
-			if err != nil {
-				return []model.VRouter{}, []model.RoutingTable{}, err
-			}
-			retRoutingTables = append(retRoutingTables, tmpRoutingTables...)
+			retRoutingTables = append(retRoutingTables, a.getRouterTables(region, routerTableId)...)
 
 		}
 	}
 
-	log.Debug("get routers complete")
-	return retVRouters, retRoutingTables, nil
+	log.Debug("get routers complete", logger.NewORGPrefix(a.orgID))
+	return retVRouters, retRoutingTables
 }
 
-func (a *Aliyun) getRouterTables(region model.Region, routerId string) ([]model.RoutingTable, error) {
+func (a *Aliyun) getRouterTables(region model.Region, routerId string) []model.RoutingTable {
 	var retRoutingTables []model.RoutingTable
 
 	request := vpc.CreateDescribeRouteEntryListRequest()
 	request.RouteTableId = routerId
 	response, err := a.getRouterTableResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return retRoutingTables, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.RoutingTable{}
 	}
 
-	routerLcuuid := common.GenerateUUID(routerId)
+	routerLcuuid := common.GenerateUUIDByOrgID(a.orgID, routerId)
 	for _, rRule := range response {
 		for j := range rRule.Get("RouteEntry").MustArray() {
 			rule := rRule.Get("RouteEntry").GetIndex(j)
@@ -107,7 +103,7 @@ func (a *Aliyun) getRouterTables(region model.Region, routerId string) ([]model.
 			nexthops := rule.Get("NextHops").Get("NextHop")
 
 			if len(nexthops.MustArray()) == 0 {
-				log.Infof("route table (%s) gateway id not found", ruleId)
+				log.Infof("route table (%s) gateway id not found", ruleId, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 			nexthop := common.ROUTING_TABLE_TYPE_LOCAL
@@ -126,7 +122,7 @@ func (a *Aliyun) getRouterTables(region model.Region, routerId string) ([]model.
 			}
 
 			retRule := model.RoutingTable{
-				Lcuuid:        common.GenerateUUID(routerLcuuid + destination + nexthop),
+				Lcuuid:        common.GenerateUUIDByOrgID(a.orgID, routerLcuuid+destination+nexthop),
 				VRouterLcuuid: routerLcuuid,
 				Destination:   destination,
 				NexthopType:   nexthopType,
@@ -136,5 +132,5 @@ func (a *Aliyun) getRouterTables(region model.Region, routerId string) ([]model.
 		}
 	}
 
-	return retRoutingTables, nil
+	return retRoutingTables
 }

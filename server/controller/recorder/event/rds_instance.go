@@ -18,32 +18,32 @@ package event
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type RDSInstance struct {
-	EventManagerBase
+	ManagerComponent
+	CUDSubscriberComponent
 	deviceType int
 }
 
-func NewRDSInstance(toolDS *tool.DataSet, eq *queue.OverwriteQueue) *RDSInstance {
-	return &RDSInstance{
-		EventManagerBase{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN,
-			ToolDataSet:  toolDS,
-			Queue:        eq,
-		},
+func NewRDSInstance(q *queue.OverwriteQueue) *RDSInstance {
+	mng := &RDSInstance{
+		newManagerComponent(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN, q),
+		newCUDSubscriberComponent(ctrlrcommon.RESOURCE_TYPE_RDS_INSTANCE_EN),
 		ctrlrcommon.VIF_DEVICE_TYPE_RDS_INSTANCE,
 	}
+	mng.SetSubscriberSelf(mng)
+	return mng
 }
 
-func (r *RDSInstance) ProduceByAdd(items []*mysql.RDSInstance) {
-	for _, item := range items {
+func (r *RDSInstance) OnResourceBatchAdded(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.RDSInstance) {
 		var opts []eventapi.TagFieldOption
-		info, err := r.ToolDataSet.GetRDSInstanceInfoByID(item.ID)
+		info, err := md.GetToolDataSet().GetRDSInstanceInfoByID(item.ID)
 		if err != nil {
 			log.Error(err)
 		} else {
@@ -58,7 +58,7 @@ func (r *RDSInstance) ProduceByAdd(items []*mysql.RDSInstance) {
 			eventapi.TagL3DeviceID(item.ID),
 		}...)
 
-		r.createAndEnqueue(
+		r.createAndEnqueue(md,
 			item.Lcuuid,
 			eventapi.RESOURCE_EVENT_TYPE_CREATE,
 			item.Name,
@@ -69,21 +69,8 @@ func (r *RDSInstance) ProduceByAdd(items []*mysql.RDSInstance) {
 	}
 }
 
-func (r *RDSInstance) ProduceByDelete(lcuuids []string) {
-	for _, lcuuid := range lcuuids {
-		var id int
-		var name string
-		id, ok := r.ToolDataSet.GetRDSInstanceIDByLcuuid(lcuuid)
-		if ok {
-			var err error
-			name, err = r.ToolDataSet.GetRDSInstanceNameByID(id)
-			if err != nil {
-				log.Errorf("%v, %v", idByLcuuidNotFound(r.resourceType, lcuuid), err)
-			}
-		} else {
-			log.Error(nameByIDNotFound(r.resourceType, id))
-		}
-
-		r.createAndEnqueue(lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, name, r.deviceType, id)
+func (r *RDSInstance) OnResourceBatchDeleted(md *message.Metadata, msg interface{}) {
+	for _, item := range msg.([]*metadbmodel.RDSInstance) {
+		r.createAndEnqueue(md, item.Lcuuid, eventapi.RESOURCE_EVENT_TYPE_DELETE, item.Name, r.deviceType, item.ID)
 	}
 }

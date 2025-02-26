@@ -38,16 +38,36 @@ use crate::common::{
 };
 use crate::config::NpbConfig;
 use crate::sender::npb_sender::{NpbArpTable, NpbPacketSender};
-use crate::utils::stats::{self, StatsOption};
+use crate::utils::stats::{self, QueueStats, StatsOption};
 use npb_handler::{NpbHandler, NpbHandlerCounter, NpbHeader, StatsNpbHandlerCounter, NOT_SUPPORT};
 use public::{
     counter::Countable,
     debug::QueueDebugger,
     leaky_bucket::LeakyBucket,
-    proto::trident::VlanMode,
+    proto::agent::VlanMode,
     queue::{bounded_with_debug, DebugSender},
     utils::net::MacAddr,
 };
+
+struct NpbStats {
+    id: usize,
+    if_index: u32,
+    mac: MacAddr,
+}
+
+impl stats::Module for NpbStats {
+    fn name(&self) -> &'static str {
+        "fragmenter"
+    }
+
+    fn tags(&self) -> Vec<stats::StatsOption> {
+        vec![
+            StatsOption::Tag("index", self.id.to_string()),
+            StatsOption::Tag("mac", self.mac.to_string()),
+            StatsOption::Tag("ifIndex", self.if_index.to_string()),
+        ]
+    }
+}
 
 pub struct NpbBuilder {
     id: usize,
@@ -56,6 +76,7 @@ pub struct NpbBuilder {
     enable_qos_bypass: bool,
     underlay_is_ipv6: bool,
     underlay_has_vlan: bool,
+    ignore_overlay_vlan: bool,
     overlay_vlan_mode: VlanMode,
 
     sender: DebugSender<(u64, usize, Vec<u8>)>,
@@ -187,8 +208,17 @@ impl NpbBuilder {
         self.stop();
         self.npb_packet_sender = None;
 
-        let (sender, receiver, _) =
-            bounded_with_debug(4096, "1-packet-to-npb-sender", queue_debugger);
+        let queue_name = "1-packet-to-npb-sender";
+        let (sender, receiver, counter) =
+            bounded_with_debug(config.queue_size, queue_name, queue_debugger);
+        self.stats_collector.register_countable(
+            &QueueStats {
+                id: self.id,
+                module: queue_name,
+            },
+            Countable::Owned(Box::new(counter)),
+        );
+
         let npb_packet_sender = Arc::new(NpbPacketSender::new(
             self.id,
             receiver,
@@ -224,8 +254,16 @@ impl NpbBuilder {
         arp: Arc<NpbArpTable>,
         stats_collector: Arc<stats::Collector>,
     ) -> Box<Self> {
-        let (sender, receiver, _) =
-            bounded_with_debug(4096, "1-packet-to-npb-sender", queue_debugger);
+        let queue_name = "1-packet-to-npb-sender";
+        let (sender, receiver, counter) =
+            bounded_with_debug(config.queue_size, queue_name, queue_debugger);
+        stats_collector.register_countable(
+            &QueueStats {
+                id,
+                module: queue_name,
+            },
+            Countable::Owned(Box::new(counter)),
+        );
 
         let builder = Box::new(Self {
             id,
@@ -234,6 +272,7 @@ impl NpbBuilder {
             underlay_is_ipv6: config.underlay_is_ipv6,
             underlay_has_vlan: config.output_vlan > 0,
             overlay_vlan_mode: config.vlan_mode,
+            ignore_overlay_vlan: config.ignore_overlay_vlan,
             sender,
             npb_packet_sender: Some(Arc::new(NpbPacketSender::new(
                 id,
@@ -268,13 +307,8 @@ impl NpbBuilder {
             );
 
             self.stats_collector.register_countable(
-                "fragmenter",
+                &NpbStats { id, mac, if_index },
                 Countable::Owned(Box::new(StatsNpbHandlerCounter(Arc::downgrade(&counter)))),
-                vec![
-                    StatsOption::Tag("index", id.to_string()),
-                    StatsOption::Tag("mac", mac.to_string()),
-                    StatsOption::Tag("ifIndex", if_index.to_string()),
-                ],
             );
         }
 
@@ -289,6 +323,7 @@ impl NpbBuilder {
             self.pseudo_tunnel_header.clone(),
             underlay_vlan_header_size,
             self.overlay_vlan_mode,
+            self.ignore_overlay_vlan,
             self.bps_limit.clone(),
             counter,
             self.sender.clone(),

@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type NATRule struct {
-	UpdaterBase[cloudmodel.NATRule, mysql.NATRule, *diffbase.NATRule]
+	UpdaterBase[
+		cloudmodel.NATRule,
+		*diffbase.NATRule,
+		*metadbmodel.NATRule,
+		metadbmodel.NATRule,
+		*message.NATRuleAdd,
+		message.NATRuleAdd,
+		*message.NATRuleUpdate,
+		message.NATRuleUpdate,
+		*message.NATRuleFieldsUpdate,
+		message.NATRuleFieldsUpdate,
+		*message.NATRuleDelete,
+		message.NATRuleDelete]
 }
 
 func NewNATRule(wholeCache *cache.Cache, cloudData []cloudmodel.NATRule) *NATRule {
 	updater := &NATRule{
-		UpdaterBase[cloudmodel.NATRule, mysql.NATRule, *diffbase.NATRule]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewNATRule(),
-			diffBaseData: wholeCache.DiffBaseDataSet.NATRules,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.NATRule,
+			*diffbase.NATRule,
+			*metadbmodel.NATRule,
+			metadbmodel.NATRule,
+			*message.NATRuleAdd,
+			message.NATRuleAdd,
+			*message.NATRuleUpdate,
+			message.NATRuleUpdate,
+			*message.NATRuleFieldsUpdate,
+			message.NATRuleFieldsUpdate,
+			*message.NATRuleDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN,
+			wholeCache,
+			db.NewNATRule().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.NATRules,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,16 +73,16 @@ func (r *NATRule) getDiffBaseByCloudItem(cloudItem *cloudmodel.NATRule) (diffBas
 	return
 }
 
-func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NATRule, bool) {
+func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*metadbmodel.NATRule, bool) {
 	var natGatewayID int
 	var exists bool
 	if cloudItem.NATGatewayLcuuid != "" {
 		natGatewayID, exists = r.cache.ToolDataSet.GetNATGatewayIDByLcuuid(cloudItem.NATGatewayLcuuid)
 		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_NAT_GATEWAY_EN, cloudItem.NATGatewayLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN, cloudItem.Lcuuid,
-			))
+			), r.metadata.LogPrefixes)
 			return nil, false
 		}
 	}
@@ -65,15 +90,15 @@ func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NAT
 	if cloudItem.VInterfaceLcuuid != "" {
 		vinterfaceID, exists = r.cache.ToolDataSet.GetVInterfaceIDByLcuuid(cloudItem.VInterfaceLcuuid)
 		if !exists {
-			log.Errorf(resourceAForResourceBNotFound(
+			log.Error(resourceAForResourceBNotFound(
 				ctrlrcommon.RESOURCE_TYPE_VINTERFACE_EN, cloudItem.VInterfaceLcuuid,
 				ctrlrcommon.RESOURCE_TYPE_NAT_RULE_EN, cloudItem.Lcuuid,
-			))
+			), r.metadata.LogPrefixes)
 			return nil, false
 		}
 	}
 
-	dbItem := &mysql.NATRule{
+	dbItem := &metadbmodel.NATRule{
 		NATGatewayID:   natGatewayID,
 		VInterfaceID:   vinterfaceID,
 		Type:           cloudItem.Type,
@@ -82,13 +107,13 @@ func (r *NATRule) generateDBItemToAdd(cloudItem *cloudmodel.NATRule) (*mysql.NAT
 		FloatingIPPort: cloudItem.FloatingIPPort,
 		FixedIP:        cloudItem.FixedIP,
 		FixedIPPort:    cloudItem.FixedIPPort,
-		Domain:         r.cache.DomainLcuuid,
+		Domain:         r.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
 // 保留接口
-func (r *NATRule) generateUpdateInfo(diffBase *diffbase.NATRule, cloudItem *cloudmodel.NATRule) (map[string]interface{}, bool) {
-	return nil, false
+func (r *NATRule) generateUpdateInfo(diffBase *diffbase.NATRule, cloudItem *cloudmodel.NATRule) (*message.NATRuleFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

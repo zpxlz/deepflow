@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type NATVMConnection struct {
-	UpdaterBase[cloudmodel.NATVMConnection, mysql.NATVMConnection, *diffbase.NATVMConnection]
+	UpdaterBase[
+		cloudmodel.NATVMConnection,
+		*diffbase.NATVMConnection,
+		*metadbmodel.NATVMConnection,
+		metadbmodel.NATVMConnection,
+		*message.NATVMConnectionAdd,
+		message.NATVMConnectionAdd,
+		*message.NATVMConnectionUpdate,
+		message.NATVMConnectionUpdate,
+		*message.NATVMConnectionFieldsUpdate,
+		message.NATVMConnectionFieldsUpdate,
+		*message.NATVMConnectionDelete,
+		message.NATVMConnectionDelete]
 }
 
 func NewNATVMConnection(wholeCache *cache.Cache, cloudData []cloudmodel.NATVMConnection) *NATVMConnection {
 	updater := &NATVMConnection{
-		UpdaterBase[cloudmodel.NATVMConnection, mysql.NATVMConnection, *diffbase.NATVMConnection]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewNATVMConnection(),
-			diffBaseData: wholeCache.DiffBaseDataSet.NATVMConnections,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.NATVMConnection,
+			*diffbase.NATVMConnection,
+			*metadbmodel.NATVMConnection,
+			metadbmodel.NATVMConnection,
+			*message.NATVMConnectionAdd,
+			message.NATVMConnectionAdd,
+			*message.NATVMConnectionUpdate,
+			message.NATVMConnectionUpdate,
+			*message.NATVMConnectionFieldsUpdate,
+			message.NATVMConnectionFieldsUpdate,
+			*message.NATVMConnectionDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN,
+			wholeCache,
+			db.NewNATVMConnection().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.NATVMConnections,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,7 +73,7 @@ func (c *NATVMConnection) getDiffBaseByCloudItem(cloudItem *cloudmodel.NATVMConn
 	return
 }
 
-func (c *NATVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.NATVMConnection) (*mysql.NATVMConnection, bool) {
+func (c *NATVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.NATVMConnection) (*metadbmodel.NATVMConnection, bool) {
 	vmID, exists := c.cache.ToolDataSet.GetVMIDByLcuuid(cloudItem.VMLcuuid)
 	if !exists {
 		log.Error(resourceAForResourceBNotFound(
@@ -66,8 +91,8 @@ func (c *NATVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.NATVMConnect
 		return nil, false
 	}
 
-	dbItem := &mysql.NATVMConnection{
-		Domain:       c.cache.DomainLcuuid,
+	dbItem := &metadbmodel.NATVMConnection{
+		Domain:       c.metadata.Domain.Lcuuid,
 		VMID:         vmID,
 		NATGatewayID: natID,
 	}
@@ -76,6 +101,6 @@ func (c *NATVMConnection) generateDBItemToAdd(cloudItem *cloudmodel.NATVMConnect
 }
 
 // 保留接口
-func (c *NATVMConnection) generateUpdateInfo(diffBase *diffbase.NATVMConnection, cloudItem *cloudmodel.NATVMConnection) (map[string]interface{}, bool) {
-	return nil, false
+func (c *NATVMConnection) generateUpdateInfo(diffBase *diffbase.NATVMConnection, cloudItem *cloudmodel.NATVMConnection) (*message.NATVMConnectionFieldsUpdate, map[string]interface{}, bool) {
+	return nil, nil, false
 }

@@ -21,30 +21,53 @@ import (
 	"time"
 
 	ecs "github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+	simplejson "github.com/bitly/go-simplejson"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aliyun) getVMs(region model.Region) (
-	[]model.VM, []model.VMSecurityGroup, []model.VInterface, []model.IP, []model.FloatingIP, map[string]string, error,
+func (a *Aliyun) getVMs(region model.Region, rgIDs []string) (
+	[]model.VM, []model.VInterface, []model.IP, []model.FloatingIP, map[string]string, error,
 ) {
 	var retVMs []model.VM
-	var retVMSecurityGroups []model.VMSecurityGroup
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 	var retFloatingIPs []model.FloatingIP
 	var vmLcuuidToVPCLcuuid = make(map[string]string)
 
-	log.Debug("get vms starting")
-	request := ecs.CreateDescribeInstancesRequest()
-	response, err := a.getVMResponse(region.Label, request)
-	if err != nil {
-		log.Error(err)
-		return retVMs, retVMSecurityGroups, retVInterfaces, retIPs, retFloatingIPs, vmLcuuidToVPCLcuuid, err
+	log.Debug("get vms starting", logger.NewORGPrefix(a.orgID))
+
+	var responses []*simplejson.Json
+	if len(rgIDs) == 0 {
+		request := ecs.CreateDescribeInstancesRequest()
+		vmResponses, err := a.getVMResponse(region.Label, request)
+		if err != nil {
+			log.Error(err, logger.NewORGPrefix(a.orgID))
+			return retVMs, retVInterfaces, retIPs, retFloatingIPs, vmLcuuidToVPCLcuuid, err
+		}
+		responses = append(responses, vmResponses...)
+	} else {
+		// remove duplicate ResourceGroupId
+		rgIDMap := map[string]bool{}
+		for _, rgID := range rgIDs {
+			rgIDMap[rgID] = false
+		}
+		for rgID := range rgIDMap {
+			log.Debugf("get instance for regin (%s) resource (%s)", region.Label, rgID, logger.NewORGPrefix(a.orgID))
+			request := ecs.CreateDescribeInstancesRequest()
+			request.ResourceGroupId = rgID
+			vmResponses, err := a.getVMResponse(region.Label, request)
+			if err != nil {
+				log.Error(err, logger.NewORGPrefix(a.orgID))
+				return retVMs, retVInterfaces, retIPs, retFloatingIPs, vmLcuuidToVPCLcuuid, err
+			}
+			responses = append(responses, vmResponses...)
+		}
 	}
 
-	for _, r := range response {
+	for _, r := range responses {
 		vms, _ := r.Get("Instance").Array()
 		for i := range vms {
 			vm := r.Get("Instance").GetIndex(i)
@@ -69,12 +92,12 @@ func (a *Aliyun) getVMs(region model.Region) (
 			createdTime := vm.Get("CreationTime").MustString()
 			vpcId := vm.Get("VpcAttributes").Get("VpcId").MustString()
 			if vpcId == "" {
-				log.Infof("no vpcId in vm (%s) data", vmId)
+				log.Infof("no vpcId in vm (%s) data", vmId, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 
-			vmLcuuid := common.GenerateUUID(vmId)
-			VPCLcuuid := common.GenerateUUID(vpcId)
+			vmLcuuid := common.GenerateUUIDByOrgID(a.orgID, vmId)
+			VPCLcuuid := common.GenerateUUIDByOrgID(a.orgID, vpcId)
 			vmState := common.VM_STATE_EXCEPTION
 			if vmStatus == "Running" {
 				vmState = common.VM_STATE_RUNNING
@@ -83,6 +106,24 @@ func (a *Aliyun) getVMs(region model.Region) (
 			}
 			createdAt, _ := time.Parse(common.GO_BIRTHDAY, createdTime)
 			vmLcuuidToVPCLcuuid[vmLcuuid] = VPCLcuuid
+
+			var pIP string
+			networks := vm.GetPath("NetworkInterfaces", "NetworkInterface")
+			for n := range networks.MustArray() {
+				network := networks.GetIndex(n)
+				if network.Get("Type").MustString() == "Primary" {
+					pIP = network.Get("PrimaryIpAddress").MustString()
+					break
+				}
+			}
+
+			cloudTags := map[string]string{}
+			vmTags := vm.GetPath("Tags", "Tag")
+			for t := range vmTags.MustArray() {
+				tag := vmTags.GetIndex(t)
+				cloudTags[tag.Get("TagKey").MustString()] = tag.Get("TagValue").MustString()
+			}
+
 			retVM := model.VM{
 				Lcuuid:       vmLcuuid,
 				Name:         vmName,
@@ -90,32 +131,19 @@ func (a *Aliyun) getVMs(region model.Region) (
 				HType:        common.VM_HTYPE_VM_C,
 				VPCLcuuid:    VPCLcuuid,
 				State:        vmState,
-				LaunchServer: "",
+				IP:           pIP,
+				CloudTags:    cloudTags,
 				CreatedAt:    createdAt,
-				AZLcuuid:     common.GenerateUUID(a.uuidGenerate + "_" + zoneId),
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				AZLcuuid:     common.GenerateUUIDByOrgID(a.orgID, a.uuidGenerate+"_"+zoneId),
+				RegionLcuuid: a.regionLcuuid,
 			}
 			retVMs = append(retVMs, retVM)
 			a.azLcuuidToResourceNum[retVM.AZLcuuid]++
-			a.regionLcuuidToResourceNum[retVM.RegionLcuuid]++
-
-			// VM与安全组关联关系
-			securityGroupIds := vm.Get("SecurityGroupIds").Get("SecurityGroupId").MustStringArray()
-			priority := 0
-			for _, securityGroupId := range securityGroupIds {
-				retSecurityGroup := model.VMSecurityGroup{
-					Lcuuid:              common.GenerateUUID(vmLcuuid + securityGroupId),
-					VMLcuuid:            vmLcuuid,
-					SecurityGroupLcuuid: common.GenerateUUID(securityGroupId),
-					Priority:            priority,
-				}
-				retVMSecurityGroups = append(retVMSecurityGroups, retSecurityGroup)
-			}
 
 			// VM PublicIPs
 			publicIPs := vm.Get("PublicIpAddress").Get("IpAddress").MustStringArray()
 			for _, publicIP := range publicIPs {
-				vinterfaceLcuuid := common.GenerateUUID(vmLcuuid + publicIP)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(a.orgID, vmLcuuid+publicIP)
 				retVInterface := model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.VIF_TYPE_WAN,
@@ -124,34 +152,34 @@ func (a *Aliyun) getVMs(region model.Region) (
 					DeviceType:    common.VIF_DEVICE_TYPE_VM,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     VPCLcuuid,
-					RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:  a.regionLcuuid,
 				}
 				retVInterfaces = append(retVInterfaces, retVInterface)
 
-				ipLcuuid := common.GenerateUUID(vinterfaceLcuuid + publicIP)
+				ipLcuuid := common.GenerateUUIDByOrgID(a.orgID, vinterfaceLcuuid+publicIP)
 				retIP := model.IP{
 					Lcuuid:           ipLcuuid,
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               publicIP,
-					RegionLcuuid:     a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:     a.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 
-				floatingIPLcuuid := common.GenerateUUID(vmLcuuid + publicIP)
+				floatingIPLcuuid := common.GenerateUUIDByOrgID(a.orgID, vmLcuuid+publicIP)
 				retFloatingIP := model.FloatingIP{
 					Lcuuid:        floatingIPLcuuid,
 					IP:            publicIP,
 					VMLcuuid:      vmLcuuid,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     VPCLcuuid,
-					RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:  a.regionLcuuid,
 				}
 				retFloatingIPs = append(retFloatingIPs, retFloatingIP)
 			}
 		}
 	}
-	log.Debug("get vms complete")
-	return retVMs, retVMSecurityGroups, retVInterfaces, retIPs, retFloatingIPs, vmLcuuidToVPCLcuuid, nil
+	log.Debug("get vms complete", logger.NewORGPrefix(a.orgID))
+	return retVMs, retVInterfaces, retIPs, retFloatingIPs, vmLcuuidToVPCLcuuid, nil
 }
 
 func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP, []model.FloatingIP, []model.NATRule, error) {
@@ -160,11 +188,11 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 	var retFloatingIPs []model.FloatingIP
 	var retNATRules []model.NATRule
 
-	log.Debug("get ports starting")
+	log.Debug("get ports starting", logger.NewORGPrefix(a.orgID))
 	request := ecs.CreateDescribeNetworkInterfacesRequest()
 	response, err := a.getVMInterfaceResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(a.orgID))
 		return retVInterfaces, retIPs, retFloatingIPs, retNATRules, nil
 	}
 
@@ -178,7 +206,7 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 				[]string{"NetworkInterfaceId", "MacAddress", "InstanceId", "VSwitchId", "VpcId"},
 			)
 			if err != nil {
-				log.Info(err)
+				log.Info(err, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 
@@ -187,10 +215,10 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 				continue
 			}
 
-			portLcuuid := common.GenerateUUID(port.Get("NetworkInterfaceId").MustString())
-			deviceLcuuid := common.GenerateUUID(instanceId)
-			networkLcuuid := common.GenerateUUID(port.Get("VSwitchId").MustString())
-			vpcLcuuid := common.GenerateUUID(port.Get("VpcId").MustString())
+			portLcuuid := common.GenerateUUIDByOrgID(a.orgID, port.Get("NetworkInterfaceId").MustString())
+			deviceLcuuid := common.GenerateUUIDByOrgID(a.orgID, instanceId)
+			networkLcuuid := common.GenerateUUIDByOrgID(a.orgID, port.Get("VSwitchId").MustString())
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, port.Get("VpcId").MustString())
 			mac := port.Get("MacAddress").MustString()
 			retVInterface := model.VInterface{
 				Lcuuid:        portLcuuid,
@@ -200,7 +228,7 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 				DeviceType:    common.VIF_DEVICE_TYPE_VM,
 				NetworkLcuuid: networkLcuuid,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid:  a.regionLcuuid,
 			}
 			retVInterfaces = append(retVInterfaces, retVInterface)
 
@@ -219,11 +247,11 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 					continue
 				}
 				retIP := model.IP{
-					Lcuuid:           common.GenerateUUID(portLcuuid + privateIP),
+					Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, portLcuuid+privateIP),
 					VInterfaceLcuuid: portLcuuid,
 					IP:               privateIP,
-					SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-					RegionLcuuid:     a.getRegionLcuuid(region.Lcuuid),
+					SubnetLcuuid:     common.GenerateUUIDByOrgID(a.orgID, networkLcuuid),
+					RegionLcuuid:     a.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 
@@ -232,7 +260,7 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 				if publicIP == "" {
 					continue
 				}
-				publicPortLcuuid := common.GenerateUUID(portLcuuid)
+				publicPortLcuuid := common.GenerateUUIDByOrgID(a.orgID, portLcuuid)
 				retVInterface := model.VInterface{
 					Lcuuid:        publicPortLcuuid,
 					Type:          common.VIF_TYPE_WAN,
@@ -241,31 +269,31 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 					DeviceType:    common.VIF_DEVICE_TYPE_VM,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:  a.regionLcuuid,
 				}
 				retVInterfaces = append(retVInterfaces, retVInterface)
 
 				retIP = model.IP{
-					Lcuuid:           common.GenerateUUID(deviceLcuuid + publicIP),
+					Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, deviceLcuuid+publicIP),
 					VInterfaceLcuuid: publicPortLcuuid,
 					IP:               publicIP,
-					RegionLcuuid:     a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:     a.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 
-				floatingIPLcuuid := common.GenerateUUID(deviceLcuuid + publicIP)
+				floatingIPLcuuid := common.GenerateUUIDByOrgID(a.orgID, deviceLcuuid+publicIP)
 				retFloatingIP := model.FloatingIP{
 					Lcuuid:        floatingIPLcuuid,
 					IP:            publicIP,
 					VMLcuuid:      deviceLcuuid,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+					RegionLcuuid:  a.regionLcuuid,
 				}
 				retFloatingIPs = append(retFloatingIPs, retFloatingIP)
 
 				retNATRule := model.NATRule{
-					Lcuuid:           common.GenerateUUID(publicIP + "_" + privateIP),
+					Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, publicIP+"_"+privateIP),
 					Type:             "DNAT",
 					Protocol:         "ALL",
 					FloatingIP:       publicIP,
@@ -276,6 +304,6 @@ func (a *Aliyun) getVMPorts(region model.Region) ([]model.VInterface, []model.IP
 			}
 		}
 	}
-	log.Debug("get ports complete")
+	log.Debug("get ports complete", logger.NewORGPrefix(a.orgID))
 	return retVInterfaces, retIPs, retFloatingIPs, retNATRules, nil
 }

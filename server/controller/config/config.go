@@ -17,6 +17,7 @@
 package config
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -24,8 +25,11 @@ import (
 	logging "github.com/op/go-logging"
 	yaml "gopkg.in/yaml.v2"
 
+	shared_common "github.com/deepflowio/deepflow/server/common"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	configs "github.com/deepflowio/deepflow/server/controller/config/common"
 	"github.com/deepflowio/deepflow/server/controller/db/clickhouse"
-	mysql "github.com/deepflowio/deepflow/server/controller/db/mysql/config"
+	metadb "github.com/deepflowio/deepflow/server/controller/db/metadb/config"
 	"github.com/deepflowio/deepflow/server/controller/db/redis"
 	genesis "github.com/deepflowio/deepflow/server/controller/genesis/config"
 	http "github.com/deepflowio/deepflow/server/controller/http/config"
@@ -38,11 +42,6 @@ import (
 )
 
 var log = logging.MustGetLogger("config")
-
-type IngesterApi struct {
-	Port    int `default:"20106" yaml:"port"`
-	Timeout int `default:"60" yaml:"timeout"`
-}
 
 type Specification struct {
 	VTapGroupMax                 int `default:"1000" yaml:"vtap_group_max"`
@@ -58,13 +57,6 @@ type DFWebService struct {
 	Enabled bool   `default:"false" yaml:"enabled"`
 	Host    string `default:"df-web" yaml:"host"`
 	Port    int    `default:"20825" yaml:"port"`
-	Timeout int    `default:"30" yaml:"timeout"`
-}
-
-type FPermit struct {
-	Enabled bool   `default:"false" yaml:"enabled"`
-	Host    string `default:"fpermit" yaml:"host"`
-	Port    int    `default:"20823" yaml:"port"`
 	Timeout int    `default:"30" yaml:"timeout"`
 }
 
@@ -86,16 +78,22 @@ type ControllerConfig struct {
 	ReportingDisabled              bool   `default:"false" yaml:"reporting-disabled"`
 	BillingMethod                  string `default:"license" yaml:"billing-method"`
 	PodClusterInternalIPToIngester int    `default:"0" yaml:"pod-cluster-internal-ip-to-ingester"`
+	NoTeamIDRefused                bool   `default:"false" yaml:"no-teamid-refused"`
+	AllAgentConnectToNatIP         bool   `default:"false" yaml:"all-agent-connect-to-nat-ip"`
+	NoIPOverlapping                bool   `default:"false" yaml:"no-ip-overlapping"`
+	AgentCommandTimeout            int    `default:"30" yaml:"agent-cmd-timeout"`
 
-	DFWebService DFWebService `yaml:"df-web-service"`
-	FPermit      FPermit      `yaml:"fpermit"`
+	DFWebService DFWebService   `yaml:"df-web-service"`
+	FPermit      common.FPermit `yaml:"fpermit"`
 
-	MySqlCfg      mysql.MySqlConfig           `yaml:"mysql"`
+	MetadbCfg     metadb.Config
+	PostgreSQLCfg metadb.PostgreSQLConfig     `yaml:"postgresql"`
+	MySqlCfg      metadb.MySQLConfig          `yaml:"mysql"`
 	RedisCfg      redis.Config                `yaml:"redis"`
 	ClickHouseCfg clickhouse.ClickHouseConfig `yaml:"clickhouse"`
 
-	IngesterApi IngesterApi   `yaml:"ingester-api"`
-	Spec        Specification `yaml:"spec"`
+	IngesterApi common.IngesterApi `yaml:"ingester-api"`
+	Spec        Specification      `yaml:"spec"`
 
 	MonitorCfg     monitor.MonitorConfig         `yaml:"monitor"`
 	ManagerCfg     manager.ManagerConfig         `yaml:"manager"`
@@ -105,6 +103,7 @@ type ControllerConfig struct {
 	TagRecorderCfg tagrecorder.TagRecorderConfig `yaml:"tagrecorder"`
 	PrometheusCfg  prometheus.Config             `yaml:"prometheus"`
 	HTTPCfg        http.Config                   `yaml:"http"`
+	SwaggerCfg     configs.Swagger               `yaml:"swagger"`
 }
 
 type Config struct {
@@ -112,6 +111,12 @@ type Config struct {
 }
 
 func (c *Config) Validate() error {
+	if !c.ControllerConfig.MySqlCfg.Enabled && !c.ControllerConfig.PostgreSQLCfg.Enabled {
+		return fmt.Errorf("mysql or postgresql must be enabled")
+	}
+	if c.ControllerConfig.MySqlCfg.Enabled && c.ControllerConfig.PostgreSQLCfg.Enabled {
+		return fmt.Errorf("mysql and postgresql can not be enabled at the same time")
+	}
 	return nil
 }
 
@@ -135,6 +140,11 @@ func (c *Config) Load(path string) {
 	c.ControllerConfig.TrisolarisCfg.SetBillingMethod(c.ControllerConfig.BillingMethod)
 	c.ControllerConfig.TrisolarisCfg.SetPodClusterInternalIPToIngester(c.ControllerConfig.PodClusterInternalIPToIngester)
 	c.ControllerConfig.TrisolarisCfg.SetGrpcMaxMessageLength(c.ControllerConfig.GrpcMaxMessageLength)
+	c.ControllerConfig.TrisolarisCfg.SetNoTeamIDRefused(c.ControllerConfig.NoTeamIDRefused)
+	c.ControllerConfig.TrisolarisCfg.SetFPermitConfig(c.ControllerConfig.FPermit)
+	c.ControllerConfig.TrisolarisCfg.SetIngesterAPI(c.ControllerConfig.IngesterApi) // for data source
+	c.ControllerConfig.TrisolarisCfg.SetAllAgentConnectToNatIP(c.ControllerConfig.AllAgentConnectToNatIP)
+	c.ControllerConfig.TrisolarisCfg.SetNoIPOverlapping(c.ControllerConfig.NoIPOverlapping)
 	grpcPort, err := strconv.Atoi(c.ControllerConfig.GrpcPort)
 	if err == nil {
 		c.ControllerConfig.TrisolarisCfg.SetGrpcPort(grpcPort)
@@ -143,6 +153,11 @@ func (c *Config) Load(path string) {
 	if err == nil {
 		c.ControllerConfig.TrisolarisCfg.SetIngesterPort(ingesterPort)
 	}
+	// from ingester exporter setting
+	c.ControllerConfig.TrisolarisCfg.SetExportersEnabled(shared_common.ExportersEnabled(path))
+
+	c.ControllerConfig.MetadbCfg.InitFromMySQL(c.ControllerConfig.MySqlCfg)
+	c.ControllerConfig.MetadbCfg.InitFromPostgreSQL(c.ControllerConfig.PostgreSQLCfg)
 }
 
 func DefaultConfig() *Config {

@@ -17,27 +17,28 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChNodeType struct {
-	UpdaterBase[mysql.ChNodeType, NodeTypeKey]
+	UpdaterComponent[metadbmodel.ChNodeType, NodeTypeKey]
 }
 
 func NewChNodeType() *ChNodeType {
 	updater := &ChNodeType{
-		UpdaterBase[mysql.ChNodeType, NodeTypeKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_NODE_TYPE,
-		},
+		newUpdaterComponent[metadbmodel.ChNodeType, NodeTypeKey](
+			RESOURCE_TYPE_CH_NODE_TYPE,
+		),
 	}
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (n *ChNodeType) generateNewData() (map[NodeTypeKey]mysql.ChNodeType, bool) {
-	keyToItem := make(map[NodeTypeKey]mysql.ChNodeType)
+func (n *ChNodeType) generateNewData(db *metadb.DB) (map[NodeTypeKey]metadbmodel.ChNodeType, bool) {
+	keyToItem := make(map[NodeTypeKey]metadbmodel.ChNodeType)
 	for resourceType, nodeType := range RESOURCE_TYPE_TO_NODE_TYPE {
-		keyToItem[NodeTypeKey{ResourceType: resourceType}] = mysql.ChNodeType{
+		keyToItem[NodeTypeKey{ResourceType: resourceType}] = metadbmodel.ChNodeType{
 			ResourceType: resourceType,
 			NodeType:     nodeType,
 		}
@@ -45,11 +46,11 @@ func (n *ChNodeType) generateNewData() (map[NodeTypeKey]mysql.ChNodeType, bool) 
 	return keyToItem, true
 }
 
-func (n *ChNodeType) generateKey(dbItem mysql.ChNodeType) NodeTypeKey {
+func (n *ChNodeType) generateKey(dbItem metadbmodel.ChNodeType) NodeTypeKey {
 	return NodeTypeKey{ResourceType: dbItem.ResourceType}
 }
 
-func (n *ChNodeType) generateUpdateInfo(oldItem, newItem mysql.ChNodeType) (map[string]interface{}, bool) {
+func (n *ChNodeType) generateUpdateInfo(oldItem, newItem metadbmodel.ChNodeType) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.NodeType != newItem.NodeType {
 		updateInfo["node_type"] = newItem.NodeType

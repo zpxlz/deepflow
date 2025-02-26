@@ -25,18 +25,16 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getVMs(
-	region model.Region, zoneNameToAZLcuuid map[string]string, vpcIdToLcuuid map[string]string,
-	networkIdToLcuuid map[string]string,
-) ([]model.VM, []model.VInterface, []model.IP, error) {
+func (b *BaiduBce) getVMs(zoneNameToAZLcuuid map[string]string, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string) ([]model.VM, []model.VInterface, []model.IP, error) {
 	var retVMs []model.VM
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 	var vmIdToLcuuid map[string]string
 
-	log.Debug("get vms starting")
+	log.Debug("get vms starting", logger.NewORGPrefix(b.orgID))
 
 	bccClient, _ := bcc.NewClient(b.secretID, b.secretKey, "bcc."+b.endpoint)
 	bccClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -48,7 +46,7 @@ func (b *BaiduBce) getVMs(
 		startTime := time.Now()
 		result, err := bccClient.ListInstances(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("ListInstances", len(result.Instances), startTime)
@@ -65,27 +63,36 @@ func (b *BaiduBce) getVMs(
 		for _, vm := range r.Instances {
 			azLcuuid, ok := zoneNameToAZLcuuid[vm.ZoneName]
 			if !ok {
-				log.Debugf("vm (%s) az (%s) not found", vm.InstanceId, vm.ZoneName)
+				log.Debugf("vm (%s) az (%s) not found", vm.InstanceId, vm.ZoneName, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			vpcLcuuid, ok := vpcIdToLcuuid[vm.VpcId]
 			if !ok {
-				log.Debugf("vm (%s) vpc (%s) not found", vm.InstanceId, vm.VpcId)
+				log.Debugf("vm (%s) vpc (%s) not found", vm.InstanceId, vm.VpcId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			networkLcuuid, ok := networkIdToLcuuid[vm.SubnetId]
 			if !ok {
-				log.Debugf("vm (%s) network (%s) not found", vm.InstanceId, vm.SubnetId)
+				log.Debugf("vm (%s) network (%s) not found", vm.InstanceId, vm.SubnetId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 
-			vmLcuuid := common.GenerateUUID(vm.InstanceId)
+			vmLcuuid := common.GenerateUUIDByOrgID(b.orgID, vm.InstanceId)
 			vmState := common.VM_STATE_EXCEPTION
 			if vm.Status == "Running" {
 				vmState = common.VM_STATE_RUNNING
 			} else if vm.Status == "Stopped" {
 				vmState = common.VM_STATE_STOPPED
 			}
+
+			var pIP string
+			for _, nic := range vm.NicInfo.Ips {
+				if nic.Primary == "true" {
+					pIP = nic.PrivateIp
+					break
+				}
+			}
+
 			retVM := model.VM{
 				Lcuuid:       vmLcuuid,
 				Name:         vm.InstanceName,
@@ -93,13 +100,13 @@ func (b *BaiduBce) getVMs(
 				HType:        common.VM_HTYPE_VM_C,
 				VPCLcuuid:    vpcLcuuid,
 				State:        vmState,
+				IP:           pIP,
 				AZLcuuid:     azLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			}
 			retVMs = append(retVMs, retVM)
 			vmIdToLcuuid[vm.InstanceId] = vmLcuuid
 			b.azLcuuidToResourceNum[retVM.AZLcuuid]++
-			b.regionLcuuidToResourceNum[retVM.RegionLcuuid]++
 
 			// 虚拟机主网卡信息
 			// 虚拟机API不会返回弹性网卡信息，需要通过弹性网卡API单独获取
@@ -107,7 +114,7 @@ func (b *BaiduBce) getVMs(
 				continue
 			}
 
-			vinterfaceLcuuid := common.GenerateUUID(vmLcuuid + vm.NicInfo.MacAddress)
+			vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, vmLcuuid+vm.NicInfo.MacAddress)
 			retVInterface := model.VInterface{
 				Lcuuid:        vinterfaceLcuuid,
 				Type:          common.VIF_TYPE_LAN,
@@ -116,7 +123,7 @@ func (b *BaiduBce) getVMs(
 				DeviceType:    common.VIF_DEVICE_TYPE_VM,
 				NetworkLcuuid: networkLcuuid,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  region.Lcuuid,
+				RegionLcuuid:  b.regionLcuuid,
 			}
 			retVInterfaces = append(retVInterfaces, retVInterface)
 
@@ -125,13 +132,13 @@ func (b *BaiduBce) getVMs(
 					continue
 				}
 				// 内网IP
-				ipLcuuid := common.GenerateUUID(vinterfaceLcuuid + ip.PrivateIp)
+				ipLcuuid := common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+ip.PrivateIp)
 				retIP := model.IP{
 					Lcuuid:           ipLcuuid,
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               ip.PrivateIp,
-					SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-					RegionLcuuid:     region.Lcuuid,
+					SubnetLcuuid:     common.GenerateUUIDByOrgID(b.orgID, networkLcuuid),
+					RegionLcuuid:     b.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 
@@ -139,7 +146,7 @@ func (b *BaiduBce) getVMs(
 				if ip.Eip == "" || ip.Eip == "null" {
 					continue
 				}
-				publicVInterfaceLcuuid := common.GenerateUUID(vmLcuuid + ip.Eip)
+				publicVInterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, vmLcuuid+ip.Eip)
 				retVInterface = model.VInterface{
 					Lcuuid:        publicVInterfaceLcuuid,
 					Type:          common.VIF_TYPE_WAN,
@@ -148,16 +155,16 @@ func (b *BaiduBce) getVMs(
 					DeviceType:    common.VIF_DEVICE_TYPE_VM,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  region.Lcuuid,
+					RegionLcuuid:  b.regionLcuuid,
 				}
 				retVInterfaces = append(retVInterfaces, retVInterface)
 
-				publicIPLcuuid := common.GenerateUUID(publicVInterfaceLcuuid + ip.Eip)
+				publicIPLcuuid := common.GenerateUUIDByOrgID(b.orgID, publicVInterfaceLcuuid+ip.Eip)
 				retIP = model.IP{
 					Lcuuid:           publicIPLcuuid,
 					VInterfaceLcuuid: publicVInterfaceLcuuid,
 					IP:               ip.Eip,
-					RegionLcuuid:     region.Lcuuid,
+					RegionLcuuid:     b.regionLcuuid,
 				}
 				retIPs = append(retIPs, retIP)
 			}
@@ -165,7 +172,7 @@ func (b *BaiduBce) getVMs(
 	}
 
 	// 获取弹性网卡及IP信息
-	tmpVInterfaces, tmpIPs, err := b.getVMEnis(region, vpcIdToLcuuid, networkIdToLcuuid, vmIdToLcuuid)
+	tmpVInterfaces, tmpIPs, err := b.getVMEnis(vpcIdToLcuuid, networkIdToLcuuid, vmIdToLcuuid)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -173,17 +180,17 @@ func (b *BaiduBce) getVMs(
 	retVInterfaces = append(retVInterfaces, tmpVInterfaces...)
 	retIPs = append(retIPs, tmpIPs...)
 
-	log.Debug("get vms complete")
+	log.Debug("get vms complete", logger.NewORGPrefix(b.orgID))
 	return retVMs, retVInterfaces, retIPs, nil
 }
 
 func (b *BaiduBce) getVMEnis(
-	region model.Region, vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string, vmIdToLcuuid map[string]string,
+	vpcIdToLcuuid map[string]string, networkIdToLcuuid map[string]string, vmIdToLcuuid map[string]string,
 ) ([]model.VInterface, []model.IP, error) {
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get vm enis starting")
+	log.Debug("get vm enis starting", logger.NewORGPrefix(b.orgID))
 
 	eniClient, _ := eni.NewClient(b.secretID, b.secretKey, "bcc."+b.endpoint)
 	eniClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -196,7 +203,7 @@ func (b *BaiduBce) getVMEnis(
 			startTime := time.Now()
 			result, err := eniClient.ListEni(args)
 			if err != nil {
-				log.Error(err)
+				log.Error(err, logger.NewORGPrefix(b.orgID))
 				return nil, nil, err
 			}
 			b.cloudStatsd.RefreshAPIMoniter("ListEni", len(result.Eni), startTime)
@@ -217,16 +224,16 @@ func (b *BaiduBce) getVMEnis(
 
 				vmLcuuid, ok := vmIdToLcuuid[eni.InstanceId]
 				if !ok {
-					log.Infof("eni (%s) vm (%s) not found", eni.EniId, eni.InstanceId)
+					log.Infof("eni (%s) vm (%s) not found", eni.EniId, eni.InstanceId, logger.NewORGPrefix(b.orgID))
 					continue
 				}
 				networkLcuuid, ok := networkIdToLcuuid[eni.SubnetId]
 				if !ok {
-					log.Infof("eni (%s) network (%s) not found", eni.EniId, eni.SubnetId)
+					log.Infof("eni (%s) network (%s) not found", eni.EniId, eni.SubnetId, logger.NewORGPrefix(b.orgID))
 					continue
 				}
 
-				vinterfaceLcuuid := common.GenerateUUID(vmLcuuid + eni.EniId)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, vmLcuuid+eni.EniId)
 				retVInterface := model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.NETWORK_TYPE_LAN,
@@ -235,7 +242,7 @@ func (b *BaiduBce) getVMEnis(
 					DeviceType:    common.VIF_DEVICE_TYPE_VM,
 					NetworkLcuuid: networkLcuuid,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  region.Lcuuid,
+					RegionLcuuid:  b.regionLcuuid,
 				}
 				retVInterfaces = append(retVInterfaces, retVInterface)
 
@@ -244,11 +251,11 @@ func (b *BaiduBce) getVMEnis(
 						continue
 					}
 					retIP := model.IP{
-						Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + privateIP.PrivateIpAddress),
+						Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+privateIP.PrivateIpAddress),
 						VInterfaceLcuuid: vinterfaceLcuuid,
 						IP:               privateIP.PrivateIpAddress,
-						SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-						RegionLcuuid:     region.Lcuuid,
+						SubnetLcuuid:     common.GenerateUUIDByOrgID(b.orgID, networkLcuuid),
+						RegionLcuuid:     b.regionLcuuid,
 					}
 					retIPs = append(retIPs, retIP)
 
@@ -257,7 +264,7 @@ func (b *BaiduBce) getVMEnis(
 						continue
 					}
 
-					publicVInterfaceLcuuid := common.GenerateUUID(vmLcuuid + privateIP.PublicIpAddress)
+					publicVInterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, vmLcuuid+privateIP.PublicIpAddress)
 					retVInterface = model.VInterface{
 						Lcuuid:        publicVInterfaceLcuuid,
 						Type:          common.NETWORK_TYPE_WAN,
@@ -266,23 +273,21 @@ func (b *BaiduBce) getVMEnis(
 						DeviceType:    common.VIF_DEVICE_TYPE_VM,
 						NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 						VPCLcuuid:     vpcLcuuid,
-						RegionLcuuid:  region.Lcuuid,
+						RegionLcuuid:  b.regionLcuuid,
 					}
 					retVInterfaces = append(retVInterfaces, retVInterface)
 
 					retIP = model.IP{
-						Lcuuid: common.GenerateUUID(
-							publicVInterfaceLcuuid + privateIP.PublicIpAddress,
-						),
+						Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, publicVInterfaceLcuuid+privateIP.PublicIpAddress),
 						VInterfaceLcuuid: publicVInterfaceLcuuid,
 						IP:               privateIP.PublicIpAddress,
-						RegionLcuuid:     region.Lcuuid,
+						RegionLcuuid:     b.regionLcuuid,
 					}
 					retIPs = append(retIPs, retIP)
 				}
 			}
 		}
 	}
-	log.Debug("Get vm enis complete")
+	log.Debug("Get vm enis complete", logger.NewORGPrefix(b.orgID))
 	return retVInterfaces, retIPs, nil
 }

@@ -30,6 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ipnet::IpNet;
 use log::{debug, info, trace, warn};
 use neli::{
     attr::Attribute,
@@ -48,8 +49,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::utils::net::{
-    self, addr_list, link_by_name, link_list, links_by_name_regex, Addr, Link, MacAddr,
-    IF_TYPE_IPVLAN,
+    self, addr_list, link_by_name, link_list, links_by_name_regex, route_list, rule_list, Addr,
+    Link, MacAddr, IF_TYPE_IPVLAN,
 };
 
 #[derive(Debug, Error)]
@@ -85,7 +86,7 @@ pub struct InterfaceInfo {
     pub tap_ns: NsFile,
     pub tap_idx: u32,
     pub mac: MacAddr,
-    pub ips: Vec<IpAddr>,
+    pub ips: Vec<IpNet>,
     pub name: String,
     pub device_id: String,
     pub ns_inode: u64,
@@ -152,7 +153,7 @@ pub enum NsFile {
 }
 
 impl NsFile {
-    fn get_inode(&self) -> Result<u64> {
+    pub fn get_inode(&self) -> Result<u64> {
         match self {
             Self::Root => Ok(fs::metadata(ROOT_NS_PATH)?.ino()),
             Self::Named(name) => {
@@ -161,6 +162,27 @@ impl NsFile {
             }
             Self::Proc(ino) => Ok(*ino),
         }
+    }
+
+    // opening root and named namespaces is consistent
+    //
+    // opening a proc namespace will need to iterate /proc/$pid/ns/net entries to find netns file
+    // which cost more cpu and can fail when process terminates
+    pub fn open_and_setns(&self) -> Result<()> {
+        if !supported() {
+            return Ok(());
+        }
+        let path = match self {
+            NsFile::Root => Cow::Borrowed(Path::new(ROOT_NS_PATH)),
+            NsFile::Named(name) => Cow::Owned(Path::new(NAMED_PATH).join(name)),
+            NsFile::Proc(inode) => Cow::Owned(get_proc_path_by_inode(*inode)?),
+        };
+        let fp = File::open(&*path)?;
+        let r = set_netns(&fp);
+        if let Err(e) = r.as_ref() {
+            debug!("open {} and setns failed: {:?}", path.display(), e);
+        }
+        r
     }
 }
 
@@ -241,7 +263,75 @@ pub const NAMED_PATH: &'static str = "/var/run/netns";
 pub const ROOT_NS_PATH: &'static str = "/proc/1/ns/net";
 pub const PROC_PATH: &'static str = "/proc";
 
-pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<InterfaceInfo>>> {
+fn generate_masklen_map() -> Result<HashMap<IpAddr, u8>> {
+    let mut prefix_map = HashMap::new();
+    generate_masklen_map_in(&mut prefix_map)?;
+    Ok(prefix_map)
+}
+
+/*
+ * Generates mapping of ip address and its netmask prefix
+ * by linux policy routing entries
+ *
+ * 1. Find the following routing rule (`ip rule show`) by destination $ip:
+ *
+ *      from all to $ip lookup $table
+ *
+ * 2. Find the matching route (`ip route show table $table`) in $table
+ *
+ *      $ip_masked/$prefix dev ...
+ *
+ *    in which `$ip_masked` is a address range that covers `$ip`
+ *
+ * 3. Populate the `HashMap` with `key=$ip` and `value=$prefix`
+ */
+fn generate_masklen_map_in(map: &mut HashMap<IpAddr, u8>) -> Result<()> {
+    let rules = rule_list()?;
+    trace!("rules: {:?}", rules);
+    if rules.is_empty() {
+        return Ok(());
+    }
+    let routes = route_list()?;
+    trace!("routes: {:?}", routes);
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    for rule in rules {
+        let Some(ip) = rule.dst_ip.as_ref() else {
+            continue;
+        };
+
+        // only care about single addresses
+        if ip.prefix_len() != ip.max_prefix_len() {
+            continue;
+        }
+
+        for route in routes.iter() {
+            let Some(route_ip) = route.dst_ip.as_ref() else {
+                continue;
+            };
+
+            // found matching entry
+            if rule.table == route.table && route_ip.contains(ip) {
+                trace!(
+                    "found prefix len {} for addr {}",
+                    route_ip.prefix_len(),
+                    ip.addr()
+                );
+                map.insert(ip.addr(), route_ip.prefix_len());
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn interfaces_linked_with<S: AsRef<[NsFile]>>(
+    ns: S,
+) -> Result<HashMap<NsFile, Vec<InterfaceInfo>>> {
+    let ns = ns.as_ref();
     // find all net namespaces
     let mut all_ns = HashMap::new();
     for path in get_named_file_paths().into_iter() {
@@ -270,11 +360,39 @@ pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<In
         all_ns.iter().map(|(k, v)| (k, &v[0])).collect::<Vec<_>>()
     );
 
+    struct NamespaceInfo<'a> {
+        fp: File,
+        file: &'a NsFile,
+        prefix_map: HashMap<IpAddr, u8>,
+    }
+
     debug!("tap namespace: {:?}", ns);
+    // nsid is not consistent between namespaces
+    // the connection is established by querying nsid from pod namespace
+    // for all interested namespaces (in which pod link veth pair resides)
+    // and related it to `link_netsid` in link info
+    //
+    // `NamespaceInfo` is used to put these things together for query:
+    //   fp: used for querying nsid from pod namespace
+    //   file: `tap_ns` entry in `InterfaceInfo`
+    //   prefix_map: getting link ip prefix
     let interested_files = ns
         .iter()
         .filter_map(|f| match open_root_or_named_ns_file(f) {
-            Ok((fp, _)) => Some((f, fp)),
+            Ok((fp, _)) => {
+                if let Err(_) = set_netns(&fp) {
+                    warn!("setns failed for {}", f);
+                    None
+                } else {
+                    let prefix_map = generate_masklen_map().unwrap_or_default();
+                    debug!("prefix map in {} is {:?}", f, prefix_map);
+                    Some(NamespaceInfo {
+                        fp,
+                        file: f,
+                        prefix_map,
+                    })
+                }
+            }
             Err(e) => {
                 warn!("open netns file {:?} failed: {:?}", f, e);
                 None
@@ -331,10 +449,15 @@ pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<In
             }
 
             nsid_map.clear();
-            for (ns, nsfp) in interested_files.iter() {
+            for NamespaceInfo {
+                file: ns,
+                fp: nsfp,
+                prefix_map,
+            } in interested_files.iter()
+            {
                 match socket.get_nsid_by_file(nsfp) {
                     Ok(id) if id >= 0 => {
-                        nsid_map.insert(id, ns);
+                        nsid_map.insert(id, (ns, prefix_map));
                     }
                     Ok(_) => (),
                     Err(e) => {
@@ -346,21 +469,22 @@ pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<In
 
             for link in links {
                 trace!("check {:?}", link);
-                let tap_ns = if let Some(nsid) = link.link_netnsid {
-                    let Some(tap_ns) = nsid_map.get(&(nsid as i32)) else {
-                        debug!("no tap_ns found for link {:?}", link);
-                        continue;
-                    };
-                    tap_ns
-                } else {
-                    match link.if_type.as_ref() {
-                        Some(if_type) if if_type == IF_TYPE_IPVLAN => &NsFile::Root,
-                        _ => {
-                            debug!("{:?} has no link-netnsid", link);
+                let (tap_ns, prefix_map): (&NsFile, Option<&HashMap<_, _>>) =
+                    if let Some(nsid) = link.link_netnsid {
+                        let Some((tap_ns, prefix_map)) = nsid_map.get(&(nsid as i32)) else {
+                            debug!("no tap_ns found for link {:?}", link);
                             continue;
+                        };
+                        (**tap_ns, Some(*prefix_map))
+                    } else {
+                        match link.if_type.as_ref() {
+                            Some(if_type) if if_type == IF_TYPE_IPVLAN => (&NsFile::Root, None),
+                            _ => {
+                                debug!("{:?} has no link-netnsid", link);
+                                continue;
+                            }
                         }
-                    }
-                };
+                    };
                 let info = InterfaceInfo {
                     tap_ns: tap_ns.clone(),
                     // no peer index means same index
@@ -370,7 +494,13 @@ pub fn interfaces_linked_with(ns: &Vec<NsFile>) -> Result<HashMap<NsFile, Vec<In
                         .iter()
                         .filter_map(|addr| {
                             if addr.if_index == link.if_index {
-                                Some(addr.ip_addr)
+                                let prefix_len = prefix_map
+                                    .and_then(|m| m.get(&addr.ip_addr))
+                                    .unwrap_or(match addr.ip_addr {
+                                        IpAddr::V4(_) => &32,
+                                        IpAddr::V6(_) => &128,
+                                    });
+                                IpNet::new(addr.ip_addr, *prefix_len).ok()
                             } else {
                                 None
                             }
@@ -512,23 +642,6 @@ pub fn reset_netns() -> Result<()> {
     })
 }
 
-pub fn open_named_and_setns(ns: &NsFile) -> Result<()> {
-    if !supported() {
-        return Ok(());
-    }
-    let path = match ns {
-        NsFile::Root => Cow::Borrowed(Path::new(ROOT_NS_PATH)),
-        NsFile::Named(name) => Cow::Owned(Path::new(NAMED_PATH).join(name)),
-        _ => unimplemented!(),
-    };
-    let fp = File::open(&*path)?;
-    let r = set_netns(&fp);
-    if let Err(e) = r.as_ref() {
-        debug!("open {} and setns failed: {:?}", path.display(), e);
-    }
-    r
-}
-
 fn get_named_file_paths() -> Vec<PathBuf> {
     let paths = if let Ok(entries) = fs::read_dir(NAMED_PATH) {
         entries
@@ -570,7 +683,33 @@ fn open_root_or_named_ns_file(ns: &NsFile) -> Result<(File, PathBuf)> {
     }
 }
 
-fn get_proc_cache() -> Result<HashMap<u64, Vec<u32>>> {
+// get a possible path by netns inode from process net namespaces
+fn get_proc_path_by_inode(inode: u64) -> Result<PathBuf> {
+    for proc in fs::read_dir(PROC_PATH)? {
+        let Ok(proc) = proc else {
+            // ignore file not found probably caused by process terminated
+            continue;
+        };
+        match proc.file_type() {
+            Ok(t) if t.is_dir() => (),
+            _ => {
+                debug!("skipped {}", proc.path().display());
+                continue;
+            }
+        }
+
+        let mut ns_path = proc.path();
+        ns_path.extend(&["ns", "net"]);
+        if let Ok(fp) = fs::metadata(&ns_path) {
+            if fp.ino() == inode {
+                return Ok(ns_path);
+            }
+        }
+    }
+    Err(Error::NotFound)
+}
+
+pub fn get_proc_cache() -> Result<HashMap<u64, Vec<u32>>> {
     let mut cache = HashMap::new();
     for proc in fs::read_dir(PROC_PATH)? {
         let Ok(proc) = proc else {
@@ -648,28 +787,28 @@ impl WrappedSocket {
 }
 
 pub fn link_by_name_in_netns<S: AsRef<str>>(name: S, ns: &NsFile) -> Result<Link> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let link = link_by_name(name.as_ref())?;
     reset_netns()?;
     Ok(link)
 }
 
 pub fn links_by_name_regex_in_netns<S: AsRef<str>>(regex: S, ns: &NsFile) -> Result<Vec<Link>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let links = links_by_name_regex(regex.as_ref())?;
     reset_netns()?;
     Ok(links)
 }
 
 pub fn link_list_in_netns(ns: &NsFile) -> Result<Vec<Link>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let links = link_list()?;
     reset_netns()?;
     Ok(links)
 }
 
 pub fn addr_list_in_netns(ns: &NsFile) -> Result<Vec<Addr>> {
-    let _ = open_named_and_setns(ns)?;
+    let _ = ns.open_and_setns()?;
     let addrs = addr_list()?;
     reset_netns()?;
     Ok(addrs)

@@ -33,7 +33,7 @@ const (
 )
 
 type PcapWriter struct {
-	ckdbAddrs         []string
+	ckdbAddrs         *[]string
 	ckdbUsername      string
 	ckdbPassword      string
 	ckdbCluster       string
@@ -60,10 +60,10 @@ func NewPcapWriter(config *config.Config) (*PcapWriter, error) {
 		ttl:               config.TTL,
 		writerConfig:      config.CKWriterConfig,
 	}
-	table := GenPcapCKTable(w.ckdbCluster, w.ckdbStoragePolicy, w.ttl, ckdb.GetColdStorage(w.ckdbColdStorages, PCAP_DB, PCAP_TABLE))
+	table := GenPcapCKTable(w.ckdbCluster, w.ckdbStoragePolicy, config.Base.CKDB.Type, w.ttl, ckdb.GetColdStorage(w.ckdbColdStorages, PCAP_DB, PCAP_TABLE))
 
-	ckwriter, err := ckwriter.NewCKWriter(w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
-		PCAP_TABLE, config.Base.CKDB.TimeZone, table, w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout)
+	ckwriter, err := ckwriter.NewCKWriter(*w.ckdbAddrs, w.ckdbUsername, w.ckdbPassword,
+		PCAP_TABLE, config.Base.CKDB.TimeZone, table, w.writerConfig.QueueCount, w.writerConfig.QueueSize, w.writerConfig.BatchSize, w.writerConfig.FlushTimeout, config.Base.CKDB.Watcher)
 	if err != nil {
 		return nil, err
 	}

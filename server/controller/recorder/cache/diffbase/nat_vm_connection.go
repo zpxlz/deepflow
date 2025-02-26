@@ -18,22 +18,22 @@ package diffbase
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddNATVMConnection(dbItem *mysql.NATVMConnection, seq int) {
+func (b *DataSet) AddNATVMConnection(dbItem *metadbmodel.NATVMConnection, seq int) {
 	b.NATVMConnections[dbItem.Lcuuid] = &NATVMConnection{
 		DiffBase: DiffBase{
 			Sequence: seq,
 			Lcuuid:   dbItem.Lcuuid,
 		},
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN, b.NATVMConnections[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN, b.NATVMConnections[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteNATVMConnection(lcuuid string) {
 	delete(b.NATVMConnections, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_NAT_VM_CONNECTION_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type NATVMConnection struct {

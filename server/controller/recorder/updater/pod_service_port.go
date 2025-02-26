@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodServicePort struct {
-	UpdaterBase[cloudmodel.PodServicePort, mysql.PodServicePort, *diffbase.PodServicePort]
+	UpdaterBase[
+		cloudmodel.PodServicePort,
+		*diffbase.PodServicePort,
+		*metadbmodel.PodServicePort,
+		metadbmodel.PodServicePort,
+		*message.PodServicePortAdd,
+		message.PodServicePortAdd,
+		*message.PodServicePortUpdate,
+		message.PodServicePortUpdate,
+		*message.PodServicePortFieldsUpdate,
+		message.PodServicePortFieldsUpdate,
+		*message.PodServicePortDelete,
+		message.PodServicePortDelete]
 }
 
 func NewPodServicePort(wholeCache *cache.Cache, cloudData []cloudmodel.PodServicePort) *PodServicePort {
 	updater := &PodServicePort{
-		UpdaterBase[cloudmodel.PodServicePort, mysql.PodServicePort, *diffbase.PodServicePort]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPodServicePort(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PodServicePorts,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodServicePort,
+			*diffbase.PodServicePort,
+			*metadbmodel.PodServicePort,
+			metadbmodel.PodServicePort,
+			*message.PodServicePortAdd,
+			message.PodServicePortAdd,
+			*message.PodServicePortUpdate,
+			message.PodServicePortUpdate,
+			*message.PodServicePortFieldsUpdate,
+			message.PodServicePortFieldsUpdate,
+			*message.PodServicePortDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN,
+			wholeCache,
+			db.NewPodServicePort().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PodServicePorts,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,17 +73,17 @@ func (s *PodServicePort) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodService
 	return
 }
 
-func (p *PodServicePort) generateDBItemToAdd(cloudItem *cloudmodel.PodServicePort) (*mysql.PodServicePort, bool) {
+func (p *PodServicePort) generateDBItemToAdd(cloudItem *cloudmodel.PodServicePort) (*metadbmodel.PodServicePort, bool) {
 	podServiceID, exists := p.cache.ToolDataSet.GetPodServiceIDByLcuuid(cloudItem.PodServiceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, cloudItem.PodServiceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN, cloudItem.Lcuuid,
-		))
+		), p.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.PodServicePort{
+	dbItem := &metadbmodel.PodServicePort{
 		Name:         cloudItem.Name,
 		Protocol:     cloudItem.Protocol,
 		Port:         cloudItem.Port,
@@ -66,19 +91,19 @@ func (p *PodServicePort) generateDBItemToAdd(cloudItem *cloudmodel.PodServicePor
 		NodePort:     cloudItem.NodePort,
 		PodServiceID: podServiceID,
 		SubDomain:    cloudItem.SubDomainLcuuid,
+		Domain:       p.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (p *PodServicePort) generateUpdateInfo(diffBase *diffbase.PodServicePort, cloudItem *cloudmodel.PodServicePort) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (p *PodServicePort) generateUpdateInfo(diffBase *diffbase.PodServicePort, cloudItem *cloudmodel.PodServicePort) (*message.PodServicePortFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodServicePortFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddPeerConnection(dbItem *mysql.PeerConnection, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddPeerConnection(dbItem *metadbmodel.PeerConnection, seq int, toolDataSet *tool.DataSet) {
 	remoteRegionLcuuid, _ := toolDataSet.GetRegionLcuuidByID(dbItem.RemoteRegionID)
 	localRegionLcuuid, _ := toolDataSet.GetRegionLcuuidByID(dbItem.LocalRegionID)
 	b.PeerConnections[dbItem.Lcuuid] = &PeerConnection{
@@ -35,12 +35,12 @@ func (b *DataSet) AddPeerConnection(dbItem *mysql.PeerConnection, seq int, toolD
 		RemoteRegionLcuuid: remoteRegionLcuuid,
 		LocalRegionLcuuid:  localRegionLcuuid,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, b.PeerConnections[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, b.PeerConnections[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePeerConnection(lcuuid string) {
 	delete(b.PeerConnections, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PeerConnection struct {

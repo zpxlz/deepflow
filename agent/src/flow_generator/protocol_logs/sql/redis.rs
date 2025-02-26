@@ -14,28 +14,30 @@
  * limitations under the License.
  */
 
-use serde::{Serialize, Serializer};
+use std::{cell::OnceCell, collections::HashMap, fmt, str};
 
-use std::{fmt, str};
+use serde::{Serialize, Serializer};
 
 use super::{
     super::{value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType},
-    redis_obfuscate::attempt_obfuscation,
     ObfuscateCache,
 };
 
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::L7Protocol,
-        flow::{L7PerfStats, PacketDirection},
+        flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
         l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
         meta_packet::EbpfFlags,
     },
+    config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
-        protocol_logs::pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
+        protocol_logs::{
+            pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
+            set_captured_byte,
+        },
     },
 };
 
@@ -74,7 +76,13 @@ pub struct RedisInfo {
     #[serde(rename = "response_status")]
     pub resp_status: L7ResponseStatus,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     rrt: u64,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 impl L7ProtocolInfoInterface for RedisInfo {
@@ -100,6 +108,14 @@ impl L7ProtocolInfoInterface for RedisInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.request.len()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 pub fn vec_u8_to_string<S>(v: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
@@ -114,7 +130,21 @@ impl RedisInfo {
         std::mem::swap(&mut self.status, &mut other.status);
         std::mem::swap(&mut self.error, &mut other.error);
         self.resp_status = other.resp_status;
+        self.captured_response_byte = other.captured_response_byte;
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
         Ok(())
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::Redis) {
+            self.is_on_blacklist = t
+                .request_resource
+                .is_on_blacklist(str::from_utf8(&self.request).unwrap_or_default())
+                || t.request_type
+                    .is_on_blacklist(str::from_utf8(&self.request_type).unwrap_or_default());
+        }
     }
 }
 
@@ -151,6 +181,8 @@ impl From<RedisInfo> for L7ProtocolSendLog {
             EbpfFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req: L7Request {
                 req_type: String::from_utf8_lossy(f.request_type.as_slice()).to_string(),
                 resource: String::from_utf8_lossy(f.request.as_slice()).to_string(),
@@ -172,7 +204,8 @@ impl From<RedisInfo> for L7ProtocolSendLog {
 pub struct RedisLog {
     has_request: bool,
     perf_stats: Option<L7PerfStats>,
-    obfuscate_cache: Option<ObfuscateCache>,
+    obfuscate: bool,
+    last_is_on_blacklist: bool,
 }
 
 impl L7ProtocolParserInterface for RedisLog {
@@ -184,10 +217,7 @@ impl L7ProtocolParserInterface for RedisLog {
             return false;
         }
 
-        if payload[0] != b'*' {
-            return false;
-        }
-        decode_asterisk(payload, true).is_some()
+        CommandLine::new(payload).is_ok()
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -196,17 +226,29 @@ impl L7ProtocolParserInterface for RedisLog {
         };
         let mut info = RedisInfo::default();
         info.is_tls = param.is_tls();
-        self.parse(
-            payload,
-            param.l4_protocol,
-            param.direction,
-            param.is_from_ebpf(),
-            &mut info,
-        )?;
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
+        self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+        if !info.is_on_blacklist && !self.last_is_on_blacklist {
+            match param.direction {
+                PacketDirection::ClientToServer => {
+                    self.perf_stats.as_mut().map(|p| p.inc_req());
+                }
+                PacketDirection::ServerToClient => {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if info.resp_status == L7ResponseStatus::ServerError {
+                        self.perf_stats.as_mut().map(|p| p.inc_resp_err());
+                    }
+                }
+            }
+            info.cal_rrt(param).map(|rrt| {
+                info.rrt = rrt;
+                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
+            });
+        }
+        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::RedisInfo(info)))
         } else {
@@ -227,7 +269,7 @@ impl L7ProtocolParserInterface for RedisLog {
     }
 
     fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
-        self.obfuscate_cache = obfuscate_cache;
+        self.obfuscate = obfuscate_cache.is_some();
     }
 }
 
@@ -236,33 +278,27 @@ impl RedisLog {
         self.perf_stats = None;
     }
 
-    fn fill_request(&mut self, context: Vec<u8>, info: &mut RedisInfo) {
-        info.request_type = match (&context).iter().position(|&x| x == b' ') {
-            Some(i) if i > 0 => Vec::from(&context[..i]),
-            _ => context.clone(),
-        };
+    fn fill_request(&mut self, request: CommandLine, info: &mut RedisInfo) {
+        info.request_type = Vec::from(request.command());
         info.msg_type = LogMessageType::Request;
-        info.request =
-            attempt_obfuscation(&self.obfuscate_cache, &context, false).map_or(context, |m| m);
+        info.request = request.stringify(self.obfuscate);
         self.has_request = true;
-        self.perf_stats.as_mut().map(|p| p.inc_req());
     }
 
-    fn fill_response(&mut self, context: Vec<u8>, error_response: bool, info: &mut RedisInfo) {
+    fn fill_response(&mut self, context: Vec<u8>, info: &mut RedisInfo) {
         info.msg_type = LogMessageType::Response;
         self.has_request = false;
-        self.perf_stats.as_mut().map(|p| p.inc_resp());
+
+        info.resp_status = L7ResponseStatus::Ok;
+
         if context.is_empty() {
             return;
         }
-
-        info.resp_status = L7ResponseStatus::Ok;
         match context[0] {
             b'+' => info.status = context,
-            b'-' if error_response => {
+            b'-' | b'!' => {
                 info.error = context;
                 info.resp_status = L7ResponseStatus::ServerError;
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
             }
             _ => {}
         }
@@ -273,24 +309,22 @@ impl RedisLog {
         payload: &[u8],
         proto: IpProtocol,
         direction: PacketDirection,
-        is_from_ebpf: bool,
         info: &mut RedisInfo,
     ) -> Result<()> {
         if proto != IpProtocol::TCP {
             return Err(Error::InvalidIpProtocol);
         }
+        if payload.is_empty() {
+            return Err(Error::L7ProtocolUnknown);
+        }
 
-        let (context, _, error_response) =
-            decode(payload, direction == PacketDirection::ClientToServer)
-                .ok_or(Error::RedisLogParseFailed)?;
         match direction {
             // only parse the request with payload start with '*' which indicate is a command start, otherwise assume tcp fragment of request
-            PacketDirection::ClientToServer if payload[0] == b'*' => {
-                self.fill_request(context, info)
+            PacketDirection::ClientToServer if payload.get(0) == Some(&b'*') => {
+                self.fill_request(CommandLine::new(payload)?, info)
             }
-            // When packet comes from AfPacket, there must be a request before parsing the response.
-            PacketDirection::ServerToClient if self.has_request || is_from_ebpf => {
-                self.fill_response(context, error_response, info)
+            PacketDirection::ServerToClient if self.has_request => {
+                self.fill_response(stringifier::decode(payload, false)?, info)
             }
             _ => return Err(Error::L7ProtocolUnknown),
         };
@@ -298,161 +332,712 @@ impl RedisLog {
     }
 }
 
-// 协议解析：http://redisdoc.com/topic/protocol.html#
-fn find_separator(payload: &[u8]) -> Option<usize> {
-    let len = payload.len();
-    if len < 2 {
-        return None;
+mod stringifier {
+    use super::*;
+
+    pub const NULL_STR: &'static str = "NULL";
+
+    // decode simple types that does not contain '\r' or '\n' but ends with "\r\n"
+    fn decode_simple_type<'a, P>(
+        output: Option<&mut Vec<u8>>,
+        payload: &'a [u8],
+        condition: P,
+        limit: usize,
+    ) -> Result<&'a [u8]>
+    where
+        P: Fn(usize, u8) -> bool,
+    {
+        let payload = &payload[1..];
+        // find the first invalid character or '\r'
+        let Some(end) = payload
+            .iter()
+            .enumerate()
+            .position(|(i, &b)| !condition(i, b) || b == b'\r')
+        else {
+            return Err(Error::RedisLogParseFailed);
+        };
+        if end + 2 > payload.len() || &payload[end..end + 2] != b"\r\n" {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        if let Some(output) = output {
+            output.extend_from_slice(&payload[..end.min(limit)]);
+            if end > 1 + limit {
+                output.extend_from_slice(b"...");
+            }
+        }
+
+        Ok(&payload[end + 2..])
     }
 
-    for i in 0..len - 1 {
-        if payload[i] == b'\r' && payload[i + 1] == b'\n' {
-            return Some(i);
+    fn validate_simple_type<P>(payload: &[u8], condition: P) -> Result<&[u8]>
+    where
+        P: Fn(usize, u8) -> bool,
+    {
+        decode_simple_type(None, payload, condition, 0)
+    }
+
+    // does not include type character
+    pub fn read_length(payload: &[u8]) -> Result<(&[u8], isize)> {
+        let Some(end) = payload
+            .iter()
+            .position(|&b| !(b == b'+' || b == b'-' || b.is_ascii_digit()) || b == b'\r')
+        else {
+            return Err(Error::RedisLogParseFailed);
+        };
+        if end + 2 > payload.len() || &payload[end..end + 2] != b"\r\n" {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        // SAFTY: verified characters in [0, end) are ascii
+        let s = unsafe { str::from_utf8_unchecked(&payload[..end]) };
+        let Ok(length) = s.parse::<isize>() else {
+            return Err(Error::RedisLogParseFailed);
+        };
+
+        Ok((&payload[end + 2..], length))
+    }
+
+    // decode TLV types
+    fn decode_bulk_type<'a>(output: Option<&mut Vec<u8>>, payload: &'a [u8]) -> Result<&'a [u8]> {
+        let (payload, length) = read_length(&payload[1..])?;
+
+        // actually only -1 is valid
+        if length < 0 {
+            if let Some(output) = output {
+                output.extend_from_slice(NULL_STR.as_bytes());
+            }
+            return Ok(payload);
+        }
+
+        let end = length as usize;
+        if end + 2 > payload.len() || &payload[end..end + 2] != b"\r\n" {
+            // for non-strict parse
+            if let Some(output) = output {
+                output.extend_from_slice(&payload[..end.min(payload.len())]);
+            }
+            return Err(Error::RedisLogParsePartial);
+        }
+
+        if let Some(output) = output {
+            output.extend_from_slice(&payload[..end]);
+        }
+
+        Ok(&payload[end + 2..])
+    }
+
+    // decode TLV types
+    fn validate_bulk_type(payload: &[u8]) -> Result<&[u8]> {
+        decode_bulk_type(None, payload)
+    }
+
+    // decode arrays, sets and pushes
+    fn validate_array_type(payload: &[u8]) -> Result<&[u8]> {
+        let (mut payload, length) = read_length(&payload[1..])?;
+
+        // actually only -1 is valid
+        if length < 0 {
+            return Ok(payload);
+        }
+
+        for _ in 0..length {
+            match decode_resp_type(None, payload) {
+                Ok(p) => payload = p,
+                _ => return Err(Error::RedisLogParsePartial),
+            };
+        }
+
+        Ok(payload)
+    }
+
+    fn decode_simple_string<'a>(
+        mut output: Option<&mut Vec<u8>>,
+        payload: &'a [u8],
+    ) -> Result<&'a [u8]> {
+        assert_eq!(payload[0], b'+');
+        if let Some(ref mut output) = output {
+            output.push(payload[0]);
+        }
+        decode_simple_type(output, payload, |_, c| c.is_ascii(), 32)
+    }
+
+    fn decode_simple_error<'a>(
+        mut output: Option<&mut Vec<u8>>,
+        payload: &'a [u8],
+    ) -> Result<&'a [u8]> {
+        assert_eq!(payload[0], b'-');
+        if let Some(ref mut output) = output {
+            output.push(payload[0]);
+        }
+        decode_simple_type(output, payload, |_, c| c.is_ascii(), 256)
+    }
+
+    fn validate_integer(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b':');
+        validate_simple_type(payload, |i, c| {
+            c.is_ascii_digit() || (i == 0 && (c == b'+' || c == b'-'))
+        })
+    }
+
+    fn validate_bulk_string(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'$');
+        validate_bulk_type(payload)
+    }
+
+    fn validate_array(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'*');
+        validate_array_type(payload)
+    }
+
+    // _\r\n
+    fn validate_null(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'_');
+
+        if payload.get(1..3) == Some(b"\r\n".as_ref()) {
+            Ok(&payload[3..])
+        } else {
+            Err(Error::RedisLogParseFailed)
         }
     }
-    None
-}
 
-fn decode_integer(payload: &[u8]) -> Option<(isize, usize)> {
-    let separator_pos = find_separator(payload)?;
-    // 整数至少占一位
-    if separator_pos < 1 {
-        return None;
+    // #<t|f>\r\n
+    fn validate_boolean(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'#');
+
+        match payload.get(1..4) {
+            Some(b"t\r\n") | Some(b"f\r\n") => Ok(&payload[4..]),
+            _ => Err(Error::RedisLogParseFailed),
+        }
     }
 
-    let integer = str::from_utf8(&payload[..separator_pos])
-        .unwrap_or_default()
-        .parse::<isize>()
-        .ok()?;
-
-    Some((integer, separator_pos + SEPARATOR_SIZE))
-}
-
-// 格式为"$3\r\nSET\r\n"
-fn decode_dollor(payload: &[u8], strict: bool) -> Option<(&[u8], usize)> {
-    let mut offset = 1; // 开头的$
-    let (next_data_len, sub_offset) = decode_integer(&payload[offset..])?;
-
-    // $-1 $0时返回
-    if next_data_len <= 0 {
-        return Some((
-            &payload[offset..offset + sub_offset - SEPARATOR_SIZE],
-            offset + sub_offset,
-        ));
+    // ,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n
+    // ,inf\r\n
+    // ,-inf\r\n
+    // ,nan\r\n
+    fn validate_double(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b',');
+        validate_simple_type(payload, |_, c| c.is_ascii())
     }
 
-    offset += sub_offset;
-    let next_data_len = next_data_len as usize;
+    // ([+|-]<number>\r\n
+    fn validate_big_number(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'(');
+        validate_simple_type(payload, |i, c| {
+            c.is_ascii_digit() || (i == 0 && (c == b'+' || c == b'-'))
+        })
+    }
 
-    if offset + next_data_len + SEPARATOR_SIZE > payload.len()
-        || payload[offset + next_data_len] != b'\r'
-        || payload[offset + next_data_len + 1] != b'\n'
-    {
-        if strict {
+    // !<length>\r\n<error>\r\n
+    fn decode_bulk_error<'a>(
+        mut output: Option<&mut Vec<u8>>,
+        payload: &'a [u8],
+    ) -> Result<&'a [u8]> {
+        assert_eq!(payload[0], b'!');
+        if let Some(ref mut output) = output {
+            output.push(payload[0]);
+        }
+        decode_bulk_type(output, payload)
+    }
+
+    // =<length>\r\n<encoding>:<data>\r\n
+    fn validate_verbatim_string(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'=');
+        validate_bulk_type(payload)
+    }
+
+    // %<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
+    fn validate_map(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'%');
+
+        let (mut payload, length) = read_length(&payload[1..])?;
+
+        // actually only -1 is valid
+        if length < 0 {
+            return Ok(payload);
+        }
+
+        for _ in 0..length {
+            match decode_resp_type(None, payload) {
+                Ok(p) => payload = p,
+                _ => return Err(Error::RedisLogParsePartial),
+            };
+            match decode_resp_type(None, payload) {
+                Ok(p) => payload = p,
+                _ => return Err(Error::RedisLogParsePartial),
+            };
+        }
+
+        Ok(payload)
+    }
+
+    // ~<number-of-elements>\r\n<element-1>...<element-n>
+    fn validate_set(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'~');
+        validate_array_type(payload)
+    }
+
+    // ><number-of-elements>\r\n<element-1>...<element-n>
+    fn validate_push(payload: &[u8]) -> Result<&[u8]> {
+        assert_eq!(payload[0], b'>');
+        validate_array_type(payload)
+    }
+
+    fn decode_resp_type<'a>(output: Option<&mut Vec<u8>>, payload: &'a [u8]) -> Result<&'a [u8]> {
+        if payload.is_empty() {
+            // happens when compound RESP types are truncated between valid segments
+            // for example: parsing b"*3\r\n+bbb\r\n" will call this function with empty payload
+            return Err(Error::RedisLogParsePartial);
+        }
+        // decode '+', '-' and '!' RESP types used in fill_response
+        // other types are only validated
+        match payload[0] {
+            b'+' => decode_simple_string(output, payload),
+            b'-' => decode_simple_error(output, payload),
+            b':' => validate_integer(payload),
+            b'$' => validate_bulk_string(payload),
+            b'*' => validate_array(payload),
+            b'_' => validate_null(payload),
+            b'#' => validate_boolean(payload),
+            b',' => validate_double(payload),
+            b'(' => validate_big_number(payload),
+            b'!' => decode_bulk_error(output, payload),
+            b'=' => validate_verbatim_string(payload),
+            b'%' => validate_map(payload),
+            b'~' => validate_set(payload),
+            b'>' => validate_push(payload),
+            _ => Err(Error::RedisLogParseFailed),
+        }
+    }
+
+    pub fn decode(payload: &[u8], strict: bool) -> Result<Vec<u8>> {
+        if payload.is_empty() {
+            return Err(Error::RedisLogParseFailed);
+        }
+        let mut output = match payload[0] {
+            b'+' | b'-' | b'!' => Vec::with_capacity(payload.len()),
+            _ => Vec::new(),
+        };
+        match (strict, decode_resp_type(Some(&mut output), payload)) {
+            (_, Err(Error::RedisLogParseFailed)) | (true, Err(Error::RedisLogParsePartial)) => {
+                Err(Error::RedisLogParseFailed)
+            }
+            _ => Ok(output),
+        }
+    }
+}
+
+struct Command {
+    cmd: String,
+    sub: Vec<String>,
+}
+
+thread_local! {
+    static ALL_COMMANDS: OnceCell<Vec<Command>> = OnceCell::new();
+    static MAX_COMMAND_LENGTH: OnceCell<usize> = OnceCell::new();
+}
+
+fn max_command_length() -> usize {
+    MAX_COMMAND_LENGTH.with(|cell| {
+        let len = cell.get_or_init(|| {
+            ALL_COMMANDS.with(|cell| {
+                let cmds = cell.get_or_init(all_commands);
+                cmds.iter().map(|cmd| cmd.cmd.len()).max().unwrap()
+            })
+        });
+        *len
+    })
+}
+
+fn all_commands() -> Vec<Command> {
+    let mut command_map: HashMap<&str, Vec<String>> = HashMap::new();
+    for line in ALL_COMMNADS_STR.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut keys = line.split_whitespace();
+        let key0 = keys.next().unwrap();
+        let key1 = keys.next().unwrap_or_default();
+        command_map.entry(key0).or_default().push(key1.to_owned());
+    }
+    let mut commands = command_map
+        .into_iter()
+        .map(|(cmd, mut sub)| {
+            // remove `sub` for commands without sub commands to save memory
+            // commands (for example, JSON.DEBUG) that can have zero or one more sub commands
+            // can also be removed because validate the second word is pointless
+            if sub.is_empty() || sub.iter().any(|s| s.is_empty()) {
+                Command {
+                    cmd: cmd.to_owned(),
+                    sub: vec![],
+                }
+            } else {
+                sub.sort_unstable();
+                Command {
+                    cmd: cmd.to_owned(),
+                    sub,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    commands.sort_unstable_by(|k1, k2| k1.cmd.cmp(&k2.cmd));
+    commands
+}
+
+// The list is from https://redis.io/docs/latest/commands/
+const ALL_COMMNADS_STR: &str = include_str!("redis-commands");
+
+struct CommandLine<'a> {
+    payload: &'a [u8],
+    cmd_upper: String,
+    length: usize,
+}
+
+impl<'a> CommandLine<'a> {
+    fn new(payload: &'a [u8]) -> Result<Self> {
+        if payload.len() < "*0\r\n".len() || payload[0] != b'*' {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        let (payload, length) = stringifier::read_length(&payload[1..])?;
+
+        // read command
+        let (mut payload_iter, command) = Self::decode_bulk_string(payload)?;
+        if command.len() > max_command_length() {
+            return Err(Error::RedisLogParseFailed);
+        }
+        let Ok(cmd_upper) = str::from_utf8(command).map(|s| s.to_ascii_uppercase()) else {
+            return Err(Error::RedisLogParseFailed);
+        };
+
+        let valid = if length > 1 {
+            Self::check_command(&cmd_upper, Some(payload_iter))
+        } else {
+            Self::check_command(&cmd_upper, None)
+        };
+        if !valid {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        // validate rest of the buffer
+        for _ in 1..length {
+            match Self::decode_bulk_string(payload_iter) {
+                Ok((p, _)) => payload_iter = p,
+                _ => return Err(Error::RedisLogParsePartial),
+            };
+        }
+
+        Ok(Self {
+            payload,
+            cmd_upper,
+            length: length as usize,
+        })
+    }
+
+    fn check_command(cmd_upper: &str, next_cmds: Option<&[u8]>) -> bool {
+        ALL_COMMANDS.with(|cell| {
+            let cmds = cell.get_or_init(all_commands);
+            match cmds.binary_search_by_key(&cmd_upper, |cmd| &cmd.cmd) {
+                Ok(id) if cmds[id].sub.is_empty() => true,
+                Ok(id) => {
+                    if let Some(next) = next_cmds {
+                        let Ok((_, next_cmd)) = Self::decode_bulk_string(next) else {
+                            return false;
+                        };
+                        let Ok(next_cmd) = str::from_utf8(next_cmd) else {
+                            return false;
+                        };
+                        let next_cmd_upper = next_cmd.to_ascii_uppercase();
+                        cmds[id].sub.binary_search(&next_cmd_upper).is_ok()
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
+        })
+    }
+
+    fn decode_bulk_string(payload: &[u8]) -> Result<(&[u8], &[u8])> {
+        if payload.len() < "$0\r\n".len() || payload[0] != b'$' {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        let (payload, length) = stringifier::read_length(&payload[1..])?;
+
+        // actually only -1 is valid
+        if length < 0 {
+            return Ok((payload, stringifier::NULL_STR.as_bytes()));
+        }
+
+        let end = length as usize;
+        if end + 2 > payload.len() || &payload[end..end + 2] != b"\r\n" {
+            return Err(Error::RedisLogParseFailed);
+        }
+
+        Ok((&payload[end + 2..], &payload[..end]))
+    }
+
+    fn iter(&self) -> CommandIterator<'a> {
+        CommandIterator {
+            payload: self.payload,
+            index: 0,
+            size: self.length,
+        }
+    }
+
+    fn command(&self) -> &[u8] {
+        // unwrap safe because checked in Self::new()
+        Self::decode_bulk_string(self.payload).unwrap().1
+    }
+
+    fn stringify(&self, obfuscate: bool) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.payload.len());
+
+        if !obfuscate || self.cmd_upper.is_empty() {
+            self.iter().stringify_in(&mut output);
+            return output;
+        }
+
+        let mut args = self.iter();
+        output.extend_from_slice(args.next().unwrap());
+        match self.cmd_upper.as_str() {
+            "AUTH" => {
+                // obfuscate everything
+                // - AUTH password
+                if args.next().is_some() {
+                    output.extend_from_slice(b" ?");
+                }
+            }
+            "HELLO" => {
+                // obfuscate everything after 'AUTH' if there is one
+                while let Some(arg) = args.next() {
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+                    if arg.eq_ignore_ascii_case(b"AUTH") {
+                        if args.next().is_some() {
+                            output.extend_from_slice(b" ?");
+                        }
+                        break;
+                    }
+                }
+            }
+            "APPEND" | "GETSET" | "LPUSHX" | "GEORADIUSBYMEMBER" | "RPUSHX" | "SET" | "SETNX"
+            | "SISMEMBER" | "ZRANK" | "ZREVRANK" | "ZSCORE" => {
+                // obfuscate 2nd argument
+                // - APPEND key value
+                // - GETSET key value
+                // - LPUSHX key value
+                // - GEORADIUSBYMEMBER key member radius m|km|ft|mi [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count] [ASC|DESC] [STORE key] [STOREDIST key]
+                // - RPUSHX key value
+                // - SET key value [expiration EX seconds|PX milliseconds] [NX|XX]
+                // - SETNX key value
+                // - SISMEMBER key member
+                // - ZRANK key member
+                // - ZREVRANK key member
+                // - ZSCORE key member
+                args.obfuscate_nth_in(&mut output, 1);
+            }
+            "HSETNX" | "LREM" | "LSET" | "SETBIT" | "SETEX" | "PSETEX" | "SETRANGE" | "ZINCRBY"
+            | "SMOVE" | "RESTORE" => {
+                // obfuscate 3rd argument
+                // - HSETNX key field value
+                // - LREM key count value
+                // - LSET key index value
+                // - SETBIT key offset value
+                // - SETEX key seconds value
+                // - PSETEX key milliseconds value
+                // - SETRANGE key offset value
+                // - ZINCRBY key increment member
+                // - SMOVE source destination member
+                // - RESTORE key ttl serialized-value [REPLACE]
+                args.obfuscate_nth_in(&mut output, 2);
+            }
+            "LINSERT" => {
+                // obfuscate 4th argument
+                // - LINSERT key BEFORE|AFTER pivot value
+                args.obfuscate_nth_in(&mut output, 3);
+            }
+            "GEOHASH" | "GEOPOS" | "GEODIST" | "LPUSH" | "RPUSH" | "SREM" | "ZREM" | "SADD" => {
+                // obfuscate everything after the first
+                // - GEOHASH key member [member ...]
+                // - GEOPOS key member [member ...]
+                // - GEODIST key member1 member2 [unit]
+                // - LPUSH key value [value ...]
+                // - RPUSH key value [value ...]
+                // - SREM key member [member ...]
+                // - ZREM key member [member ...]
+                // - SADD key member [member ...]
+                if let Some(arg) = args.next() {
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+                    if args.next().is_some() {
+                        output.extend_from_slice(b" ?");
+                    }
+                }
+            }
+            "GEOADD" => {
+                // obfuscate every 3rd argument after the first
+                // - GEOADD key longitude latitude member [longitude latitude member ...]
+                if let Some(arg) = args.next() {
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+                    args.obfuscate_every_nth_in(&mut output, 3);
+                }
+            }
+            "HSET" | "HMSET" => {
+                // obfuscate every 2nd argument after the first
+                // - HSET key field value [field value ...]
+                // - HMSET key field value [field value ...]
+                if let Some(arg) = args.next() {
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+                    args.obfuscate_every_nth_in(&mut output, 2);
+                }
+            }
+            "MSET" | "MSETNX" => {
+                // obfuscate every 2nd argument
+                // - MSET key value [key value ...]
+                // - MSETNX key value [key value ...]
+                args.obfuscate_every_nth_in(&mut output, 2);
+            }
+            "CONFIG" => {
+                // obfuscate every 2nd argument after 'SET'
+                // - CONFIG SET parameter value [parameter value ...]
+                while let Some(arg) = args.next() {
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+                    if arg.eq_ignore_ascii_case(b"SET") {
+                        args.obfuscate_every_nth_in(&mut output, 2);
+                        break;
+                    }
+                }
+            }
+            "BITFIELD" => {
+                // obfuscate 3rd argument to 'SET'
+                // - BITFIELD key [GET encoding offset | [OVERFLOW <WRAP | SAT | FAIL>]
+                //       <SET encoding offset value | INCRBY encoding offset increment>
+                //       [GET encoding offset | [OVERFLOW <WRAP | SAT | FAIL>]
+                //       <SET encoding offset value | INCRBY encoding offset increment>
+                //       ...]]
+                let mut index_after_set = None;
+                while let Some(arg) = args.next() {
+                    output.push(b' ');
+                    if let Some(i) = index_after_set.as_mut() {
+                        *i += 1;
+                        if *i == 3 {
+                            output.push(b'?');
+                            index_after_set = None;
+                        } else {
+                            output.extend_from_slice(arg);
+                        }
+                    } else {
+                        output.extend_from_slice(arg);
+                    }
+                    if arg.eq_ignore_ascii_case(b"SET") {
+                        index_after_set = Some(0);
+                    }
+                }
+            }
+            "ZADD" => {
+                // obfuscate every 2nd argument after optional arguments
+                // - ZADD key [NX | XX] [GT | LT] [CH] [INCR] score member [score member ...]
+                if let Some(arg) = args.next() {
+                    // key
+                    output.push(b' ');
+                    output.extend_from_slice(arg);
+
+                    // optional arguments
+                    while let Some(arg) = args.next() {
+                        output.push(b' ');
+                        output.extend_from_slice(arg);
+                        if arg.len() > 4 || !arg.is_ascii() {
+                            break;
+                        }
+                        // SAFTY: checked ascii string
+                        let arg_upper =
+                            unsafe { str::from_utf8_unchecked(arg).to_ascii_uppercase() };
+                        match arg_upper.as_str() {
+                            "NX" | "XX" | "GT" | "LT" | "CH" | "INCR" => continue,
+                            _ => break,
+                        }
+                    }
+                    // consume next and write '?'
+                    if args.next().is_some() {
+                        output.extend_from_slice(b" ?");
+                    }
+
+                    // rest
+                    args.obfuscate_every_nth_in(&mut output, 2);
+                }
+            }
+            _ => {
+                args.stringify_in(&mut output);
+            }
+        }
+
+        output
+    }
+}
+
+// redis command is defined as 'an array of bulk strings'
+struct CommandIterator<'a> {
+    payload: &'a [u8],
+    index: usize,
+    size: usize,
+}
+
+impl CommandIterator<'_> {
+    fn stringify_in(self, output: &mut Vec<u8>) {
+        for s in self {
+            if !output.is_empty() && s.len() > 0 {
+                output.push(b' ');
+            }
+            output.extend_from_slice(s);
+        }
+    }
+
+    fn obfuscate_nth_in(self, output: &mut Vec<u8>, n: usize) {
+        for (i, s) in self.enumerate() {
+            if !output.is_empty() && s.len() > 0 {
+                output.push(b' ');
+            }
+            if i == n {
+                output.push(b'?');
+            } else {
+                output.extend_from_slice(s);
+            }
+        }
+    }
+
+    fn obfuscate_every_nth_in(self, output: &mut Vec<u8>, n: usize) {
+        for (i, s) in self.enumerate() {
+            if !output.is_empty() && s.len() > 0 {
+                output.push(b' ');
+            }
+            if (i + 1) % n == 0 {
+                output.push(b'?');
+            } else {
+                output.extend_from_slice(s);
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for CommandIterator<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.size {
             return None;
         }
-        // 返回所有内容
-        return Some((&payload[offset..], payload.len()));
+
+        // unwrap safe because checked in CommandLine::new()
+        let (payload, s) = CommandLine::decode_bulk_string(self.payload).unwrap();
+        self.payload = payload;
+        self.index += 1;
+
+        Some(s)
     }
-
-    // 完全合法
-    Some((
-        &payload[offset..offset + next_data_len],
-        offset + next_data_len + 2,
-    ))
-}
-
-// 命令为"set mykey myvalue"，实际封装为"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n"
-fn decode_asterisk(payload: &[u8], strict: bool) -> Option<(Vec<u8>, usize)> {
-    let mut offset = 1; // 开头的 *
-
-    // 提取请求参数个数/批量回复个数
-    let (next_data_num, sub_offset) = decode_integer(&payload[offset..])?;
-
-    if next_data_num <= 0 {
-        // 无内容的多条批量回复: "*-1\r\n"
-        // 空白内容的多条批量回复: "*0\r\n"
-        return Some((
-            payload[offset..offset + sub_offset - SEPARATOR_SIZE].to_vec(),
-            offset + sub_offset,
-        ));
-    }
-    offset += sub_offset;
-
-    let mut ret_vec = Vec::new();
-    let len = payload.len();
-
-    for _ in 0..next_data_num {
-        if let Some((sub_vec, sub_offset, _)) = decode(&payload[offset..], strict) {
-            if sub_offset == 0 {
-                if strict {
-                    return None;
-                }
-                return Some((ret_vec, offset));
-            }
-
-            if !ret_vec.is_empty() {
-                ret_vec.push(b' ');
-            }
-            ret_vec.extend_from_slice(sub_vec.as_slice());
-
-            offset += sub_offset;
-            if offset >= len {
-                return Some((ret_vec, len));
-            }
-        }
-    }
-    Some((ret_vec, offset))
-}
-
-fn decode_ascii_str(payload: &[u8], limit: usize) -> Option<(&[u8], usize)> {
-    let len = payload.len();
-    let separator_pos = find_separator(payload).unwrap_or(len);
-
-    let (context, length) = if separator_pos > limit {
-        (
-            // 截取数据后，并不会在末尾增加'...'提示
-            &payload[..limit],
-            limit,
-        )
-    } else {
-        (&payload[..separator_pos], separator_pos)
-    };
-
-    // Do not parse strings with non ascii byte
-    if !context.is_ascii() {
-        return None;
-    }
-
-    Some((context, length))
-}
-
-// 函数在入参为"$-1"或"-1"时都返回"-1", 使用第三个参数区分是否为错误回复
-pub fn decode(payload: &[u8], strict: bool) -> Option<(Vec<u8>, usize, bool)> {
-    if payload.len() < SEPARATOR_SIZE {
-        return None;
-    }
-
-    match payload[0] {
-        // 请求或多条批量回复
-        b'*' => decode_asterisk(payload, strict).map(|(v, s)| (v, s, false)),
-        // 状态回复,整数回复
-        b'+' | b':' => decode_ascii_str(payload, 32).map(|(v, s)| (v.to_vec(), s, false)),
-        // 错误回复
-        b'-' => decode_ascii_str(payload, 256).map(|(v, s)| (v.to_vec(), s, true)),
-        // 批量回复
-        b'$' => decode_dollor(payload, strict).map(|(v, s)| (v.to_vec(), s, false)),
-        _ => None,
-    }
-}
-
-pub fn decode_error_code(context: &[u8]) -> Option<&[u8]> {
-    for (i, ch) in context.iter().enumerate() {
-        if *ch == b' ' || *ch == b'\n' {
-            return Some(&context[..i]);
-        }
-    }
-    None
 }
 
 // test log parse
@@ -495,9 +1080,21 @@ mod tests {
                 None => continue,
             };
 
-            let param = &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true);
+            let param = &mut ParseParam::new(
+                packet as &MetaPacket,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
+            param.set_captured_byte(payload.len());
 
-            let is_redis = redis.check_payload(payload, param);
+            let is_redis = match packet.lookup_key.direction {
+                PacketDirection::ClientToServer => redis.check_payload(payload, param),
+                PacketDirection::ServerToClient => stringifier::decode(payload, false).is_ok(),
+            };
 
             let info = if let Ok(i) = redis.parse_payload(payload, param) {
                 match i.unwrap_single() {
@@ -508,7 +1105,7 @@ mod tests {
                 RedisInfo::default()
             };
 
-            output.push_str(&format!("{} is_redis: {}\r\n", info, is_redis));
+            output.push_str(&format!("{} is_redis: {}\n", info, is_redis));
         }
         output
     }
@@ -540,47 +1137,88 @@ mod tests {
 
     #[test]
     fn test_decode() {
-        let payload = [b'*', b'-', b'1', b'\r', b'\n'];
-        let (context, n, e) = decode(payload.as_slice(), true).unwrap();
-        assert_eq!(context, "-1".as_bytes());
-        assert_eq!(n, payload.len());
-        assert_eq!(e, false);
-
-        let payload = [
-            b'*', b'3', b'\r', b'\n', b'$', b'3', b'\r', b'\n', b'S', b'E', b'T', b'\r', b'\n',
-            b'$', b'5', b'\r', b'\n', b'm', b'y', b'k', b'e', b'y', b'\r', b'\n', b'$', b'7',
-            b'\r', b'\n', b'm', b'y', b'v', b'a', b'l', b'u', b'e', b'\r', b'\n',
+        let testcases = vec![
+            (("*-1\r\n", true), Some("")),
+            (
+                ("*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n", true),
+                Some(""),
+            ),
+            (("$0\r\n\r\n", true), Some("")),
+            (("$-1\r\n", true), Some("")),
+            (("$9\r\n12345", false), Some("")),
+            (("$9\r\n12345", true), None),
+            (("-1\r\n", true), Some("-1")),
+            // _\r\n
+            (("_\r\n", true), Some("")),
+            (("_\r", true), None),
+            // #<t|f>\r\n
+            (("#t\r\n", true), Some("")),
+            (("#t\r", true), None),
+            // ,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n
+            // ,inf\r\n
+            // ,-inf\r\n
+            // ,nan\r\n
+            ((",1.12\r\n", true), Some("")),
+            // ([+|-]<number>\r\n
+            (("(1112111211121112\r\n", true), Some("")),
+            // !<length>\r\n<error>\r\n
+            (("!9\r\nabcdefghi\r\n", true), Some("!abcdefghi")),
+            // =<length>\r\n<encoding>:<data>\r\n
+            (("=9\r\ntxt:abcde\r\n", true), Some("")),
+            // %<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
+            (("%1\r\n+key\r\n:123\r\n", true), Some("")),
+            // ~<number-of-elements>\r\n<element-1>...<element-n>
+            // ><number-of-elements>\r\n<element-1>...<element-n>
+            (("~2\r\n+key\r\n:123\r\n", true), Some("")),
         ];
+        for (input, expected) in testcases.iter() {
+            let output = stringifier::decode(&input.0.as_bytes(), input.1);
+            assert_eq!(
+                output.ok().as_ref().and_then(|vs| str::from_utf8(vs).ok()),
+                *expected,
+                "testcase input '{}' failed",
+                str::from_utf8(input.0.as_bytes()).unwrap().escape_default()
+            );
+        }
+    }
 
-        let (context, n, e) = decode(payload.as_slice(), true).unwrap();
-        assert_eq!(context, "SET mykey myvalue".as_bytes());
-        assert_eq!(n, payload.len());
-        assert_eq!(e, false);
+    #[test]
+    fn truncated_compound_type() {
+        assert!(stringifier::decode(b"%1\r\n+key\r\n", false).is_ok());
+        assert!(stringifier::decode(b"%1\r\n+key\r\n", true).is_err());
+        let s = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+        for i in 0..(s.len() - 1) {
+            assert!(stringifier::decode(&s.as_bytes()[..i], true).is_err());
+        }
+    }
 
-        let payload = [b'$', b'0', b'\r', b'\n'];
-        let (context, n, _) = decode(payload.as_slice(), true).unwrap();
-        assert_eq!(context, "0".as_bytes());
-        assert_eq!(n, payload.len());
+    #[test]
+    fn check_command() {
+        // single word command
+        assert!(CommandLine::check_command("SET", None));
+        assert!(CommandLine::check_command("SET", Some(b"$3\r\nkey\r\n")));
 
-        let payload = [b'$', b'-', b'1', b'\r', b'\n'];
-        let (context, n, e) = decode(payload.as_slice(), false).unwrap();
-        assert_eq!(context, "-1".as_bytes());
-        assert_eq!(n, payload.len());
-        assert_eq!(e, false);
+        // multi word command
+        assert!(CommandLine::check_command("ACL", Some(b"$4\r\nLIST\r\n")));
+        assert!(CommandLine::check_command(
+            "ACL",
+            Some(b"$7\r\nGENPASS\r\n")
+        ));
+        assert!(!CommandLine::check_command(
+            "ACL",
+            Some(b"$7\r\nINVALID\r\n")
+        ));
 
-        let payload = [b'$', b'9', b'\r', b'\n', b'1', b'2', b'3', b'4', b'5'];
-        let (context, n, _) = decode(payload.as_slice(), false).unwrap();
-        assert_eq!(context, "12345".as_bytes());
-        assert_eq!(n, payload.len());
-
-        let payload = [b'$', b'9', b'\r', b'\n', b'1', b'2', b'3', b'4', b'5'];
-        assert_eq!(decode(payload.as_slice(), true), None);
-
-        let payload = [b'-', b'1', b'\r', b'\n'];
-        let (context, n, e) = decode(payload.as_slice(), true).unwrap();
-        assert_eq!(context, "-1".as_bytes());
-        assert_eq!(n, 2);
-        assert_eq!(e, true);
+        // single or multi
+        assert!(CommandLine::check_command("JSON.DEBUG", None));
+        assert!(CommandLine::check_command(
+            "JSON.DEBUG",
+            Some(b"$6\r\nMEMORY\r\n")
+        ));
+        assert!(CommandLine::check_command(
+            "JSON.DEBUG",
+            Some(b"$14\r\nSOMETHING_ELSE\r\n")
+        ));
     }
 
     #[test]
@@ -655,10 +1293,122 @@ mod tests {
             if packet.get_l4_payload().is_some() {
                 let _ = redis.parse_payload(
                     packet.get_l4_payload().unwrap(),
-                    &ParseParam::new(&*packet, rrt_cache.clone(), true, true),
+                    &ParseParam::new(
+                        &*packet,
+                        rrt_cache.clone(),
+                        Default::default(),
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        Default::default(),
+                        true,
+                        true,
+                    ),
                 );
             }
         }
         redis.perf_stats.unwrap()
+    }
+
+    fn encode_redis_command(command: &str) -> Vec<u8> {
+        let n = command.split(" ").count();
+        let mut output = Vec::from(format!("*{}\r\n", n));
+
+        for arg in command.split(" ") {
+            output.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+
+        output
+    }
+
+    #[test]
+    fn check_obfuscation() {
+        let testcases = [
+                ("GET key ", "GET key"),
+                ("AUTH", "AUTH"),
+                ("AUTH my-secret-password", "AUTH ?"),
+                ("AUTH james my-secret-password", "AUTH ?"),
+                ("HELLO 3 AUTH username passwd SETNAME cliname", "HELLO 3 AUTH ?"),
+                ("APPEND key value", "APPEND key ?"),
+                ("GETSET key value", "GETSET key ?"),
+                ("LPUSHX key value", "LPUSHX key ?"),
+                ("GEORADIUSBYMEMBER Sicily Agrigento 100 km", "GEORADIUSBYMEMBER Sicily ? 100 km"),
+                ("RPUSHX key value", "RPUSHX key ?"),
+                ("SET key value", "SET key ?"),
+                ("SET anotherkey value EX 60", "SET anotherkey ? EX 60"),
+                ("SETNX key value", "SETNX key ?"),
+                ("SISMEMBER key member", "SISMEMBER key ?"),
+                ("ZRANK key member", "ZRANK key ?"),
+                ("ZREVRANK key member", "ZREVRANK key ?"),
+                ("ZSCORE key member", "ZSCORE key ?"),
+                ("BITFIELD key GET type offset SET type offset value INCRBY type", "BITFIELD key GET type offset SET type offset ? INCRBY type"),
+                ("BITFIELD key SET type offset value INCRBY type", "BITFIELD key SET type offset ? INCRBY type"),
+                ("BITFIELD key GET type offset INCRBY type", "BITFIELD key GET type offset INCRBY type"),
+                ("BITFIELD key SET type offset", "BITFIELD key SET type offset"),
+                ("CONFIG SET parameter value", "CONFIG SET parameter ?"),
+                ("CONFIG GET foo bar baz", "CONFIG GET foo bar baz"),
+                ("GEOADD key longitude latitude member longitude latitude member longitude latitude member", "GEOADD key longitude latitude ? longitude latitude ? longitude latitude ?"),
+                ("GEOADD key longitude latitude member longitude latitude member", "GEOADD key longitude latitude ? longitude latitude ?"),
+                ("GEOADD key longitude latitude member", "GEOADD key longitude latitude ?"),
+                ("GEOADD key longitude latitude", "GEOADD key longitude latitude"),
+                ("GEOADD key", "GEOADD key"),
+                ("GEOHASH key", "GEOHASH key"),
+                ("GEOPOS key", "GEOPOS key"),
+                ("GEODIST key", "GEODIST key"),
+                ("GEOHASH key member", "GEOHASH key ?"),
+                ("GEOPOS key member", "GEOPOS key ?"),
+                ("GEODIST key member", "GEODIST key ?"),
+                ("GEOHASH key member member member", "GEOHASH key ?"),
+                ("GEOPOS key member member", "GEOPOS key ?"),
+                ("GEODIST key member member member", "GEODIST key ?"),
+                ("SREM key member1 member2 member3", "SREM key ?"),
+                ("ZREM key member1 member2 member3", "ZREM key ?"),
+                ("SADD key member1 member2 member3", "SADD key ?"),
+                ("GEODIST key member1 member2 m", "GEODIST key ?"),
+                ("LPUSH key value1 value2 value3", "LPUSH key ?"),
+                ("RPUSH key value1 value2 value3", "RPUSH key ?"),
+                ("HSET key field value", "HSET key field ?"),
+                ("HSETNX key field value", "HSETNX key field ?"),
+                ("HSET key field value field1 value1 field2 value2", "HSET key field ? field1 ? field2 ?"),
+                ("HSETNX key field value", "HSETNX key field ?"),
+                ("LREM key count value", "LREM key count ?"),
+                ("LSET key index value", "LSET key index ?"),
+                ("SETBIT key offset value", "SETBIT key offset ?"),
+                ("SETRANGE key offset value", "SETRANGE key offset ?"),
+                ("SETEX key seconds value", "SETEX key seconds ?"),
+                ("PSETEX key milliseconds value", "PSETEX key milliseconds ?"),
+                ("ZINCRBY key increment member", "ZINCRBY key increment ?"),
+                ("SMOVE source destination member", "SMOVE source destination ?"),
+                ("RESTORE key ttl serialized-value [REPLACE]", "RESTORE key ttl ? [REPLACE]"),
+                ("LINSERT key BEFORE pivot value", "LINSERT key BEFORE pivot ?"),
+                ("LINSERT key AFTER pivot value", "LINSERT key AFTER pivot ?"),
+                ("HMSET key field value field value", "HMSET key field ? field ?"),
+                ("HMSET key field value", "HMSET key field ?"),
+                ("HMSET key field", "HMSET key field"),
+                ("MSET key value key value", "MSET key ? key ?"),
+                ("MSET", "MSET"),
+                ("MSET key value", "MSET key ?"),
+                ("MSETNX key value key value", "MSETNX key ? key ?"),
+                ("ZADD key score member score member", "ZADD key score ? score ?"),
+                ("ZADD key NX score member score member", "ZADD key NX score ? score ?"),
+                ("ZADD key NX CH score member score member", "ZADD key NX CH score ? score ?"),
+                ("ZADD key NX CH INCR score member score member", "ZADD key NX CH INCR score ? score ?"),
+                ("ZADD key XX INCR score member score member", "ZADD key XX INCR score ? score ?"),
+                ("ZADD key XX INCR score member", "ZADD key XX INCR score ?"),
+                ("ZADD key XX INCR score", "ZADD key XX INCR score"),
+                ("SET *😊®© ❤️", "SET *😊®© ?"),
+                ("ZADD key 😊 member score 😊", "ZADD key 😊 ? score ?"),
+            ];
+        for (input, expected) in testcases.iter() {
+            let redis_str = encode_redis_command(input);
+            let Ok(cmdline) = CommandLine::new(&redis_str) else {
+                panic!("parse cmdline failed at: {input}");
+            };
+            let output = cmdline.stringify(true);
+            assert_eq!(
+                str::from_utf8(output.as_slice()).unwrap(),
+                *expected,
+                "testcase {} failed",
+                input
+            );
+        }
     }
 }

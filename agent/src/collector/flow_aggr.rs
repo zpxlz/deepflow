@@ -33,7 +33,7 @@ use super::consts::*;
 use crate::collector::types::U16Set;
 use crate::common::Timestamp;
 use crate::common::{
-    enums::TapType,
+    enums::CaptureNetworkType,
     flow::CloseType,
     tagged_flow::{BoxedTaggedFlow, TaggedFlow},
 };
@@ -64,6 +64,7 @@ pub struct FlowAggrThread {
     input: Arc<Receiver<Arc<BatchedBox<TaggedFlow>>>>,
     output: DebugSender<BoxedTaggedFlow>,
     config: CollectorAccess,
+    delay: Duration,
 
     thread_handle: Option<JoinHandle<()>>,
 
@@ -79,6 +80,7 @@ impl FlowAggrThread {
         input: Receiver<Arc<BatchedBox<TaggedFlow>>>,
         output: DebugSender<BoxedTaggedFlow>,
         config: CollectorAccess,
+        delay: Duration,
         ntp_diff: Arc<AtomicI64>,
     ) -> (Self, Arc<FlowAggrCounter>) {
         let running = Arc::new(AtomicBool::new(false));
@@ -90,6 +92,7 @@ impl FlowAggrThread {
                 output: output.clone(),
                 thread_handle: None,
                 config,
+                delay,
                 running,
                 ntp_diff,
                 metrics: metrics.clone(),
@@ -109,6 +112,7 @@ impl FlowAggrThread {
             self.output.clone(),
             self.running.clone(),
             self.config.clone(),
+            self.delay,
             self.ntp_diff.clone(),
             self.metrics.clone(),
         );
@@ -169,10 +173,11 @@ impl FlowAggr {
         output: DebugSender<BoxedTaggedFlow>,
         running: Arc<AtomicBool>,
         config: CollectorAccess,
+        delay: Duration,
         ntp_diff: Arc<AtomicI64>,
         metrics: Arc<FlowAggrCounter>,
     ) -> Self {
-        let slot_count = TIMESTAMP_SLOT_COUNT + config.load().packet_delay.as_secs() as usize + 1;
+        let slot_count = TIMESTAMP_SLOT_COUNT + delay.as_secs() as usize;
         let mut flow_stashs = VecDeque::with_capacity(slot_count);
         for _ in 0..slot_count {
             flow_stashs.push_back(HashMap::with_capacity(Self::MIN_STASH_CAPACITY_SECOND));
@@ -335,12 +340,16 @@ impl FlowAggr {
                 Ok(_) => {
                     let config = self.config.load();
                     for tagged_flow in batch.drain(..) {
-                        if config.l4_log_ignore_tap_sides[tagged_flow.flow.tap_side as usize] {
+                        if config.l4_log_ignore_tap_sides[tagged_flow.flow.tap_side as usize]
+                            && !tagged_flow.flow.need_to_store
+                        {
                             continue;
                         }
-                        if config.l4_log_store_tap_types[u16::from(TapType::Any) as usize]
+                        if config.l4_log_store_tap_types
+                            [u16::from(CaptureNetworkType::Any) as usize]
                             || config.l4_log_store_tap_types
                                 [u16::from(tagged_flow.flow.flow_key.tap_type) as usize]
+                            || tagged_flow.flow.need_to_store
                         {
                             self.minute_merge(tagged_flow);
                         }
@@ -446,8 +455,11 @@ impl ThrottlingQueue {
             != self.last_flush_cache_with_throttling_time.as_secs() >> Self::THROTTLE_BUCKET_BITS
         {
             self.update_throttle();
-            if let Err(_) = self.output.send_all(&mut self.cache_with_throttling) {
-                debug!("l4 flow throttle push aggred flow to sender queue failed, maybe queue have terminated");
+            if let Err(e) = self.output.send_all(&mut self.cache_with_throttling) {
+                debug!(
+                    "l4 flow throttle push aggred flow to sender queue failed, because {:?}",
+                    e
+                );
                 self.cache_with_throttling.clear();
             }
 
@@ -476,9 +488,10 @@ impl ThrottlingQueue {
                 != self.last_flush_cache_without_throttling_time.as_secs()
                     >> Self::THROTTLE_BUCKET_BITS
         {
-            if let Err(_) = self.output.send_all(&mut self.cache_without_throttling) {
+            if let Err(e) = self.output.send_all(&mut self.cache_without_throttling) {
                 debug!(
-                    "l4 flow push aggred flow to sender queue failed, maybe queue have terminated"
+                    "l4 flow push aggred flow to sender queue failed, because {:?}",
+                    e
                 );
                 self.cache_without_throttling.clear();
             }

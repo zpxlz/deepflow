@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type VMPodNodeConnection struct {
-	OperatorBase[mysql.VMPodNodeConnection]
+	OperatorBase[*metadbmodel.VMPodNodeConnection, metadbmodel.VMPodNodeConnection]
 }
 
 func NewVMPodNodeConnection() *VMPodNodeConnection {
 	return &VMPodNodeConnection{
-		OperatorBase[mysql.VMPodNodeConnection]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.VMPodNodeConnection](
+			ctrlrcommon.RESOURCE_TYPE_VM_POD_NODE_CONNECTION_EN,
+			false,
+			false,
+		),
 	}
 }

@@ -15,10 +15,13 @@
  */
 
 use std::{
-    fs,
+    fs::{self, File},
     io::{Error, ErrorKind, Result},
+    os::unix::io::AsRawFd,
     path::Path,
 };
+
+use nix::sched::{setns, CloneFlags};
 
 use super::exec_command;
 
@@ -166,4 +169,45 @@ pub fn get_all_vm_xml<P: AsRef<Path>>(xml_path: P) -> Result<String> {
 
     result = format!("<domains>\n{}</domains>\n", result);
     Ok(result)
+}
+
+const ROOT_UTS_PATH: &'static str = "/proc/1/ns/uts";
+const ORIGIN_UTS_PATH: &'static str = "/proc/self/ns/uts";
+
+fn set_utsns(fp: &File) -> Result<()> {
+    setns(fp.as_raw_fd(), CloneFlags::CLONE_NEWUTS).map_err(|e| Error::new(ErrorKind::Other, e))
+}
+
+pub fn get_hostname() -> Result<String> {
+    fn hostname() -> Result<String> {
+        hostname::get()?
+            .into_string()
+            .map_err(|_| Error::new(ErrorKind::Other, "get hostname failed"))
+    }
+
+    let origin_path = Path::new(ORIGIN_UTS_PATH);
+    let root_path = Path::new(ROOT_UTS_PATH);
+    match (fs::read_link(origin_path), fs::read_link(root_path)) {
+        (Ok(origin_link), Ok(root_link)) if origin_link == root_link => {
+            return hostname();
+        }
+        _ => (),
+    }
+
+    // If the ORIGIN_UTS_PATH or ROOT_UTS_PATH does not exist, it may be due to a kernel version that is too low
+    // to support UTS namespaces, therefore, do not switch UTS namespaces and directly return the hostname.
+    let Ok(origin_fp) = File::open(origin_path) else {
+        return hostname();
+    };
+    let Ok(root_fp) = File::open(root_path) else {
+        return hostname();
+    };
+    if let Err(e) = set_utsns(&root_fp) {
+        return Err(Error::new(ErrorKind::Other, e));
+    }
+    let name = hostname();
+    if let Err(e) = set_utsns(&origin_fp) {
+        return Err(Error::new(ErrorKind::Other, e));
+    }
+    name
 }

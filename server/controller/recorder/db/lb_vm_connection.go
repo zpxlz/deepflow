@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type LBVMConnection struct {
-	OperatorBase[mysql.LBVMConnection]
+	OperatorBase[*metadbmodel.LBVMConnection, metadbmodel.LBVMConnection]
 }
 
 func NewLBVMConnection() *LBVMConnection {
 	return &LBVMConnection{
-		OperatorBase[mysql.LBVMConnection]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.LBVMConnection](
+			ctrlrcommon.RESOURCE_TYPE_LB_VM_CONNECTION_EN,
+			false,
+			false,
+		),
 	}
 }

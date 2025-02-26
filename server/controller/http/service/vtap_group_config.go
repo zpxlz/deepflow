@@ -25,13 +25,30 @@ import (
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v2"
 
+	"github.com/deepflowio/deepflow/server/agent_config"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/refresh"
 )
 
-func convertStrToIntList(convertStr string) ([]int, error) {
+type VtapGroupConfig struct {
+	cfg *config.ControllerConfig
+
+	resourceAccess *ResourceAccess
+}
+
+func NewVTapGroupConfig(userInfo *httpcommon.UserInfo, cfg *config.ControllerConfig) *VtapGroupConfig {
+	return &VtapGroupConfig{
+		cfg:            cfg,
+		resourceAccess: &ResourceAccess{Fpermit: cfg.FPermit, UserInfo: userInfo},
+	}
+}
+
+func ConvertStrToIntList(convertStr string) ([]int, error) {
 	if len(convertStr) == 0 {
 		return []int{}, nil
 	}
@@ -44,6 +61,26 @@ func convertStrToIntList(convertStr string) ([]int, error) {
 		} else {
 			result[index] = target
 		}
+	}
+
+	return result, nil
+}
+
+func ConvertStrToIntListWithIgnore(convertStr string, ignoreFields []int) ([]int, error) {
+	if len(convertStr) == 0 {
+		return []int{}, nil
+	}
+	splitStr := strings.Split(convertStr, ",")
+	var result []int
+	for _, src := range splitStr {
+		target, err := strconv.Atoi(src)
+		if err != nil {
+			return []int{}, err
+		}
+		if common.Contains[int](ignoreFields, target) {
+			continue
+		}
+		result = append(result, target)
 	}
 
 	return result, nil
@@ -71,7 +108,13 @@ func copyStruct(from, to interface{}, ignoreName []string) {
 	toElem := toValue.Elem()
 	for i := 0; i < toElem.NumField(); i++ {
 		toField := toElem.Type().Field(i)
-		if common.Contains(ignoreName, toField.Name) == true {
+		if common.Contains(ignoreName, toField.Name) {
+			// set value to avoid return nil
+			if toField.Type.Kind() == reflect.Slice {
+				sliceType := reflect.SliceOf(toField.Type.Elem())
+				emptySlice := reflect.MakeSlice(sliceType, 0, 0)
+				toElem.Field(i).Set(emptySlice)
+			}
 			continue
 		}
 		fromFieldName, ok := fromElem.Type().FieldByName(toField.Name)
@@ -88,22 +131,22 @@ var DecapTypeData = map[int]string{
 	3: "GRE",
 }
 
-func getTypeInfo(tapTypeValue int, idToTapTypeName map[int]string) *model.TypeInfo {
-	var typeInfo *model.TypeInfo
+func getTypeInfo(tapTypeValue int, idToTapTypeName map[int]string) *agent_config.TypeInfo {
+	var typeInfo *agent_config.TypeInfo
 	switch tapTypeValue {
 	case 0:
-		typeInfo = &model.TypeInfo{
+		typeInfo = &agent_config.TypeInfo{
 			ID:   tapTypeValue,
 			Name: "全部",
 		}
 	case -1:
-		typeInfo = &model.TypeInfo{
+		typeInfo = &agent_config.TypeInfo{
 			ID:   tapTypeValue,
 			Name: "无",
 		}
 	default:
 		name := idToTapTypeName[tapTypeValue]
-		typeInfo = &model.TypeInfo{
+		typeInfo = &agent_config.TypeInfo{
 			ID:   tapTypeValue,
 			Name: name,
 		}
@@ -127,14 +170,17 @@ var tapSideIDToName = map[int]string{
 	34: "网关到服务端",    // ServerGateway
 	41: "客户端进程",     // ClientProcess
 	42: "服务端进程",     // ServerProcess
-	48: "应用",        // App
-	49: "客户端应用",     // ClientApp
-	50: "服务端应用",     // ServerApp
+	// 48: "应用",        // App
+	// 49: "客户端应用",     // ClientApp
+	// 50: "服务端应用",     // ServerApp
 }
 
+var DeprecatedTapSideID = []int{48, 49, 50}
+
 func convertDBToJson(
-	sData *mysql.VTapGroupConfiguration,
-	tData *model.VTapGroupConfigurationResponse,
+	orgDB *metadb.DB,
+	sData *agent_config.AgentGroupConfigModel,
+	tData *agent_config.AgentGroupConfigResponse,
 	idToTapTypeName map[int]string,
 	lcuuidToDomain map[string]string) {
 
@@ -142,65 +188,66 @@ func convertDBToJson(
 		"L7LogIgnoreTapSides", "L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps",
 		"MaxNpbBps", "MaxTxBandwidth", "WasmPlugins", "SoPlugins"}
 	copyStruct(sData, tData, ignoreName)
-	tData.L4LogTapTypes = []*model.TypeInfo{}
-	tData.L7LogStoreTapTypes = []*model.TypeInfo{}
-	tData.DecapType = []*model.TypeInfo{}
-	tData.Domains = []*model.DomainInfo{}
 	if sData.L4LogTapTypes != nil {
-		cL4LogTapTypes, err := convertStrToIntList(*sData.L4LogTapTypes)
+		cL4LogTapTypes, err := ConvertStrToIntList(*sData.L4LogTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL4LogTapTypes {
 				tData.L4LogTapTypes = append(tData.L4LogTapTypes,
 					getTypeInfo(tapTypeValue, idToTapTypeName))
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.L4LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L4LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L4LogIgnoreTapSides, DeprecatedTapSideID)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		} else {
 			for _, tapSideValue := range tapSides {
-				tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides,
-					&model.TapSideInfo{
-						ID:   tapSideValue,
-						Name: tapSideIDToName[tapSideValue],
-					})
+				if name, ok := tapSideIDToName[tapSideValue]; ok {
+					tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides,
+						&agent_config.TapSideInfo{
+							ID:   tapSideValue,
+							Name: name,
+						})
+				}
 			}
 		}
 	}
 	if sData.L7LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L7LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L7LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSideValue := range tapSides {
-				tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides,
-					&model.TapSideInfo{
-						ID:   tapSideValue,
-						Name: tapSideIDToName[tapSideValue],
-					})
+				if name, ok := tapSideIDToName[tapSideValue]; ok {
+					tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides,
+						&agent_config.TapSideInfo{
+							ID:   tapSideValue,
+							Name: name,
+						})
+				}
+
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.L7LogStoreTapTypes != nil {
-		cL7LogStoreTapTypes, err := convertStrToIntList(*sData.L7LogStoreTapTypes)
+		cL7LogStoreTapTypes, err := ConvertStrToIntList(*sData.L7LogStoreTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL7LogStoreTapTypes {
 				tData.L7LogStoreTapTypes = append(tData.L7LogStoreTapTypes,
 					getTypeInfo(tapTypeValue, idToTapTypeName))
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.DecapType != nil {
-		cDecapType, err := convertStrToIntList(*sData.DecapType)
+		cDecapType, err := ConvertStrToIntList(*sData.DecapType)
 		if err == nil {
 			for _, decapType := range cDecapType {
-				typeInfo := &model.TypeInfo{
+				typeInfo := &agent_config.TypeInfo{
 					ID:   decapType,
 					Name: DecapTypeData[decapType],
 				}
@@ -208,21 +255,21 @@ func convertDBToJson(
 				tData.DecapType = append(tData.DecapType, typeInfo)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.Domains != nil {
 		cDomains := strings.Split(*sData.Domains, ",")
 		for _, domain := range cDomains {
-			var domainInfo *model.DomainInfo
+			var domainInfo *agent_config.DomainInfo
 			if domain == "0" {
-				domainInfo = &model.DomainInfo{
+				domainInfo = &agent_config.DomainInfo{
 					ID:   domain,
 					Name: "全部",
 				}
 			}
 			if domainInfo == nil && domain != "" {
-				domainInfo = &model.DomainInfo{
+				domainInfo = &agent_config.DomainInfo{
 					ID:   domain,
 					Name: lcuuidToDomain[domain],
 				}
@@ -259,70 +306,70 @@ func convertDBToJson(
 	}
 }
 
-func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroupConfiguration) {
+func convertDBToYaml(orgDB *metadb.DB, sData *agent_config.AgentGroupConfigModel, tData *agent_config.AgentGroupConfig) {
 	ignoreName := []string{"ID", "VTapGroupLcuuid", "VTapGroupID", "Lcuuid", "YamlConfig",
 		"L4LogTapTypes", "L4LogIgnoreTapSides", "L7LogIgnoreTapSides",
 		"L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps", "MaxNpbBps", "MaxTxBandwidth",
-		"PrometheusHttpAPIAddresses", "WasmPlugins", "SoPlugins",
+		"WasmPlugins", "SoPlugins",
 	}
 	copyStruct(sData, tData, ignoreName)
 	if sData.YamlConfig != nil {
-		yamlConfig := &model.StaticConfig{}
+		yamlConfig := &agent_config.StaticConfig{}
 		if err := yaml.Unmarshal([]byte(*sData.YamlConfig), yamlConfig); err == nil {
 			tData.YamlConfig = yamlConfig
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 
 	if sData.L4LogTapTypes != nil {
-		cL4LogTapTypes, err := convertStrToIntList(*sData.L4LogTapTypes)
+		cL4LogTapTypes, err := ConvertStrToIntList(*sData.L4LogTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL4LogTapTypes {
 				tData.L4LogTapTypes = append(tData.L4LogTapTypes, tapTypeValue)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.L4LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L4LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L4LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSide := range tapSides {
 				tData.L4LogIgnoreTapSides = append(tData.L4LogIgnoreTapSides, tapSide)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.L7LogIgnoreTapSides != nil {
-		tapSides, err := convertStrToIntList(*sData.L7LogIgnoreTapSides)
+		tapSides, err := ConvertStrToIntListWithIgnore(*sData.L7LogIgnoreTapSides, DeprecatedTapSideID)
 		if err == nil {
 			for _, tapSide := range tapSides {
 				tData.L7LogIgnoreTapSides = append(tData.L7LogIgnoreTapSides, tapSide)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.L7LogStoreTapTypes != nil {
-		cL7LogStoreTapTypes, err := convertStrToIntList(*sData.L7LogStoreTapTypes)
+		cL7LogStoreTapTypes, err := ConvertStrToIntList(*sData.L7LogStoreTapTypes)
 		if err == nil {
 			for _, tapTypeValue := range cL7LogStoreTapTypes {
 				tData.L7LogStoreTapTypes = append(tData.L7LogStoreTapTypes, tapTypeValue)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.DecapType != nil {
-		cDecapType, err := convertStrToIntList(*sData.DecapType)
+		cDecapType, err := ConvertStrToIntList(*sData.DecapType)
 		if err == nil {
 			for _, decapType := range cDecapType {
 				tData.DecapType = append(tData.DecapType, decapType)
 			}
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	}
 	if sData.Domains != nil {
@@ -332,9 +379,6 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 				tData.Domains = append(tData.Domains, domain)
 			}
 		}
-	}
-	if sData.PrometheusHttpAPIAddresses != nil {
-		tData.PrometheusHttpAPIAddresses = strings.Split(*sData.PrometheusHttpAPIAddresses, ",")
 	}
 	if sData.MaxCollectPps != nil {
 		cMaxCollectPps := *sData.MaxCollectPps / 1000
@@ -367,18 +411,18 @@ func convertDBToYaml(sData *mysql.VTapGroupConfiguration, tData *model.VTapGroup
 	}
 }
 
-func convertJsonToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConfiguration) {
+func convertJsonToDb(sData *agent_config.AgentGroupConfig, tData *agent_config.AgentGroupConfigModel) {
 	convertToDb(sData, tData)
 }
 
-func convertYamlToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConfiguration) {
+func convertYamlToDb(orgDB *metadb.DB, sData *agent_config.AgentGroupConfig, tData *agent_config.AgentGroupConfigModel) {
 	if sData.YamlConfig != nil {
 		b, err := yaml.Marshal(sData.YamlConfig)
 		if err == nil {
 			dbYamlConfig := string(b)
 			tData.YamlConfig = &dbYamlConfig
 		} else {
-			log.Error(err)
+			log.Error(err, orgDB.LogPrefixORGID)
 		}
 	} else {
 		tData.YamlConfig = nil
@@ -387,11 +431,11 @@ func convertYamlToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroup
 	convertToDb(sData, tData)
 }
 
-func convertToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConfiguration) {
+func convertToDb(sData *agent_config.AgentGroupConfig, tData *agent_config.AgentGroupConfigModel) {
 	ignoreName := []string{"ID", "YamlConfig", "Lcuuid", "VTapGroupLcuuid", "VTapGroupID",
 		"L4LogTapTypes", "L4LogIgnoreTapSides", "L7LogIgnoreTapSides",
 		"L7LogStoreTapTypes", "DecapType", "Domains", "MaxCollectPps", "MaxNpbBps", "MaxTxBandwidth",
-		"PrometheusHttpAPIAddresses", "WasmPlugins", "SoPlugins",
+		"WasmPlugins", "SoPlugins",
 	}
 	copyStruct(sData, tData, ignoreName)
 	if len(sData.L4LogTapTypes) > 0 {
@@ -430,12 +474,6 @@ func convertToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConf
 	} else {
 		tData.Domains = nil
 	}
-	if len(sData.PrometheusHttpAPIAddresses) > 0 {
-		cAddrs := strings.Join(sData.PrometheusHttpAPIAddresses, ",")
-		tData.PrometheusHttpAPIAddresses = &cAddrs
-	} else {
-		tData.PrometheusHttpAPIAddresses = nil
-	}
 	if sData.MaxCollectPps != nil {
 		cMaxCollectPps := *sData.MaxCollectPps * 1000
 		tData.MaxCollectPps = &cMaxCollectPps
@@ -468,66 +506,101 @@ func convertToDb(sData *model.VTapGroupConfiguration, tData *mysql.VTapGroupConf
 	}
 }
 
-func CreateVTapGroupConfig(createData *model.VTapGroupConfiguration) (*mysql.VTapGroupConfiguration, error) {
+func (a *VtapGroupConfig) CreateVTapGroupConfig(orgID int, createData *agent_config.AgentGroupConfig) (*agent_config.AgentGroupConfigModel, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
 	if createData.VTapGroupLcuuid == nil {
 		return nil, fmt.Errorf("vtap_group_lcuuid is emty")
 	}
 	vTapGroupLcuuid := *createData.VTapGroupLcuuid
-	dbConfig := &mysql.VTapGroupConfiguration{}
-	db := mysql.Db
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("vtap_group_lcuuid = ?", vTapGroupLcuuid).First(dbConfig)
 	if ret.Error == nil {
 		return nil, fmt.Errorf("vtapgroup %s configuration already exist", vTapGroupLcuuid)
 	}
 
-	dbGroup := &mysql.VTapGroup{}
+	dbGroup := &metadbmodel.VTapGroup{}
 	ret = db.Where("lcuuid = ?", vTapGroupLcuuid).First(dbGroup)
 	if ret.Error != nil {
 		return nil, fmt.Errorf("vtapgroup (%s) not found", vTapGroupLcuuid)
 	}
-	dbData := &mysql.VTapGroupConfiguration{}
+
+	lcuuid := uuid.New().String()
+	if err := a.resourceAccess.CanAddResource(dbGroup.TeamID, common.SET_RESOURCE_TYPE_AGENT_GROUP_CONFIG, lcuuid); err != nil {
+		return nil, err
+	}
+
+	dbData := &agent_config.AgentGroupConfigModel{}
 	convertJsonToDb(createData, dbData)
 	dbData.VTapGroupLcuuid = createData.VTapGroupLcuuid
-	lcuuid := uuid.New().String()
 	dbData.Lcuuid = &lcuuid
-	mysql.Db.Create(dbData)
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	db.Create(dbData)
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return dbData, nil
 }
 
-func DeleteVTapGroupConfig(lcuuid string) (*mysql.VTapGroupConfiguration, error) {
+func (a *VtapGroupConfig) DeleteVTapGroupConfig(orgID int, lcuuid string) (*agent_config.AgentGroupConfigModel, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
 	if lcuuid == "" {
 		return nil, fmt.Errorf("lcuuid is None")
 	}
-
-	db := mysql.Db
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("lcuuid = ?", lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return nil, fmt.Errorf("vtap group configuration(%s) not found", lcuuid)
 	}
+	var vtapGroup *metadbmodel.VTapGroup
+	if err := db.Where("lcuuid = ?", dbConfig.VTapGroupLcuuid).First(&vtapGroup).Error; err != nil {
+		return nil, err
+	}
+	if err := a.resourceAccess.CanDeleteResource(vtapGroup.TeamID, common.SET_RESOURCE_TYPE_AGENT_GROUP_CONFIG, lcuuid); err != nil {
+		return nil, err
+	}
+
 	db.Delete(dbConfig)
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return dbConfig, nil
 }
 
-func UpdateVTapGroupConfig(lcuuid string, updateData *model.VTapGroupConfiguration) (*mysql.VTapGroupConfiguration, error) {
+func (a *VtapGroupConfig) UpdateVTapGroupConfig(orgID int, lcuuid string, updateData *agent_config.AgentGroupConfig) (*agent_config.AgentGroupConfigModel, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
 	if lcuuid == "" {
 		return nil, fmt.Errorf("lcuuid is None")
 	}
-
-	db := mysql.Db
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("lcuuid = ?", lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return nil, fmt.Errorf("vtap group configuration(%s) not found", lcuuid)
 	}
+	var vtapGroup *metadbmodel.VTapGroup
+	if err := db.Where("lcuuid = ?", dbConfig.VTapGroupLcuuid).First(&vtapGroup).Error; err != nil {
+		return nil, err
+	}
+	if err := a.resourceAccess.CanUpdateResource(vtapGroup.TeamID,
+		common.SET_RESOURCE_TYPE_AGENT_GROUP_CONFIG, lcuuid, nil); err != nil {
+		return nil, err
+	}
+
 	convertJsonToDb(updateData, dbConfig)
 	ret = db.Save(dbConfig)
 	if ret.Error != nil {
 		return nil, fmt.Errorf("save config failed, %s", ret.Error)
 	}
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return dbConfig, nil
 }
 
@@ -557,12 +630,12 @@ func isBlank(value reflect.Value) bool {
 	return reflect.DeepEqual(value.Interface(), reflect.Zero(value.Type()).Interface())
 }
 
-func getRealVTapGroupConfig(config *mysql.VTapGroupConfiguration) *mysql.VTapGroupConfiguration {
+func getRealVTapGroupConfig(config *agent_config.AgentGroupConfigModel) *agent_config.AgentGroupConfigModel {
 	ignoreName := []string{"ID", "VTapGroupLcuuid", "Lcuuid"}
 	typeOfDefaultConfig := reflect.ValueOf(common.DefaultVTapGroupConfig).Elem()
 	tt := reflect.TypeOf(config).Elem()
 	tv := reflect.ValueOf(config).Elem()
-	realConfiguration := &mysql.VTapGroupConfiguration{}
+	realConfiguration := &agent_config.AgentGroupConfigModel{}
 	typeOfRealConfiguration := reflect.ValueOf(realConfiguration).Elem()
 	for i := 0; i < tv.NumField(); i++ {
 		field := tt.Field(i)
@@ -581,23 +654,34 @@ func getRealVTapGroupConfig(config *mysql.VTapGroupConfiguration) *mysql.VTapGro
 	return realConfiguration
 }
 
-func GetVTapGroupConfigs(filter map[string]interface{}) ([]*model.VTapGroupConfigurationResponse, error) {
-	var dbConfigs []*mysql.VTapGroupConfiguration
-	var tapTypes []*mysql.TapType
-	var domains []*mysql.Domain
-	var vtapGroups []*mysql.VTapGroup
+func GetVTapGroupConfigs(userInfo *httpcommon.UserInfo, fpermitCfg *common.FPermit, filter map[string]interface{}) ([]*agent_config.AgentGroupConfigResponse, error) {
+	dbInfo, err := metadb.GetDB(userInfo.ORGID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
+	var dbConfigs []*agent_config.AgentGroupConfigModel
+	var tapTypes []*metadbmodel.TapType
+	var domains []*metadbmodel.Domain
+	var allVTapGroups []*metadbmodel.VTapGroup
 	idToTapTypeName := make(map[int]string)
 	lcuuidToDomain := make(map[string]string)
-	lcuuidToVTapGroup := make(map[string]*mysql.VTapGroup)
-	db := mysql.Db
-	mysql.Db.Find(&dbConfigs)
-	mysql.Db.Find(&tapTypes)
-	mysql.Db.Find(&domains)
+	lcuuidToVTapGroup := make(map[string]*metadbmodel.VTapGroup)
+
+	db.Find(&dbConfigs)
+	db.Find(&tapTypes)
+	db.Find(&domains)
 	if _, ok := filter["vtap_group_id"]; ok {
-		mysql.Db.Where("short_uuid = ?", filter["vtap_group_id"]).Find(&vtapGroups)
+		db.Where("short_uuid = ?", filter["vtap_group_id"]).Find(&allVTapGroups)
 	} else {
-		db.Find(&vtapGroups)
+		db.Find(&allVTapGroups)
 	}
+	vtapGroups, err := GetAgentGroupByUser(userInfo, fpermitCfg, allVTapGroups)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, tapType := range tapTypes {
 		idToTapTypeName[tapType.Value] = tapType.Name
 	}
@@ -607,7 +691,7 @@ func GetVTapGroupConfigs(filter map[string]interface{}) ([]*model.VTapGroupConfi
 	for i, vtapGroup := range vtapGroups {
 		lcuuidToVTapGroup[vtapGroup.Lcuuid] = vtapGroups[i]
 	}
-	result := make([]*model.VTapGroupConfigurationResponse, 0, len(dbConfigs))
+	result := make([]*agent_config.AgentGroupConfigResponse, 0, len(dbConfigs))
 	for _, config := range dbConfigs {
 		if config.VTapGroupLcuuid == nil || *config.VTapGroupLcuuid == "" {
 			continue
@@ -617,32 +701,39 @@ func GetVTapGroupConfigs(filter map[string]interface{}) ([]*model.VTapGroupConfi
 			continue
 		}
 		realConfig := getRealVTapGroupConfig(config)
-		mData := &model.VTapGroupConfigurationResponse{}
+		mData := &agent_config.AgentGroupConfigResponse{}
 		mData.VTapGroupID = &vtapGroup.ShortUUID
 		mData.VTapGroupName = &vtapGroup.Name
-		convertDBToJson(realConfig, mData, idToTapTypeName, lcuuidToDomain)
+		convertDBToJson(dbInfo, realConfig, mData, idToTapTypeName, lcuuidToDomain)
+		mData.TeamID = vtapGroup.TeamID
+		mData.UserID = vtapGroup.UserID
 		result = append(result, mData)
 	}
 
 	return result, nil
 }
 
-func GetVTapGroupDetailedConfig(lcuuid string) (*model.DetailedConfig, error) {
+func GetVTapGroupDetailedConfig(orgID int, lcuuid string) (*model.DetailedConfig, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
 	if lcuuid == "" {
 		return nil, fmt.Errorf("lcuuid is None")
 	}
-	db := mysql.Db
-	realConfig := &mysql.VTapGroupConfiguration{}
+	realConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("lcuuid = ?", lcuuid).First(realConfig)
 	if ret.Error != nil {
 		ret = db.Where("vtap_group_lcuuid = ?", lcuuid).First(realConfig)
 		if ret.Error != nil {
-			log.Errorf("vtap group configuration(%s) not found", lcuuid)
-			realConfig = &mysql.VTapGroupConfiguration{}
+			log.Errorf("vtap group configuration(%s) not found", lcuuid, dbInfo.LogPrefixORGID, dbInfo.LogPrefixORGID)
+			realConfig = &agent_config.AgentGroupConfigModel{}
 		}
 	}
-	var tapTypes []*mysql.TapType
-	var domains []*mysql.Domain
+	var tapTypes []*metadbmodel.TapType
+	var domains []*metadbmodel.Domain
 	idToTapTypeName := make(map[int]string)
 	lcuuidToDomain := make(map[string]string)
 	db.Find(&tapTypes)
@@ -653,10 +744,20 @@ func GetVTapGroupDetailedConfig(lcuuid string) (*model.DetailedConfig, error) {
 	for _, domain := range domains {
 		lcuuidToDomain[domain.Lcuuid] = domain.Name
 	}
-	realData := &model.VTapGroupConfigurationResponse{}
-	convertDBToJson(realConfig, realData, idToTapTypeName, lcuuidToDomain)
-	defaultData := &model.VTapGroupConfigurationResponse{}
-	convertDBToJson(common.DefaultVTapGroupConfig, defaultData, idToTapTypeName, lcuuidToDomain)
+	realData := &agent_config.AgentGroupConfigResponse{}
+	convertDBToJson(dbInfo, realConfig, realData, idToTapTypeName, lcuuidToDomain)
+	defaultData := &agent_config.AgentGroupConfigResponse{}
+	convertDBToJson(dbInfo, common.DefaultVTapGroupConfig, defaultData, idToTapTypeName, lcuuidToDomain)
+
+	realData.TeamID = common.DEFAULT_TEAM_ID
+	if realConfig.VTapGroupLcuuid != nil {
+		var vtapGroup metadbmodel.VTapGroup
+		if err := db.Where("lcuuid = ?", *realConfig.VTapGroupLcuuid).First(&vtapGroup).Error; err != nil {
+			return nil, err
+		}
+		realData.TeamID = vtapGroup.TeamID
+	}
+
 	response := &model.DetailedConfig{
 		RealConfig:    realData,
 		DefaultConfig: defaultData,
@@ -667,21 +768,26 @@ func GetVTapGroupDetailedConfig(lcuuid string) (*model.DetailedConfig, error) {
 
 var emptyData = []byte{123, 125, 10}
 
-func GetVTapGroupAdvancedConfig(lcuuid string) (string, error) {
+func GetVTapGroupAdvancedConfig(orgID int, lcuuid string) (string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return "", err
+	}
+	db := dbInfo.DB
+
 	if lcuuid == "" {
 		return "", fmt.Errorf("lcuuid is None")
 	}
-	db := mysql.Db
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("lcuuid = ?", lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group configuration(%s) not found", lcuuid)
 	}
-	response := &model.VTapGroupConfiguration{}
-	convertDBToYaml(dbConfig, response)
+	response := &agent_config.AgentGroupConfig{}
+	convertDBToYaml(dbInfo, dbConfig, response)
 	b, err := yaml.Marshal(response)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, dbInfo.LogPrefixORGID)
 	}
 	if string(b) == string(emptyData) {
 		b = nil
@@ -689,11 +795,16 @@ func GetVTapGroupAdvancedConfig(lcuuid string) (string, error) {
 	return string(b), nil
 }
 
-func GetVTapGroupAdvancedConfigs() ([]string, error) {
-	var dbConfigs []mysql.VTapGroupConfiguration
-	var dbGroups []mysql.VTapGroup
+func GetVTapGroupAdvancedConfigs(orgID int) ([]string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return nil, err
+	}
+	db := dbInfo.DB
+
+	var dbConfigs []agent_config.AgentGroupConfigModel
+	var dbGroups []metadbmodel.VTapGroup
 	lcuuidToShortUUID := make(map[string]string)
-	db := mysql.Db
 	db.Find(&dbGroups)
 	for _, dbGroup := range dbGroups {
 		lcuuidToShortUUID[dbGroup.Lcuuid] = dbGroup.ShortUUID
@@ -704,13 +815,13 @@ func GetVTapGroupAdvancedConfigs() ([]string, error) {
 		if dbConfig.VTapGroupLcuuid == nil || *dbConfig.VTapGroupLcuuid == "" {
 			continue
 		}
-		response := &model.VTapGroupConfiguration{}
-		convertDBToYaml(&dbConfig, response)
+		response := &agent_config.AgentGroupConfig{}
+		convertDBToYaml(dbInfo, &dbConfig, response)
 		shortUUID := lcuuidToShortUUID[*dbConfig.VTapGroupLcuuid]
 		response.VTapGroupID = &shortUUID
 		b, err := yaml.Marshal(response)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, dbInfo.LogPrefixORGID)
 			continue
 		}
 		result = append(result, string(b))
@@ -718,48 +829,58 @@ func GetVTapGroupAdvancedConfigs() ([]string, error) {
 	return result, nil
 }
 
-func UpdateVTapGroupAdvancedConfig(lcuuid string, updateData *model.VTapGroupConfiguration) (string, error) {
-	db := mysql.Db
-	dbConfig := &mysql.VTapGroupConfiguration{}
+func UpdateVTapGroupAdvancedConfig(orgID int, lcuuid string, updateData *agent_config.AgentGroupConfig) (string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return "", err
+	}
+	db := dbInfo.DB
+
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret := db.Where("lcuuid = ?", lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group configuration(%s) not found", lcuuid)
 	}
-	convertYamlToDb(updateData, dbConfig)
+	convertYamlToDb(dbInfo, updateData, dbConfig)
 	ret = db.Save(dbConfig)
 	if ret.Error != nil {
 		return "", fmt.Errorf("save config failed, %s", ret.Error)
 	}
-	response := &model.VTapGroupConfiguration{}
-	convertDBToYaml(dbConfig, response)
+	response := &agent_config.AgentGroupConfig{}
+	convertDBToYaml(dbInfo, dbConfig, response)
 	b, err := yaml.Marshal(response)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, dbInfo.LogPrefixORGID)
 	}
 	if string(b) == string(emptyData) {
 		b = nil
 	}
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return string(b), nil
 }
 
-func CreateVTapGroupAdvancedConfig(createData *model.VTapGroupConfiguration) (string, error) {
+func CreateVTapGroupAdvancedConfig(orgID int, createData *agent_config.AgentGroupConfig) (string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return "", err
+	}
+	db := dbInfo.DB
+
 	if createData.VTapGroupID == nil {
 		return "", fmt.Errorf("vtap_group_id is None")
 	}
 	shortUUID := createData.VTapGroupID
-	db := mysql.Db
-	vtapGroup := &mysql.VTapGroup{}
+	vtapGroup := &metadbmodel.VTapGroup{}
 	ret := db.Where("short_uuid = ?", shortUUID).First(vtapGroup)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) not found", *shortUUID)
 	}
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret = db.Where("vtap_group_lcuuid = ?", vtapGroup.Lcuuid).First(dbConfig)
 	if ret.Error == nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) configuration already exist", *shortUUID)
 	}
-	convertYamlToDb(createData, dbConfig)
+	convertYamlToDb(dbInfo, createData, dbConfig)
 	dbConfig.VTapGroupLcuuid = &vtapGroup.Lcuuid
 	lcuuid := uuid.New().String()
 	dbConfig.Lcuuid = &lcuuid
@@ -767,72 +888,82 @@ func CreateVTapGroupAdvancedConfig(createData *model.VTapGroupConfiguration) (st
 	if ret.Error != nil {
 		return "", fmt.Errorf("save config failed, %s", ret.Error)
 	}
-	response := &model.VTapGroupConfiguration{}
-	convertDBToYaml(dbConfig, response)
+	response := &agent_config.AgentGroupConfig{}
+	convertDBToYaml(dbInfo, dbConfig, response)
 	response.VTapGroupID = shortUUID
 	b, err := yaml.Marshal(response)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, dbInfo.LogPrefixORGID)
 	}
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return string(b), nil
 }
 
-func GetVTapGroupConfigByFilter(args map[string]string) (string, error) {
+func GetVTapGroupConfigByFilter(orgID int, args map[string]string) (string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return "", err
+	}
+	db := dbInfo.DB
+
 	shortUUID := args["vtap_group_id"]
 	if shortUUID == "" {
 		return "", fmt.Errorf("short uuid is None")
 	}
-	db := mysql.Db
-	vtapGroup := &mysql.VTapGroup{}
+	vtapGroup := &metadbmodel.VTapGroup{}
 	ret := db.Where("short_uuid = ?", shortUUID).First(vtapGroup)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) not found", shortUUID)
 	}
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret = db.Where("vtap_group_lcuuid = ?", vtapGroup.Lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) configuration not found", shortUUID)
 	}
-	response := &model.VTapGroupConfiguration{}
-	convertDBToYaml(dbConfig, response)
+	response := &agent_config.AgentGroupConfig{}
+	convertDBToYaml(dbInfo, dbConfig, response)
 	response.VTapGroupID = &shortUUID
 	b, err := yaml.Marshal(response)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, dbInfo.LogPrefixORGID)
 	}
 	return string(b), nil
 }
 
-func DeleteVTapGroupConfigByFilter(args map[string]string) (string, error) {
+func DeleteVTapGroupConfigByFilter(orgID int, args map[string]string) (string, error) {
+	dbInfo, err := metadb.GetDB(orgID)
+	if err != nil {
+		return "", err
+	}
+	db := dbInfo.DB
+
 	shortUUID := args["vtap_group_id"]
 	if shortUUID == "" {
 		return "", fmt.Errorf("short uuid is None")
 	}
-	db := mysql.Db
-	vtapGroup := &mysql.VTapGroup{}
+	vtapGroup := &metadbmodel.VTapGroup{}
 	ret := db.Where("short_uuid = ?", shortUUID).First(vtapGroup)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) not found", shortUUID)
 	}
 
-	dbConfig := &mysql.VTapGroupConfiguration{}
+	dbConfig := &agent_config.AgentGroupConfigModel{}
 	ret = db.Where("vtap_group_lcuuid = ?", vtapGroup.Lcuuid).First(dbConfig)
 	if ret.Error != nil {
 		return "", fmt.Errorf("vtap group(short_uuid=%s) configuration not found", shortUUID)
 	}
 	db.Delete(dbConfig)
-	response := &model.VTapGroupConfiguration{}
-	convertDBToYaml(dbConfig, response)
+	response := &agent_config.AgentGroupConfig{}
+	convertDBToYaml(dbInfo, dbConfig, response)
 	response.VTapGroupID = &shortUUID
 	b, err := yaml.Marshal(response)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, dbInfo.LogPrefixORGID)
 	}
-	refresh.RefreshCache([]common.DataChanged{common.DATA_CHANGED_VTAP})
+	refresh.RefreshCache(orgID, []common.DataChanged{common.DATA_CHANGED_VTAP})
 	return string(b), nil
 }
 
 func GetVTapGroupExampleConfig() (string, error) {
-	return string(model.YamlAgentGroupConfig), nil
+	return string(agent_config.YamlAgentGroupConfig), nil
 }

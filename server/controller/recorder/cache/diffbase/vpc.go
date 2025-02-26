@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddVPC(dbItem *mysql.VPC, seq int) {
+func (b *DataSet) AddVPC(dbItem *metadbmodel.VPC, seq int) {
 	b.VPCs[dbItem.Lcuuid] = &VPC{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -34,12 +34,12 @@ func (b *DataSet) AddVPC(dbItem *mysql.VPC, seq int) {
 		CIDR:         dbItem.CIDR,
 		RegionLcuuid: dbItem.Region,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_VPC_EN, b.VPCs[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_VPC_EN, b.VPCs[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteVPC(lcuuid string) {
 	delete(b.VPCs, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_VPC_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_VPC_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type VPC struct {

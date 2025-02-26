@@ -17,17 +17,9 @@
 package common
 
 const (
-	CLOUD_SYNC_TIMER_MIN = 60
-	CLOUD_SYNC_TIMER_MAX = 86400
-)
-
-const (
-	SECURITY_GROUP_RULE_ACCEPT  = 1
-	SECURITY_GROUP_RULE_DROP    = 2
-	SECURITY_GROUP_RULE_INGRESS = 1
-	SECURITY_GROUP_RULE_EGRESS  = 2
-	SECURITY_GROUP_IPV4         = 1
-	SECURITY_GROUP_IPV6         = 2
+	CLOUD_SYNC_TIMER_DEFAULT = 60
+	CLOUD_SYNC_TIMER_MIN     = 1
+	CLOUD_SYNC_TIMER_MAX     = 86400
 )
 
 const (
@@ -52,4 +44,9 @@ const (
 
 const (
 	SVC_RULE_RESOURCE_NAME = "virtual-kubelet.io/provider-resource-name"
+)
+
+const (
+	K8S_VPC_NAME       = "kubernetes_vpc"
+	K8S_VERSION_PREFIX = "Kubernetes"
 )

@@ -19,17 +19,17 @@ package tencent
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getAZs(region tencentRegion) ([]model.AZ, error) {
-	log.Debug("get azs starting")
+func (t *Tencent) getAZs(region string) ([]model.AZ, error) {
+	log.Debug("get azs starting", logger.NewORGPrefix(t.orgID))
 	var azs []model.AZ
 
 	attrs := []string{"Zone", "ZoneName"}
-	resp, err := t.getResponse("cvm", "2017-03-12", "DescribeZones", region.name, "ZoneSet", false, map[string]interface{}{})
+	resp, err := t.getResponse("cvm", "2017-03-12", "DescribeZones", region, "ZoneSet", false, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("az request tencent api error: (%s)", err.Error())
+		log.Errorf("az request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.AZ{}, err
 	}
 	for _, aData := range resp {
@@ -38,18 +38,18 @@ func (t *Tencent) getAZs(region tencentRegion) ([]model.AZ, error) {
 		}
 		zone := aData.Get("Zone").MustString()
 		name := aData.Get("ZoneName").MustString()
-		lcuuid := common.GetUUID(t.uuidGenerate+"_"+zone, uuid.Nil)
+		lcuuid := common.GetUUIDByOrgID(t.orgID, t.uuidGenerate+"_"+zone)
 		if _, ok := t.azLcuuidMap[lcuuid]; !ok {
-			log.Debugf("az (%s) has no resource", name)
+			log.Debugf("az (%s) has no resource", name, logger.NewORGPrefix(t.orgID))
 			continue
 		}
 		azs = append(azs, model.AZ{
 			Lcuuid:       lcuuid,
 			Label:        zone,
 			Name:         name,
-			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid: t.regionLcuuid,
 		})
 	}
-	log.Debug("get azs complete")
+	log.Debug("get azs complete", logger.NewORGPrefix(t.orgID))
 	return azs, nil
 }

@@ -21,25 +21,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBHost() *mysql.Host {
-	return &mysql.Host{Base: mysql.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
+func newDBHost() *metadbmodel.Host {
+	return &metadbmodel.Host{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
 }
 
 func (t *SuiteTest) TestAddHostBatchSuccess() {
 	operator := NewHost()
 	itemToAdd := newDBHost()
 
-	_, ok := operator.AddBatch([]*mysql.Host{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.Host{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.Host
+	var addedItem *metadbmodel.Host
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Name, itemToAdd.Name)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.Host{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.Host{})
 }
 
 func (t *SuiteTest) TestUpdateHostSuccess() {
@@ -52,11 +52,11 @@ func (t *SuiteTest) TestUpdateHostSuccess() {
 	_, ok := operator.Update(addedItem.Lcuuid, updateInfo)
 	assert.True(t.T(), ok)
 
-	var updatedItem *mysql.Host
+	var updatedItem *metadbmodel.Host
 	t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&updatedItem)
 	assert.Equal(t.T(), updatedItem.Name, updateInfo["name"])
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.Host{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.Host{})
 }
 
 func (t *SuiteTest) TestDeleteHostSuccess() {
@@ -66,28 +66,28 @@ func (t *SuiteTest) TestDeleteHostSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.Host
+	var deletedItem *metadbmodel.Host
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }
 
 func (t *SuiteTest) TestHostCreateAndFind() {
 	lcuuid := uuid.New().String()
-	host := &mysql.Host{
-		Base: mysql.Base{Lcuuid: lcuuid},
+	host := &metadbmodel.Host{
+		Base: metadbmodel.Base{Lcuuid: lcuuid},
 	}
 	t.db.Create(host)
-	var resultHost *mysql.Host
+	var resultHost *metadbmodel.Host
 	err := t.db.Where("lcuuid = ? and name='' and alias='' and description='' and ip='' and user_name='' "+
 		"and user_passwd='' and az='' and region='' and domain=''", lcuuid).First(&resultHost).Error
 	assert.Equal(t.T(), nil, err)
 	assert.Equal(t.T(), host.Base.Lcuuid, resultHost.Base.Lcuuid)
 
-	resultHost = new(mysql.Host)
+	resultHost = new(metadbmodel.Host)
 	t.db.Where("lcuuid = ?", lcuuid).Find(&resultHost)
 	assert.Equal(t.T(), host.Base.Lcuuid, resultHost.Base.Lcuuid)
 
-	resultHost = new(mysql.Host)
+	resultHost = new(metadbmodel.Host)
 	result := t.db.Where("lcuuid = ? and name = null", lcuuid).Find(&resultHost)
 	assert.Equal(t.T(), nil, result.Error)
 	assert.Equal(t.T(), int64(0), result.RowsAffected)

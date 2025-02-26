@@ -17,15 +17,20 @@
 package cache
 
 import (
-	"sync"
+	cmap "github.com/orcaman/concurrent-map/v2"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type LabelKey struct {
 	Name  string
 	Value string
+}
+
+func (k LabelKey) String() string {
+	return k.Name + "-" + k.Value
 }
 
 func NewLabelKey(name, value string) LabelKey {
@@ -36,33 +41,33 @@ func NewLabelKey(name, value string) LabelKey {
 }
 
 type label struct {
-	idToKey sync.Map
-	keyToID sync.Map
+	org *common.ORG
+
+	keyToID cmap.ConcurrentMap[LabelKey, int]
 }
 
-func newLabel() *label {
-	return &label{}
+func newLabel(org *common.ORG) *label {
+	return &label{
+		org:     org,
+		keyToID: cmap.NewStringer[LabelKey, int](),
+	}
+}
+
+func (l *label) GetKeyToID() cmap.ConcurrentMap[LabelKey, int] {
+	return l.keyToID
 }
 
 func (l *label) GetIDByKey(key LabelKey) (int, bool) {
-	if item, ok := l.keyToID.Load(key); ok {
-		return item.(int), true
+	if item, ok := l.keyToID.Get(key); ok {
+		return item, true
 	}
 	return 0, false
-}
-
-func (l *label) GetKeyByID(id int) (LabelKey, bool) {
-	if item, ok := l.idToKey.Load(id); ok {
-		return item.(LabelKey), true
-	}
-	return LabelKey{}, false
 }
 
 func (l *label) Add(batch []*controller.PrometheusLabel) {
 	for _, item := range batch {
 		k := NewLabelKey(item.GetName(), item.GetValue())
-		l.keyToID.Store(k, int(item.GetId()))
-		l.idToKey.Store(int(item.GetId()), k)
+		l.keyToID.Set(k, int(item.GetId()))
 	}
 }
 
@@ -73,14 +78,13 @@ func (l *label) refresh(args ...interface{}) error {
 	}
 	for _, item := range ls {
 		k := NewLabelKey(item.Name, item.Value)
-		l.keyToID.Store(k, item.ID)
-		l.idToKey.Store(item.ID, k)
+		l.keyToID.Set(k, item.ID)
 	}
 	return nil
 }
 
-func (l *label) load() ([]*mysql.PrometheusLabel, error) {
-	var labels []*mysql.PrometheusLabel
-	err := mysql.Db.Find(&labels).Error
+func (l *label) load() ([]*metadbmodel.PrometheusLabel, error) {
+	var labels []*metadbmodel.PrometheusLabel
+	err := l.org.DB.Find(&labels).Error
 	return labels, err
 }

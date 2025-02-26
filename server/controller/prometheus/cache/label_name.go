@@ -19,12 +19,25 @@ package cache
 import (
 	"sync"
 
+	"github.com/cornelk/hashmap"
+
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type labelName struct {
+	org *common.ORG
+
 	nameToID sync.Map
+	idToName *hashmap.Map[int, string]
+}
+
+func newLabelName(org *common.ORG) *labelName {
+	return &labelName{
+		org:      org,
+		idToName: hashmap.New[int, string](),
+	}
 }
 
 func (ln *labelName) GetIDByName(n string) (int, bool) {
@@ -34,9 +47,17 @@ func (ln *labelName) GetIDByName(n string) (int, bool) {
 	return 0, false
 }
 
+func (ln *labelName) GetNameByID(id int) (string, bool) {
+	if name, ok := ln.idToName.Get(id); ok {
+		return name, true
+	}
+	return "", false
+}
+
 func (ln *labelName) Add(batch []*controller.PrometheusLabelName) {
 	for _, item := range batch {
 		ln.nameToID.Store(item.GetName(), int(item.GetId()))
+		ln.idToName.Set(int(item.GetId()), item.GetName())
 	}
 }
 
@@ -47,12 +68,13 @@ func (ln *labelName) refresh(args ...interface{}) error {
 	}
 	for _, item := range labelNames {
 		ln.nameToID.Store(item.Name, item.ID)
+		ln.idToName.Set(item.ID, item.Name)
 	}
 	return nil
 }
 
-func (ln *labelName) load() ([]*mysql.PrometheusLabelName, error) {
-	var labelNames []*mysql.PrometheusLabelName
-	err := mysql.Db.Find(&labelNames).Error
+func (ln *labelName) load() ([]*metadbmodel.PrometheusLabelName, error) {
+	var labelNames []*metadbmodel.PrometheusLabelName
+	err := ln.org.DB.Find(&labelNames).Error
 	return labelNames, err
 }

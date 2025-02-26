@@ -20,14 +20,14 @@ import (
 	"regexp"
 
 	simplejson "github.com/bitly/go-simplejson"
-	logging "github.com/op/go-logging"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.kubernetes")
+var log = logger.MustGetLogger("cloud.kubernetes")
 
 type Kubernetes struct {
 	name                  string
@@ -35,15 +35,16 @@ type Kubernetes struct {
 	clusterID             string
 	regionUuid            string
 	vpcUuid               string
+	orgID                 int
 	podNetIPv4CIDRMaxMask int
 	podNetIPv6CIDRMaxMask int
 	portNameRegex         string
 }
 
-func NewKubernetes(domain mysql.Domain) (*Kubernetes, error) {
+func NewKubernetes(orgID int, domain metadbmodel.Domain) (*Kubernetes, error) {
 	configJson, err := simplejson.NewJson([]byte(domain.Config))
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(orgID))
 		return nil, err
 	}
 
@@ -54,7 +55,7 @@ func NewKubernetes(domain mysql.Domain) (*Kubernetes, error) {
 
 	_, regxErr := regexp.Compile(portNameRegex)
 	if regxErr != nil {
-		log.Errorf("newkubernetes portnameregex (%s) compile error : (%s)", portNameRegex, regxErr.Error())
+		log.Errorf("newkubernetes portnameregex (%s) compile error : (%s)", portNameRegex, regxErr.Error(), logger.NewORGPrefix(orgID))
 		return nil, regxErr
 	}
 
@@ -73,6 +74,7 @@ func NewKubernetes(domain mysql.Domain) (*Kubernetes, error) {
 		name:                  domain.Name,
 		uuidGenerate:          domain.DisplayName,
 		clusterID:             domain.ClusterID,
+		orgID:                 orgID,
 		regionUuid:            configJson.Get("region_uuid").MustString(),
 		vpcUuid:               configJson.Get("vpc_uuid").MustString(),
 		podNetIPv4CIDRMaxMask: podNetIPv4CIDRMaxMask,

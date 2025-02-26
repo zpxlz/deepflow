@@ -17,14 +17,16 @@
 package common
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/agent_config"
 )
 
-var DefaultVTapGroupConfig = &mysql.VTapGroupConfiguration{
+var DefaultVTapGroupConfig = &agent_config.AgentGroupConfigModel{
 	MaxCollectPps:                 &DefaultMaxCollectPps,
 	MaxNpbBps:                     &DefaultMaxNpbBps,
 	MaxCPUs:                       &DefaultMaxCPUs,
+	MaxMilliCPUs:                  &DefaultMaxMilliCPUs,
 	MaxMemory:                     &DefaultMaxMemory,
+	PlatformSyncInterval:          &DefaultPlatformSyncInterval,
 	SyncInterval:                  &DefaultSyncInterval,
 	StatsInterval:                 &DefaultStatsInterval,
 	RsyslogEnabled:                &DefaultRsyslogEnabled,
@@ -72,25 +74,31 @@ var DefaultVTapGroupConfig = &mysql.VTapGroupConfiguration{
 	Domains:                       &DefaultDomains,
 	DecapType:                     &DefaultDecapType,
 	HTTPLogSpanID:                 &DefaultHTTPLogSpanID,
+	SysFreeMemoryMetric:           &DefaultSysFreeMemoryMetric,
 	SysFreeMemoryLimit:            &DefaultSysFreeMemoryLimit,
 	LogFileSize:                   &DefaultLogFileSize,
 	HTTPLogXRequestID:             &DefaultHTTPLogXRequestID,
 	ExternalAgentHTTPProxyEnabled: &DefaultExternalAgentHTTPProxyEnabled,
 	ExternalAgentHTTPProxyPort:    &DefaultExternalAgentHTTPProxyPort,
-	PrometheusHttpAPIAddresses:    &DefaultPrometheusHttpAPIAddresses,
 	AnalyzerPort:                  &DefaultAnalyzerPort,
 	ProxyControllerPort:           &DefaultProxyControllerPort,
 	ProxyControllerIP:             &DefaultProxyControllerIP,
 	AnalyzerIP:                    &DefaultAnalyzerIP,
 	WasmPlugins:                   &DefaultWasmPlugins,
 	SoPlugins:                     &DefaultSoPlugins,
+
+	SystemLoadCircuitBreakerThreshold: &DefaultSystemLoadCircuitBreakerThreshold,
+	SystemLoadCircuitBreakerRecover:   &DefaultSystemLoadCircuitBreakerRecover,
+	SystemLoadCircuitBreakerMetric:    &DefaultSystemLoadCircuitBreakerMetric,
 }
 
 var (
 	DefaultMaxCollectPps                 = 200000
 	DefaultMaxNpbBps                     = int64(1000000000)
 	DefaultMaxCPUs                       = 1
+	DefaultMaxMilliCPUs                  = 1000
 	DefaultMaxMemory                     = 768
+	DefaultPlatformSyncInterval          = 10
 	DefaultSyncInterval                  = 60
 	DefaultStatsInterval                 = 10
 	DefaultRsyslogEnabled                = 1
@@ -98,6 +106,7 @@ var (
 	DefaultBandwidthProbeInterval        = 10
 	DefaultTapInterfaceRegex             = "^(tap.*|cali.*|veth.*|eth.*|en[osipx].*|lxc.*|lo|[0-9a-f]+_h)$"
 	DefaultMaxEscapeSeconds              = 3600
+	DefaultMaxEscapeSecondsStr           = "3600s"
 	DefaultMtu                           = 1500
 	DefaultOutputVlan                    = 0
 	DefaultCollectorSocketType           = "TCP"
@@ -139,16 +148,20 @@ var (
 	DefaultDomains                       = "0"
 	DefaultDecapType                     = "1,2"
 	DefaultHTTPLogSpanID                 = "traceparent, sw8"
+	DefaultSysFreeMemoryMetric           = "free"
 	DefaultSysFreeMemoryLimit            = 0
 	DefaultLogFileSize                   = 1000
 	DefaultHTTPLogXRequestID             = "X-Request-ID"
 	DefaultExternalAgentHTTPProxyEnabled = 1 // 外部Agent数据HTTP代理开关
 	DefaultExternalAgentHTTPProxyPort    = 38086
-	DefaultPrometheusHttpAPIAddresses    = ""
 	DefaultAnalyzerPort                  = 30033
 	DefaultProxyControllerPort           = 30035
 	DefaultProxyControllerIP             = ""
 	DefaultAnalyzerIP                    = ""
 	DefaultWasmPlugins                   = ""
 	DefaultSoPlugins                     = ""
+
+	DefaultSystemLoadCircuitBreakerThreshold = float32(1.0)
+	DefaultSystemLoadCircuitBreakerRecover   = float32(0.9)
+	DefaultSystemLoadCircuitBreakerMetric    = "load15"
 )

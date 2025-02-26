@@ -6,14 +6,7 @@ Provides the Rust language interface.
 
 Currently support `x86_64` and `arm64` architectures.
 
-**Kernel version support:**
-- x86_64
-  - Linux 4.14+ (Recommend Linux 5.2+)
-- aarch64
-  - Linux 5.8+
-  - Centos8 Linux 4.18 
-  - EulerOS Linux5.10+
-  - KylinOS V10 SP3+ 4.19.90-52.25
+[Kernel version and feature support](https://github.com/deepflowio/docs/blob/main/docs/zh/02-ce-install/01-overview.md#%E8%BF%90%E8%A1%8C%E6%9D%83%E9%99%90%E5%8F%8A%E5%86%85%E6%A0%B8%E8%A6%81%E6%B1%82)
 
 # Protocol Tracing
 
@@ -32,6 +25,11 @@ The following protocols are currently probed:
 - KAFKA
 - MQTT
 - DNS
+- TLS(handshake)
+- MONGO
+- ORACLE
+- FASTCGI
+- ROCKETMQ
 
 ## TLS/SSL Tracing
 
@@ -139,7 +137,7 @@ end
     running_socket_tracer --> running_socket_tracer-13(4.13 tracer_hooks_attach) -.-running_socket_tracer-13-i([attach all probes])
     running_socket_tracer --> running_socket_tracer-14(4.14 perf_map_config) -.- running_socket_tracer-14-i([set perf buffer reader share memory])
     running_socket_tracer --> running_socket_tracer-15(4.15 set trace uid) -.- running_socket_tracer-15-i([use for socketID,traceID,capSeq])
-    running_socket_tracer-15 -.-> |Prepare various UIDs to map|trace_conf_map[(trace_conf_map)]
+    running_socket_tracer-15 -.-> |Prepare various UIDs to map|tracer_ctx_map[(tracer_ctx_map)]
     running_socket_tracer --> running_socket_tracer-16(4.16 dispatch_worker) -.- running_socket_tracer-16-i([userspace receive and distribute eBPF data to work queue initialization])
     running_socket_tracer --> running_socket_tracer-17(4.17 register_extra_waiting_op server/client for getting kernel struct member offset)
     running_socket_tracer --> running_socket_tracer-18(4.18 register_period_event_op kick kernel for getting kernel struct member offset)
@@ -206,7 +204,7 @@ end
     get_tcp_read_seq_from_fd(6.1 get_tcp_read_seq_from_fd)
     get_tcp_write_seq_from_fd(6.2 get_tcp_write_seq_from_fd)
     socket_id(6.3 Confirm socketID)
-    trace_conf_map[(trace_conf_map)]
+    tracer_ctx_map[(tracer_ctx_map)]
     trace_process(6.4 trace_process)
     eBPF_start --> syscall_entry-.->|store args to map| args_map
     args_map -.->|fetch args | syscall_exit
@@ -232,7 +230,7 @@ end
     if_direction_trace-->|Yes|trace_map__update(6.4.1 Add new trace info)
     if_direction_trace-->|No|trace_map__delete(6.4.2 Determine the traceID, delete the trace_map entry)
     end
-    trace_conf_map -.->|get uid for traceID| trace_map__update-.->|Add new traceID|trace_map[(trace_map)]
+    tracer_ctx_map -.->|get uid for traceID| trace_map__update-.->|Add new traceID|trace_map[(trace_map)]
     data_submit-->if_socket_info{is socket_info exists?}
     if_socket_info-->|Yes|set_data_from_socket_info(6.6 set data from socketinfo)
     if_socket_info-->|No|create_socket_info(6.5 create socket info)-->set_data_from_socket_info
@@ -253,7 +251,7 @@ subgraph Symbols
     illustration-thread>thread]
     illustration-ring{{ -- queue -- }}
 end
-    style poller fill:#ccff,color:#000, stroke-width:2px
+    style perf_buffer_read fill:#ccff,color:#000, stroke-width:2px
     style start  fill:#fff,color:#000,stroke:#000,stroke-width:2px
     style worker  fill:#fff,color:#000,stroke:#000,stroke-width:2px
     style worker_1  fill:#fff,color:#000,stroke:#000,stroke-width:2px
@@ -267,7 +265,7 @@ end
     style rust_callback stroke-width:2px
     style free stroke-width:2px
 
-    start>thread 'perf-reader'] --- poller(1 poller)-->|1|perf_reader_poll(2 perf_reader_poll)-->|2|reader_raw_cb(3 reader_raw_cb)
+    start>thread 'perf-reader'] --- perf_buffer_read(1 perf_buffer_read)-->|1|perf_reader_poll(2 perf_reader_poll)-->|2|reader_raw_cb(3 reader_raw_cb)
     reader_raw_cb-->|3|register_events_handle(4 register_events_handle)
     reader_raw_cb-->|4|dispatch_queue_index(5 dispatch_queue_index)
     reader_raw_cb-->|5|copy_data_and_enqueue(6 Copy socket data and enqueue)
@@ -282,7 +280,7 @@ end
     prefetch_and_process_data-->rust_callback(9 Call rust callback func)
     rust_callback-->free(free data)
 
-    copy_data_and_enqueue-->|8 loop|poller
+    copy_data_and_enqueue-->|8 loop|perf_buffer_read
     free-->|loop|process_data
 ```
 
@@ -370,7 +368,7 @@ For all probes we provide two APIs(socket_tracer_start()/socket_tracer_stop()) t
 
 ```mermaid
 graph LR
-    style poller fill:#ccff,color:#000, stroke-width:2px
+    style perf_buffer_read fill:#ccff,color:#000, stroke-width:2px
     style perf_reader_poll fill:#ccff,color:#000, stroke-width:2px
     style reader_raw_cb fill:#ccff,color:#000, stroke-width:2px
     style perf_buffer stroke-width:2px
@@ -390,7 +388,7 @@ graph LR
     hook2-.->perf_buffer
     perf_buffer-.-> Buffer-Reader(Buffer-Reader)
     subgraph user
-    Buffer-Reader---poller(3 poller)-->perf_reader_poll(4 perf_reader_poll)-->reader_raw_cb(5 reader_raw_cb)
+    Buffer-Reader---perf_buffer_read(3 perf_buffer_read)-->reader_event_read(4 reader_event_read)-->reader_raw_cb(5 reader_raw_cb)
     end 
 ```
 

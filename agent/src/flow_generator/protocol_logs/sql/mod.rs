@@ -23,21 +23,27 @@ use std::{
 
 use lru::LruCache;
 
+mod memcached;
 mod mongo;
 mod mysql;
-mod oracle;
 mod postgre_convert;
 mod postgresql;
 mod redis;
-mod redis_obfuscate;
 mod sql_check;
 mod sql_obfuscate;
 
+pub use memcached::{MemcachedInfo, MemcachedLog};
 pub use mongo::{MongoDBInfo, MongoDBLog};
 pub use mysql::{MysqlInfo, MysqlLog};
-pub use oracle::{OracleInfo, OracleLog};
 pub use postgresql::{PostgreInfo, PostgresqlLog};
 pub use redis::{RedisInfo, RedisLog};
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        mod oracle;
+        pub use oracle::{OracleInfo, OracleLog};
+    }
+}
 
 pub type ObfuscateCache = Rc<RefCell<LruCache<u64, Vec<u8>>>>;
 

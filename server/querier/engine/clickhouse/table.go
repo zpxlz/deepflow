@@ -18,14 +18,18 @@ package clickhouse
 
 import (
 	"context"
+
+	"golang.org/x/exp/slices"
+
 	"github.com/deepflowio/deepflow/server/querier/common"
+	"github.com/deepflowio/deepflow/server/querier/engine/clickhouse/client"
 	chCommon "github.com/deepflowio/deepflow/server/querier/engine/clickhouse/common"
 )
 
 func GetDatabases() *common.Result {
 	var values []interface{}
 	for db := range chCommon.DB_TABLE_MAP {
-		values = append(values, []string{db})
+		values = append(values, []interface{}{db})
 	}
 	return &common.Result{
 		Columns: []interface{}{"name"},
@@ -33,22 +37,17 @@ func GetDatabases() *common.Result {
 	}
 }
 
-func GetTables(db string, ctx context.Context) *common.Result {
+func GetTables(db, where, queryCacheTTL, orgID string, useQueryCache bool, ctx context.Context, DebugInfo *client.DebugInfo) *common.Result {
 	var values []interface{}
 	tables, ok := chCommon.DB_TABLE_MAP[db]
 	if !ok {
 		return nil
 	}
-	if db == "ext_metrics" || db == "deepflow_system" {
-		values = append(values, chCommon.GetExtTables(db, ctx)...)
-	} else if db == chCommon.DB_NAME_PROMETHEUS {
-		values = append(values, chCommon.GetPrometheusTables(db, ctx)...)
+	if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_EXT_METRICS, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS}, db) {
+		values = append(values, chCommon.GetExtTables(db, where, queryCacheTTL, orgID, useQueryCache, ctx, DebugInfo)...)
 	} else {
 		for _, table := range tables {
-			if table == "vtap_acl" {
-				continue
-			}
-			datasource, err := chCommon.GetDatasources(db, table)
+			datasource, err := chCommon.GetDatasources(db, table, orgID)
 			if err != nil {
 				log.Error(err)
 			}

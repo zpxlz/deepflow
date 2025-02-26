@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type LBListener struct {
-	UpdaterBase[cloudmodel.LBListener, mysql.LBListener, *diffbase.LBListener]
+	UpdaterBase[
+		cloudmodel.LBListener,
+		*diffbase.LBListener,
+		*metadbmodel.LBListener,
+		metadbmodel.LBListener,
+		*message.LBListenerAdd,
+		message.LBListenerAdd,
+		*message.LBListenerUpdate,
+		message.LBListenerUpdate,
+		*message.LBListenerFieldsUpdate,
+		message.LBListenerFieldsUpdate,
+		*message.LBListenerDelete,
+		message.LBListenerDelete]
 }
 
 func NewLBListener(wholeCache *cache.Cache, cloudData []cloudmodel.LBListener) *LBListener {
 	updater := &LBListener{
-		UpdaterBase[cloudmodel.LBListener, mysql.LBListener, *diffbase.LBListener]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewLBListener(),
-			diffBaseData: wholeCache.DiffBaseDataSet.LBListeners,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.LBListener,
+			*diffbase.LBListener,
+			*metadbmodel.LBListener,
+			metadbmodel.LBListener,
+			*message.LBListenerAdd,
+			message.LBListenerAdd,
+			*message.LBListenerUpdate,
+			message.LBListenerUpdate,
+			*message.LBListenerFieldsUpdate,
+			message.LBListenerFieldsUpdate,
+			*message.LBListenerDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN,
+			wholeCache,
+			db.NewLBListener().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.LBListeners,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,17 +73,17 @@ func (l *LBListener) getDiffBaseByCloudItem(cloudItem *cloudmodel.LBListener) (d
 	return
 }
 
-func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*mysql.LBListener, bool) {
+func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*metadbmodel.LBListener, bool) {
 	lbID, exists := l.cache.ToolDataSet.GetLBIDByLcuuid(cloudItem.LBLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_LB_EN, cloudItem.LBLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_LB_LISTENER_EN, cloudItem.Lcuuid,
-		))
+		), l.metadata.LogPrefixes)
 		return nil, false
 	}
 
-	dbItem := &mysql.LBListener{
+	dbItem := &metadbmodel.LBListener{
 		Name:     cloudItem.Name,
 		LBID:     lbID,
 		IPs:      cloudItem.IPs,
@@ -66,32 +91,35 @@ func (l *LBListener) generateDBItemToAdd(cloudItem *cloudmodel.LBListener) (*mys
 		Label:    cloudItem.Label,
 		Port:     cloudItem.Port,
 		Protocol: cloudItem.Protocol,
-		Domain:   l.cache.DomainLcuuid,
+		Domain:   l.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (l *LBListener) generateUpdateInfo(diffBase *diffbase.LBListener, cloudItem *cloudmodel.LBListener) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (l *LBListener) generateUpdateInfo(diffBase *diffbase.LBListener, cloudItem *cloudmodel.LBListener) (*message.LBListenerFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.LBListenerFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.IPs != cloudItem.IPs {
-		updateInfo["ips"] = cloudItem.IPs
+		mapInfo["ips"] = cloudItem.IPs
+		structInfo.IPs.Set(diffBase.IPs, cloudItem.IPs)
 	}
 	if diffBase.SNATIPs != cloudItem.SNATIPs {
-		updateInfo["snat_ips"] = cloudItem.SNATIPs
+		mapInfo["snat_ips"] = cloudItem.SNATIPs
+		structInfo.SNATIPs.Set(diffBase.SNATIPs, cloudItem.SNATIPs)
 	}
 	if diffBase.Port != cloudItem.Port {
-		updateInfo["port"] = cloudItem.Port
+		mapInfo["port"] = cloudItem.Port
+		structInfo.Port.Set(diffBase.Port, cloudItem.Port)
 	}
 	if diffBase.Protocol != cloudItem.Protocol {
-		updateInfo["protocol"] = cloudItem.Protocol
+		mapInfo["protocol"] = cloudItem.Protocol
+		structInfo.Protocol.Set(diffBase.Protocol, cloudItem.Protocol)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

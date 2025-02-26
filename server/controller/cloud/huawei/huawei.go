@@ -21,19 +21,21 @@ import (
 	"time"
 
 	"github.com/bitly/go-simplejson"
-	"github.com/op/go-logging"
 
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.huawei")
+var log = logger.MustGetLogger("cloud.huawei")
 
 type HuaWei struct {
+	orgID           int
+	teamID          int
 	lcuuid          string
 	lcuuidGenerate  string
 	name            string
@@ -45,13 +47,15 @@ type HuaWei struct {
 	debugger        *cloudcommon.Debugger
 }
 
-func NewHuaWei(domain mysql.Domain, globalCloudCfg config.CloudConfig) (*HuaWei, error) {
+func NewHuaWei(orgID int, domain metadbmodel.Domain, globalCloudCfg config.CloudConfig) (*HuaWei, error) {
 	conf := &Config{}
-	err := conf.LoadFromString(domain.Config)
+	err := conf.LoadFromString(orgID, domain.Config)
 	if err != nil {
 		return nil, err
 	}
 	return &HuaWei{
+		orgID:  orgID,
+		teamID: domain.TeamID,
 		lcuuid: domain.Lcuuid,
 		// TODO: display_name后期需要修改为uuid_generate
 		lcuuidGenerate:  domain.DisplayName,
@@ -123,19 +127,11 @@ func (h *HuaWei) GetCloudData() (model.Resource, error) {
 	resource.VRouters = append(resource.VRouters, vrouters...)
 	resource.RoutingTables = append(resource.RoutingTables, routingTables...)
 
-	sgs, sgRules, err := h.getSecurityGroups()
-	if err != nil {
-		return resource, err
-	}
-	resource.SecurityGroups = append(resource.SecurityGroups, sgs...)
-	resource.SecurityGroupRules = append(resource.SecurityGroupRules, sgRules...)
-
-	vms, vmSGs, vifs, ips, err := h.getVMs()
+	vms, vifs, ips, err := h.getVMs()
 	if err != nil {
 		return resource, err
 	}
 	resource.VMs = append(resource.VMs, vms...)
-	resource.VMSecurityGroups = append(resource.VMSecurityGroups, vmSGs...)
 	resource.VInterfaces = append(resource.VInterfaces, vifs...)
 	resource.IPs = append(resource.IPs, ips...)
 
@@ -174,8 +170,8 @@ func (h *HuaWei) GetCloudData() (model.Resource, error) {
 	resource.VInterfaces = append(resource.VInterfaces, vifs...)
 	resource.IPs = append(resource.IPs, ips...)
 
-	log.Debugf("region resource num info: %v", h.toolDataSet.regionLcuuidToResourceNum)
-	log.Debugf("az resource num info: %v", h.toolDataSet.azLcuuidToResourceNum)
+	log.Debugf("region resource num info: %v", h.toolDataSet.regionLcuuidToResourceNum, logger.NewORGPrefix(h.orgID))
+	log.Debugf("az resource num info: %v", h.toolDataSet.azLcuuidToResourceNum, logger.NewORGPrefix(h.orgID))
 	resource.Regions = cloudcommon.EliminateEmptyRegions(regions, h.toolDataSet.regionLcuuidToResourceNum)
 	resource.AZs = cloudcommon.EliminateEmptyAZs(azs, h.toolDataSet.azLcuuidToResourceNum)
 
@@ -194,6 +190,8 @@ func (h *HuaWei) GetStatter() statsd.StatsdStatter {
 	}
 
 	return statsd.StatsdStatter{
+		OrgID:      h.orgID,
+		TeamID:     h.teamID,
 		GlobalTags: globalTags,
 		Element:    statsd.GetCloudStatsd(h.cloudStatsd),
 	}

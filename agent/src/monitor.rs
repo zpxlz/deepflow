@@ -29,19 +29,23 @@ use log::{debug, info, warn};
 use sysinfo::NetworkExt;
 use sysinfo::{get_current_pid, Pid, ProcessExt, ProcessRefreshKind, System, SystemExt};
 
-use crate::config::handler::EnvironmentAccess;
+#[cfg(target_os = "linux")]
+use crate::utils::{cgroups, environment::SocketInfo};
 use crate::{
+    config::handler::EnvironmentAccess,
     error::{Error, Result},
     utils::{
-        process::{get_current_sys_free_memory_percentage, get_file_and_size_sum},
+        process::{get_current_sys_memory_percentage, get_file_and_size_sum},
         stats::{
-            Collector, Countable, Counter, CounterType, CounterValue, RefCountable, StatsOption,
+            self, Collector, Countable, Counter, CounterType, CounterValue, RefCountable,
+            StatsOption,
         },
     },
 };
+
 #[cfg(target_os = "linux")]
 use public::netns::{self, NsFile};
-use public::utils::net::link_list;
+use public::utils::net::{link_list, Link};
 
 #[derive(Default)]
 struct NetMetricArg {
@@ -210,27 +214,39 @@ impl RefCountable for SysStatusBroker {
         }
 
         let mut metrics = vec![];
-        let current_sys_free_memory_percentage = get_current_sys_free_memory_percentage();
+        let (current_sys_free_memory_percentage, current_sys_available_memory_percentage) =
+            get_current_sys_memory_percentage();
         metrics.push((
             "sys_free_memory",
             CounterType::Gauged,
             CounterValue::Unsigned(current_sys_free_memory_percentage as u64),
         ));
+        metrics.push((
+            "sys_available_memory",
+            CounterType::Gauged,
+            CounterValue::Unsigned(current_sys_available_memory_percentage as u64),
+        ));
 
+        let sys_memory_limit = self.config.load().sys_memory_limit as f64;
+
+        let (sys_free_memory_limit_ratio, sys_available_memory_limit_ratio) =
+            if sys_memory_limit > 0.0 {
+                (
+                    current_sys_free_memory_percentage as f64 / sys_memory_limit,
+                    current_sys_available_memory_percentage as f64 / sys_memory_limit,
+                )
+            } else {
+                (0.0, 0.0) // If sys_memory_limit is set to 0, it means that there is no need to check if the system's free/available memory is too low. In this case, 0.0 will be directly returned, indicating that there will be no low system free/available memory alert.
+            };
         metrics.push((
-            "max_memory",
+            "sys_free_memory_limit_ratio",
             CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().max_memory as u64),
+            CounterValue::Float(sys_free_memory_limit_ratio),
         ));
         metrics.push((
-            "max_cpus",
+            "sys_available_memory_limit_ratio",
             CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().max_cpus as u64),
-        ));
-        metrics.push((
-            "system_free_memory_limit",
-            CounterType::Gauged,
-            CounterValue::Unsigned(self.config.load().sys_free_memory_limit as u64),
+            CounterValue::Float(sys_available_memory_limit_ratio),
         ));
 
         match get_file_and_size_sum(&self.log_dir) {
@@ -261,9 +277,19 @@ impl RefCountable for SysStatusBroker {
                     CounterValue::Float(cpu_usage),
                 ));
                 metrics.push((
+                    "max_millicpus_ratio",
+                    CounterType::Gauged,
+                    CounterValue::Float(cpu_usage * 10.0 / self.config.load().max_millicpus as f64),
+                ));
+                metrics.push((
                     "memory",
                     CounterType::Gauged,
                     CounterValue::Unsigned(mem_used),
+                ));
+                metrics.push((
+                    "max_memory_ratio",
+                    CounterType::Gauged,
+                    CounterValue::Float(mem_used as f64 / self.config.load().max_memory as f64),
                 ));
                 metrics.push((
                     "create_time",
@@ -275,6 +301,33 @@ impl RefCountable for SysStatusBroker {
                 warn!("get process data failed, system status monitor has stopped");
             }
         }
+
+        #[cfg(target_os = "linux")]
+        metrics.push((
+            "open_sockets",
+            CounterType::Gauged,
+            match SocketInfo::get() {
+                Ok(SocketInfo {
+                    tcp,
+                    tcp6,
+                    udp,
+                    udp6,
+                }) => {
+                    CounterValue::Unsigned((tcp.len() + tcp6.len() + udp.len() + udp6.len()) as u64)
+                }
+                Err(_) => CounterValue::Unsigned(0),
+            },
+        ));
+        #[cfg(target_os = "linux")]
+        metrics.push((
+            "page_cache",
+            CounterType::Gauged,
+            if let Some(m_stat) = cgroups::memory_info() {
+                CounterValue::Unsigned(m_stat.stat.cache)
+            } else {
+                CounterValue::Unsigned(0)
+            },
+        ));
         metrics
     }
 }
@@ -285,11 +338,38 @@ impl RefCountable for SysLoad {
     fn get_counters(&self) -> Vec<Counter> {
         let mut sys = self.0.lock().unwrap();
         sys.refresh_cpu();
-        vec![(
-            "load1",
-            CounterType::Gauged,
-            CounterValue::Float(sys.load_average().one),
-        )]
+        vec![
+            (
+                "load1",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().one),
+            ),
+            (
+                "load5",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().five),
+            ),
+            (
+                "load15",
+                CounterType::Gauged,
+                CounterValue::Float(sys.load_average().fifteen),
+            ),
+        ]
+    }
+}
+
+struct NetStats<'a>(&'a Link);
+
+impl stats::Module for NetStats<'_> {
+    fn name(&self) -> &'static str {
+        "net"
+    }
+
+    fn tags(&self) -> Vec<StatsOption> {
+        vec![
+            StatsOption::Tag("name", self.0.name.clone()),
+            StatsOption::Tag("mac", self.0.mac_addr.to_string()),
+        ]
     }
 }
 
@@ -337,7 +417,7 @@ impl Monitor {
             let mut link_map_guard = link_map.lock().unwrap();
 
             #[cfg(target_os = "linux")]
-            if let Err(e) = netns::open_named_and_setns(&NsFile::Root) {
+            if let Err(e) = NsFile::Root.open_and_setns() {
                 warn!("agent must have CAP_SYS_ADMIN to run without 'hostNetwork: true'.");
                 warn!("setns error: {}", e);
                 return;
@@ -379,13 +459,9 @@ impl Monitor {
                     continue;
                 }
                 let link_broker = Arc::new(LinkStatusBroker::new());
-                let mut options = vec![];
-                options.push(StatsOption::Tag("name", link.name.clone()));
-                options.push(StatsOption::Tag("mac", link.mac_addr.to_string()));
                 stats.register_countable(
-                    "net",
+                    &NetStats(&link),
                     Countable::Ref(Arc::downgrade(&link_broker) as Weak<dyn RefCountable>),
-                    options,
                 );
                 link_map_guard.insert(link.name.clone(), link_broker);
                 monitor_list.push(link.name.clone());
@@ -434,15 +510,13 @@ impl Monitor {
         }));
 
         self.stats.register_countable(
-            "monitor",
+            &stats::NoTagModule("monitor"),
             Countable::Ref(Arc::downgrade(&self.sys_monitor) as Weak<dyn RefCountable>),
-            vec![],
         );
 
         self.stats.register_countable(
-            "system",
+            &stats::NoTagModule("system"),
             Countable::Ref(Arc::downgrade(&self.sys_load) as Weak<dyn RefCountable>),
-            vec![],
         );
 
         info!("monitor started");

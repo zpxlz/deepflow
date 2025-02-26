@@ -25,11 +25,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/deepflowio/deepflow/message/agent"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/vishvananda/netlink"
 )
 
 type ctxKeyWaitGroup struct{}
+
+const ORG_ID_INDEX_MAX = common.ORG_ID_MAX + 1 // 0 index not used
+
+func CheckOrgID(orgID int) bool {
+	return orgID <= common.ORG_ID_MAX
+}
 
 func GetWaitGroupInCtx(ctx context.Context) *sync.WaitGroup {
 	if wg, ok := ctx.Value(ctxKeyWaitGroup{}).(*sync.WaitGroup); ok {
@@ -135,4 +143,56 @@ func IsVMofBMHtype(htype int) bool {
 		return true
 	}
 	return false
+}
+
+func Concat[S ~[]E, E any](slices ...S) S {
+	size := 0
+	for _, s := range slices {
+		size += len(s)
+		if size < 0 {
+			panic("len out of range")
+		}
+	}
+	newslice := Grow[S](nil, size)
+	for _, s := range slices {
+		newslice = append(newslice, s...)
+	}
+	return newslice
+}
+
+func Grow[S ~[]E, E any](s S, n int) S {
+	if n < 0 {
+		panic("cannot be negative")
+	}
+	if n -= cap(s) - len(s); n > 0 {
+		s = append(s[:cap(s)], make([]E, n)...)[:len(s)]
+	}
+	return s
+}
+
+type ORGID int
+
+func (o ORGID) Logf(format string, args ...interface{}) (string, logger.Prefix) {
+	return fmt.Sprintf(format, args...), logger.NewORGPrefix(int(o))
+}
+
+func (o ORGID) Log(logStr string) (string, logger.Prefix) {
+	return logStr, logger.NewORGPrefix(int(o))
+}
+
+func (o ORGID) GetORGID() int {
+	return int(o)
+}
+
+func Int2Bool(i int) bool {
+	if i == 0 {
+		return false
+	}
+
+	return true
+}
+
+func Int2AgentTypePtr[T int | uint16](i T) *agent.AgentType {
+	value := agent.AgentType(int32(i))
+	return &value
 }

@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type LBTargetServer struct {
-	OperatorBase[mysql.LBTargetServer]
+	OperatorBase[*metadbmodel.LBTargetServer, metadbmodel.LBTargetServer]
 }
 
 func NewLBTargetServer() *LBTargetServer {
 	return &LBTargetServer{
-		OperatorBase[mysql.LBTargetServer]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.LBTargetServer](
+			ctrlrcommon.RESOURCE_TYPE_LB_TARGET_SERVER_EN,
+			false,
+			false,
+		),
 	}
 }

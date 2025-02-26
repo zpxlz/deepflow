@@ -37,6 +37,7 @@ type Host struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Name         string `json:"name" binding:"required"`
 	IP           string `json:"ip" binding:"required"`
+	Hostname     string `json:"hostname"`
 	Type         int    `json:"type" binding:"required"`
 	HType        int    `json:"htype" binding:"required"`
 	VCPUNum      int    `json:"vcpu_num"`
@@ -47,17 +48,20 @@ type Host struct {
 }
 
 type VM struct {
-	Lcuuid       string            `json:"lcuuid" binding:"required"`
-	Name         string            `json:"name" binding:"required"`
-	Label        string            `json:"label"`
-	HType        int               `json:"htype" binding:"required"`
-	State        int               `json:"state" binding:"required"`
-	LaunchServer string            `json:"launch_server" binding:"required"`
-	CreatedAt    time.Time         `json:"created_at"`
-	VPCLcuuid    string            `json:"vpc_lcuuid" binding:"required"`
-	AZLcuuid     string            `json:"az_lcuuid" binding:"required"`
-	RegionLcuuid string            `json:"region_lcuuid" binding:"required"`
-	CloudTags    map[string]string `json:"cloud_tags"`
+	Lcuuid        string            `json:"lcuuid" binding:"required"`
+	Name          string            `json:"name" binding:"required"`
+	Label         string            `json:"label"`
+	IP            string            `json:"ip"`
+	Hostname      string            `json:"hostname"`
+	HType         int               `json:"htype" binding:"required"`
+	State         int               `json:"state" binding:"required"`
+	LaunchServer  string            `json:"launch_server" binding:"required"`
+	CreatedAt     time.Time         `json:"created_at"`
+	VPCLcuuid     string            `json:"vpc_lcuuid" binding:"required"`
+	AZLcuuid      string            `json:"az_lcuuid" binding:"required"`
+	RegionLcuuid  string            `json:"region_lcuuid" binding:"required"`
+	CloudTags     map[string]string `json:"cloud_tags"`
+	NetworkLcuuid string            `json:"network_lcuuid"`
 }
 
 type VMPodNodeConnection struct {
@@ -150,6 +154,7 @@ type VInterface struct {
 	NetnsID         uint32 `json:"netns_id"`
 	VTapID          uint32 `json:"vtap_id" binding:"required"`
 	SubDomainLcuuid string `json:"sub_domain_lcuuid"`
+	VPCID           int    // TODO @zhengya remove
 }
 
 type IP struct {
@@ -174,35 +179,6 @@ type FloatingIP struct {
 	NetworkLcuuid string `json:"network_lcuuid" binding:"required"`
 	VPCLcuuid     string `json:"vpc_lcuuid" binding:"required"`
 	RegionLcuuid  string `json:"region_lcuuid" binding:"required"`
-}
-
-type SecurityGroup struct {
-	Lcuuid       string `json:"lcuuid" binding:"required"`
-	Name         string `json:"name" binding:"required"`
-	Label        string `json:"label"`
-	VPCLcuuid    string `json:"vpc_lcuuid"`
-	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
-}
-
-type SecurityGroupRule struct {
-	Lcuuid              string `json:"lcuuid" binding:"required"`
-	SecurityGroupLcuuid string `json:"security_group_lcuuid" binding:"required"`
-	Direction           int    `json:"direction" binding:"required"`
-	EtherType           int    `json:"ether_type" binding:"required"`
-	Protocol            string `json:"protocol"`
-	LocalPortRange      string `json:"local_port_range"`
-	RemotePortRange     string `json:"remote_port_range"`
-	Local               string `json:"local"`
-	Remote              string `json:"remote"`
-	Action              int    `json:"action" binding:"required"`
-	Priority            int    `json:"priority"`
-}
-
-type VMSecurityGroup struct {
-	Lcuuid              string `json:"lcuuid" binding:"required"`
-	VMLcuuid            string `json:"vm_lcuuid" binding:"required"`
-	SecurityGroupLcuuid string `json:"security_group_lcuuid" binding:"required"`
-	Priority            int    `json:"priority" binding:"required"`
 }
 
 type LB struct {
@@ -316,6 +292,7 @@ type RDSInstance struct {
 }
 
 type SubDomain struct {
+	TeamID        int    `json:"team_id" binding:"required"`
 	Lcuuid        string `json:"lcuuid" binding:"required"`
 	Name          string `json:"name" binding:"required"`
 	DisplayName   string `json:"display_name" binding:"required"`
@@ -343,6 +320,7 @@ type PodNode struct {
 	ServerType       int    `json:"server_type" binding:"required"`
 	State            int    `json:"state" binding:"required"`
 	IP               string `json:"ip" binding:"required"`
+	Hostname         string `json:"hostname"`
 	VCPUNum          int    `json:"vcpu_num"`
 	MemTotal         int    `json:"memory_total"`
 	PodClusterLcuuid string `json:"pod_cluster_lcuuid" binding:"required"`
@@ -369,6 +347,7 @@ type PodService struct {
 	Annotation         string `json:"annotation"`
 	Type               int    `json:"type" binding:"required"`
 	Selector           string `json:"selector"`
+	ExternalIP         string `json:"external_ip"`
 	ServiceClusterIP   string `json:"service_cluster_ip"`
 	PodIngressLcuuid   string `json:"pod_ingress_lcuuid"`
 	PodNamespaceLcuuid string `json:"pod_namespace_lcuuid" binding:"required"`
@@ -467,6 +446,7 @@ type Pod struct {
 	PodReplicaSetLcuuid string    `json:"pod_replica_set_lcuuid"`
 	PodNodeLcuuid       string    `json:"pod_node_lcuuid" binding:"required"`
 	PodGroupLcuuid      string    `json:"pod_group_lcuuid" binding:"required"`
+	PodServiceLcuuid    string    `json:"pod_service_lcuuid" binding:"required"`
 	PodNamespaceLcuuid  string    `json:"pod_namespace_lcuuid" binding:"required"`
 	PodClusterLcuuid    string    `json:"pod_cluster_lcuuid" binding:"required"`
 	VPCLcuuid           string    `json:"vpc_lcuuid" binding:"required"`
@@ -488,18 +468,6 @@ type Process struct {
 	NetnsID         uint32    `json:"netns_id"`
 	ContainerID     string    `json:"container_id"`
 	SubDomainLcuuid string    `json:"sub_domain_lcuuid"`
-}
-
-type PrometheusTarget struct {
-	Lcuuid            string `json:"lcuuid,omitempty" binding:"required"`
-	ScrapeURL         string `json:"scrape_url" binding:"required"`
-	Instance          string `json:"instance" binding:"required"`
-	Job               string `json:"job" binding:"required"`
-	OtherLabels       string `json:"other_labels" binding:"required"`
-	SubDomainLcuuid   string `json:"sub_domain_lcuuid,omitempty"`
-	PodClusterLcuuid  string `json:"pod_cluster_lcuuid" binding:"required"`
-	VPCLcuuid         string `json:"vpc_lcuuid,omitempty"`
-	HonorLabelsConfig bool   `json:"honor_labels_config" binding:"required"`
 }
 
 type SubDomainResource struct {
@@ -525,7 +493,6 @@ type SubDomainResource struct {
 	PodReplicaSets         []PodReplicaSet
 	Pods                   []Pod
 	Processes              []Process
-	PrometheusTargets      []PrometheusTarget
 }
 
 type Resource struct {
@@ -544,9 +511,6 @@ type Resource struct {
 	VRouters               []VRouter
 	RoutingTables          []RoutingTable
 	DHCPPorts              []DHCPPort
-	SecurityGroups         []SecurityGroup
-	SecurityGroupRules     []SecurityGroupRule
-	VMSecurityGroups       []VMSecurityGroup
 	NATGateways            []NATGateway
 	NATRules               []NATRule
 	NATVMConnections       []NATVMConnection
@@ -577,7 +541,6 @@ type Resource struct {
 	PodIngressRules        []PodIngressRule
 	PodIngressRuleBackends []PodIngressRuleBackend
 	Processes              []Process
-	PrometheusTargets      []PrometheusTarget
 	SubDomainResources     map[string]SubDomainResource
 }
 
@@ -606,12 +569,11 @@ type AdditionalSubdomainResource struct {
 }
 
 type BasicInfo struct {
-	Lcuuid          string        `json:"lcuuid"`
-	Name            string        `json:"name"`
-	PlatformType    string        `json:"platform_type"`
-	ErrorMsg        string        `json:"error_msg"`
-	Type            int           `json:"type"`
-	Interval        time.Duration `json:"interval"`
-	LastStartedAt   time.Time     `json:"last_started_at"`
-	LastCompletedAt time.Time     `json:"last_completed_at"`
+	OrgID     int       `json:"org_id"`
+	TeamID    int       `json:"team_id"`
+	Lcuuid    string    `json:"lcuuid"`
+	Name      string    `json:"name"`
+	Type      int       `json:"type"`
+	Interval  int       `json:"interval"`
+	CreatedAt time.Time `json:"created_at"`
 }

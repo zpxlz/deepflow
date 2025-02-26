@@ -20,22 +20,25 @@ import (
 	"sync"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/prometheus/cache"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 type metricTarget struct {
+	org           *common.ORG
 	lock          sync.Mutex
 	resourceType  string
 	metricTargets mapset.Set[cache.MetricTargetKey]
 	targetEncoder *target
 }
 
-func newMetricTarget(te *target) *metricTarget {
+func newMetricTarget(org *common.ORG, te *target) *metricTarget {
 	return &metricTarget{
+		org:           org,
 		resourceType:  "metric_target",
 		metricTargets: mapset.NewSet[cache.MetricTargetKey](),
 		targetEncoder: te,
@@ -43,8 +46,8 @@ func newMetricTarget(te *target) *metricTarget {
 }
 
 func (mt *metricTarget) refresh(args ...interface{}) error {
-	var items []*mysql.PrometheusMetricTarget
-	err := mysql.Db.Find(&items).Error
+	var items []*metadbmodel.PrometheusMetricTarget
+	err := mt.org.DB.Find(&items).Error
 	if err != nil {
 		return err
 	}
@@ -59,7 +62,7 @@ func (mt *metricTarget) encode(toAdd []*controller.PrometheusMetricTargetRequest
 	defer mt.lock.Unlock()
 
 	resp := make([]*controller.PrometheusMetricTarget, 0)
-	var dbToAdd []*mysql.PrometheusMetricTarget
+	var dbToAdd []*metadbmodel.PrometheusMetricTarget
 	for _, item := range toAdd {
 		mn := item.GetMetricName()
 		ti := int(item.GetTargetId())
@@ -74,16 +77,16 @@ func (mt *metricTarget) encode(toAdd []*controller.PrometheusMetricTargetRequest
 				})
 				continue
 			}
-			dbToAdd = append(dbToAdd, &mysql.PrometheusMetricTarget{
+			dbToAdd = append(dbToAdd, &metadbmodel.PrometheusMetricTarget{
 				MetricName: mn,
 				TargetID:   ti,
 			})
 		}
 	}
 
-	err := addBatch(dbToAdd, mt.resourceType)
+	err := addBatch(mt.org.DB, dbToAdd, mt.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", mt.resourceType, err.Error())
+		log.Errorf("add %s error: %s", mt.resourceType, err.Error(), mt.org.LogPrefix)
 		return resp, err
 	}
 	for _, item := range dbToAdd {

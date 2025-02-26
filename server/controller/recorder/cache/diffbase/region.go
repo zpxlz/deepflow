@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddRegion(dbItem *mysql.Region, seq int) {
+func (b *DataSet) AddRegion(dbItem *metadbmodel.Region, seq int) {
 	b.Regions[dbItem.Lcuuid] = &Region{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -31,12 +31,12 @@ func (b *DataSet) AddRegion(dbItem *mysql.Region, seq int) {
 		Name:  dbItem.Name,
 		Label: dbItem.Label,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_REGION_EN, b.Regions[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_REGION_EN, b.Regions[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteRegion(lcuuid string) {
 	delete(b.Regions, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_REGION_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_REGION_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type Region struct {

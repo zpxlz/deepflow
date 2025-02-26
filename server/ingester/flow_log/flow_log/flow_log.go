@@ -22,12 +22,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deepflowio/deepflow/server/ingester/flow_log/exporters"
-
+	logging "github.com/op/go-logging"
 	_ "golang.org/x/net/context"
 	_ "google.golang.org/grpc"
 
 	dropletqueue "github.com/deepflowio/deepflow/server/ingester/droplet/queue"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/common"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/config"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/dbwriter"
@@ -36,13 +36,13 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/throttler"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/ingester/ingesterctl"
+	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
 	"github.com/deepflowio/deepflow/server/libs/debug"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	libqueue "github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
-	logging "github.com/op/go-logging"
 )
 
 var log = logging.MustGetLogger("flow_log")
@@ -54,7 +54,11 @@ type FlowLog struct {
 	OtelLogger           *Logger
 	OtelCompressedLogger *Logger
 	L4PacketLogger       *Logger
+	SkyWalkingLogger     *Logger
+	DdogLogger           *Logger
 	Exporters            *exporters.Exporters
+	SpanWriter           *dbwriter.SpanWriter
+	TraceTreeWriter      *dbwriter.TraceTreeWriter
 }
 
 type Logger struct {
@@ -64,13 +68,11 @@ type Logger struct {
 	FlowLogWriter *dbwriter.FlowLogWriter
 }
 
-func NewFlowLog(config *config.Config, recv *receiver.Receiver, platformDataManager *grpc.PlatformDataManager) (*FlowLog, error) {
+func NewFlowLog(config *config.Config, traceTreeQueue *queue.OverwriteQueue, recv *receiver.Receiver, platformDataManager *grpc.PlatformDataManager, exporters *exporters.Exporters) (*FlowLog, error) {
 	manager := dropletqueue.NewManager(ingesterctl.INGESTERCTL_FLOW_LOG_QUEUE)
 
 	if config.Base.StorageDisabled {
-		exporters := exporters.NewExporters(config)
-
-		l7FlowLogger, err := NewL7FlowLogger(config, platformDataManager, manager, recv, nil, exporters)
+		l7FlowLogger, err := NewL7FlowLogger(config, platformDataManager, manager, recv, nil, exporters, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -83,28 +85,46 @@ func NewFlowLog(config *config.Config, recv *receiver.Receiver, platformDataMana
 	geo.NewGeoTree()
 
 	flowLogWriter, err := dbwriter.NewFlowLogWriter(
-		config.Base.CKDB.ActualAddrs, config.Base.CKDBAuth.Username, config.Base.CKDBAuth.Password,
-		config.Base.CKDB.ClusterName, config.Base.CKDB.StoragePolicy, config.Base.CKDB.TimeZone,
-		config.CKWriterConfig, config.FlowLogTTL, config.Base.GetCKDBColdStorages())
+		*config.Base.CKDB.ActualAddrs, config.Base.CKDBAuth.Username, config.Base.CKDBAuth.Password,
+		config.Base.CKDB.ClusterName, config.Base.CKDB.StoragePolicy, config.Base.CKDB.TimeZone, config.Base.CKDB.Type,
+		config.CKWriterConfig, config.FlowLogTTL, config.Base.GetCKDBColdStorages(), config.Base.CKDB.Watcher)
 	if err != nil {
 		return nil, err
 	}
-	l4FlowLogger := NewL4FlowLogger(config, platformDataManager, manager, recv, flowLogWriter)
 
-	exporters := exporters.NewExporters(config)
-	l7FlowLogger, err := NewL7FlowLogger(config, platformDataManager, manager, recv, flowLogWriter, exporters)
+	spanWriter, err := dbwriter.NewSpanWriter(config)
 	if err != nil {
 		return nil, err
 	}
-	otelLogger, err := NewLogger(datatype.MESSAGE_TYPE_OPENTELEMETRY, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, exporters)
+
+	traceTreeWriter, err := dbwriter.NewTraceTreeWriter(config, traceTreeQueue)
 	if err != nil {
 		return nil, err
 	}
-	otelCompressedLogger, err := NewLogger(datatype.MESSAGE_TYPE_OPENTELEMETRY_COMPRESSED, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, exporters)
+
+	l4FlowLogger := NewL4FlowLogger(config, platformDataManager, manager, recv, flowLogWriter, exporters)
+
+	l7FlowLogger, err := NewL7FlowLogger(config, platformDataManager, manager, recv, flowLogWriter, exporters, spanWriter)
 	if err != nil {
 		return nil, err
 	}
-	l4PacketLogger, err := NewLogger(datatype.MESSAGE_TYPE_PACKETSEQUENCE, config, nil, manager, recv, flowLogWriter, common.L4_PACKET_ID, nil)
+	otelLogger, err := NewLogger(datatype.MESSAGE_TYPE_OPENTELEMETRY, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, nil, spanWriter)
+	if err != nil {
+		return nil, err
+	}
+	otelCompressedLogger, err := NewLogger(datatype.MESSAGE_TYPE_OPENTELEMETRY_COMPRESSED, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, nil, spanWriter)
+	if err != nil {
+		return nil, err
+	}
+	l4PacketLogger, err := NewLogger(datatype.MESSAGE_TYPE_PACKETSEQUENCE, config, nil, manager, recv, flowLogWriter, common.L4_PACKET_ID, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	skywalkingLogger, err := NewLogger(datatype.MESSAGE_TYPE_SKYWALKING, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, nil, spanWriter)
+	if err != nil {
+		return nil, err
+	}
+	ddogLogger, err := NewLogger(datatype.MESSAGE_TYPE_DATADOG, config, platformDataManager, manager, recv, flowLogWriter, common.L7_FLOW_ID, nil, spanWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -115,11 +135,15 @@ func NewFlowLog(config *config.Config, recv *receiver.Receiver, platformDataMana
 		OtelLogger:           otelLogger,
 		OtelCompressedLogger: otelCompressedLogger,
 		L4PacketLogger:       l4PacketLogger,
+		SkyWalkingLogger:     skywalkingLogger,
+		DdogLogger:           ddogLogger,
 		Exporters:            exporters,
+		SpanWriter:           spanWriter,
+		TraceTreeWriter:      traceTreeWriter,
 	}, nil
 }
 
-func NewLogger(msgType datatype.MessageType, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter, flowLogId common.FlowLogID, exporters *exporters.Exporters) (*Logger, error) {
+func NewLogger(msgType datatype.MessageType, config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter, flowLogId common.FlowLogID, exporters *exporters.Exporters, spanWriter *dbwriter.SpanWriter) (*Logger, error) {
 	queueCount := config.DecoderQueueCount
 	decodeQueues := manager.NewQueues(
 		"1-receive-to-decode-"+datatype.MessageTypeString[msgType],
@@ -135,7 +159,11 @@ func NewLogger(msgType datatype.MessageType, config *config.Config, platformData
 	decoders := make([]*decoder.Decoder, queueCount)
 	platformDatas := make([]*grpc.PlatformInfoTable, queueCount)
 	for i := 0; i < queueCount; i++ {
-		flowTagWriter, err := flow_tag.NewFlowTagWriter(i, msgType.String(), common.FLOW_LOG_DB, config.FlowLogTTL.L7FlowLog, dbwriter.DefaultPartition, config.Base, &config.CKWriterConfig)
+		flowTagWriter, err := flow_tag.NewFlowTagWriter(i, msgType.String(), common.FLOW_LOG_DB, config.FlowLogTTL.L7FlowLog, ckdb.TimeFuncTwelveHour, config.Base, &config.CKWriterConfig)
+		if err != nil {
+			return nil, err
+		}
+		appServiceTagWriter, err := flow_tag.NewAppServiceTagWriter(i, common.FLOW_LOG_DB, msgType.String(), config.FlowLogTTL.L7FlowLog, ckdb.TimeFuncTwelveHour, config.Base)
 		if err != nil {
 			return nil, err
 		}
@@ -158,6 +186,8 @@ func NewLogger(msgType datatype.MessageType, config *config.Config, platformData
 			queue.QueueReader(decodeQueues.FixedMultiQueue[i]),
 			throttlers[i],
 			flowTagWriter,
+			appServiceTagWriter,
+			spanWriter,
 			exporters,
 			config,
 		)
@@ -170,7 +200,7 @@ func NewLogger(msgType datatype.MessageType, config *config.Config, platformData
 	}, nil
 }
 
-func NewL4FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter) *Logger {
+func NewL4FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter, exporters *exporters.Exporters) *Logger {
 	msgType := datatype.MESSAGE_TYPE_TAGGEDFLOW
 	queueCount := config.DecoderQueueCount
 	queueSuffix := "-l4"
@@ -210,8 +240,8 @@ func NewL4FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDa
 			platformDatas[i],
 			queue.QueueReader(decodeQueues.FixedMultiQueue[i]),
 			throttlers[i],
-			nil,
-			nil,
+			nil, nil, nil,
+			exporters,
 			config,
 		)
 	}
@@ -223,7 +253,7 @@ func NewL4FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDa
 	}
 }
 
-func NewL7FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter, exporters *exporters.Exporters) (*Logger, error) {
+func NewL7FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDataManager, manager *dropletqueue.Manager, recv *receiver.Receiver, flowLogWriter *dbwriter.FlowLogWriter, exporters *exporters.Exporters, spanWriter *dbwriter.SpanWriter) (*Logger, error) {
 	queueSuffix := "-l7"
 	queueCount := config.DecoderQueueCount
 	msgType := datatype.MESSAGE_TYPE_PROTOCOLLOG
@@ -248,10 +278,15 @@ func NewL7FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDa
 	platformDatas := make([]*grpc.PlatformInfoTable, queueCount)
 	decoders := make([]*decoder.Decoder, queueCount)
 	var flowTagWriter *flow_tag.FlowTagWriter
+	var appServiceTagWriter *flow_tag.AppServiceTagWriter
 	var err error
 	for i := 0; i < queueCount; i++ {
 		if flowLogWriter != nil {
-			flowTagWriter, err = flow_tag.NewFlowTagWriter(i, msgType.String(), common.FLOW_LOG_DB, config.FlowLogTTL.L7FlowLog, dbwriter.DefaultPartition, config.Base, &config.CKWriterConfig)
+			flowTagWriter, err = flow_tag.NewFlowTagWriter(i, msgType.String(), common.FLOW_LOG_DB, config.FlowLogTTL.L7FlowLog, ckdb.TimeFuncTwelveHour, config.Base, &config.CKWriterConfig)
+			if err != nil {
+				return nil, err
+			}
+			appServiceTagWriter, err = flow_tag.NewAppServiceTagWriter(i, common.FLOW_LOG_DB, msgType.String(), config.FlowLogTTL.L7FlowLog, ckdb.TimeFuncTwelveHour, config.Base)
 			if err != nil {
 				return nil, err
 			}
@@ -273,6 +308,8 @@ func NewL7FlowLogger(config *config.Config, platformDataManager *grpc.PlatformDa
 			queue.QueueReader(decodeQueues.FixedMultiQueue[i]),
 			throttlers[i],
 			flowTagWriter,
+			appServiceTagWriter,
+			spanWriter,
 			exporters,
 			config,
 		)
@@ -302,7 +339,6 @@ func (l *Logger) Start() {
 			platformData.Start()
 		}
 	}
-
 	for _, decoder := range l.Decoders {
 		go decoder.Run()
 	}
@@ -332,8 +368,17 @@ func (s *FlowLog) Start() {
 	if s.OtelCompressedLogger != nil {
 		s.OtelCompressedLogger.Start()
 	}
-	if s.Exporters != nil {
-		s.Exporters.Start()
+	if s.SkyWalkingLogger != nil {
+		s.SkyWalkingLogger.Start()
+	}
+	if s.DdogLogger != nil {
+		s.DdogLogger.Start()
+	}
+	if s.SpanWriter != nil {
+		s.SpanWriter.Start()
+	}
+	if s.TraceTreeWriter != nil {
+		s.TraceTreeWriter.Start()
 	}
 }
 
@@ -353,8 +398,17 @@ func (s *FlowLog) Close() error {
 	if s.OtelCompressedLogger != nil {
 		s.OtelCompressedLogger.Close()
 	}
-	if s.Exporters != nil {
-		s.Exporters.Close()
+	if s.SkyWalkingLogger != nil {
+		s.SkyWalkingLogger.Close()
+	}
+	if s.DdogLogger != nil {
+		s.DdogLogger.Close()
+	}
+	if s.SpanWriter != nil {
+		s.SpanWriter.Close()
+	}
+	if s.TraceTreeWriter != nil {
+		s.TraceTreeWriter.Close()
 	}
 	return nil
 }

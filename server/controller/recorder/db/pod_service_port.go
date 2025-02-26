@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type PodServicePort struct {
-	OperatorBase[mysql.PodServicePort]
+	OperatorBase[*metadbmodel.PodServicePort, metadbmodel.PodServicePort]
 }
 
 func NewPodServicePort() *PodServicePort {
 	return &PodServicePort{
-		OperatorBase[mysql.PodServicePort]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.PodServicePort](
+			ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_PORT_EN,
+			false,
+			false,
+		),
 	}
 }

@@ -23,9 +23,10 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkIdToLcuuid, zoneNameToAZLcuuid map[string]string) ([]model.RDSInstance, []model.VInterface, []model.IP, error) {
+func (b *BaiduBce) getRDSInstances(vpcIdToLcuuid, networkIdToLcuuid, zoneNameToAZLcuuid map[string]string) ([]model.RDSInstance, []model.VInterface, []model.IP, error) {
 	var retRDSInstances []model.RDSInstance
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
@@ -42,7 +43,7 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 		"Standard":  common.RDS_SERIES_HA,
 	}
 
-	log.Debug("get rds_instances starting")
+	log.Debug("get rds_instances starting", logger.NewORGPrefix(b.orgID))
 
 	rdsClient, _ := rds.NewClient(b.secretID, b.secretKey, "rds."+b.endpoint)
 	rdsClient.Config.ConnectionTimeoutInMillis = b.httpTimeout * 1000
@@ -54,7 +55,7 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 		startTime := time.Now()
 		result, err := rdsClient.ListRds(args)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(b.orgID))
 			return nil, nil, nil, err
 		}
 		b.cloudStatsd.RefreshAPIMoniter("ListRds", len(result.Instances), startTime)
@@ -70,21 +71,21 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 		for _, instance := range r.Instances {
 			rds, err := rdsClient.GetDetail(instance.InstanceId)
 			if err != nil {
-				log.Error(err)
+				log.Error(err, logger.NewORGPrefix(b.orgID))
 				return nil, nil, nil, err
 			}
 			vpcLcuuid, ok := vpcIdToLcuuid[rds.VpcId]
 			if !ok {
-				//log.Debugf("rds (%s) vpc (%s) not found", rds.InstanceId, rds.VpcId)
+				//log.Debugf("rds (%s) vpc (%s) not found", rds.InstanceId, rds.VpcId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			if len(rds.ZoneNames) == 0 {
-				log.Debugf("rds (%s) with no zones", rds.InstanceId)
+				log.Debugf("rds (%s) with no zones", rds.InstanceId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			azLcuuid, ok := zoneNameToAZLcuuid[rds.ZoneNames[0]]
 			if !ok {
-				log.Debugf("rds (%s) zone (%s) not found", rds.InstanceId, rds.ZoneNames[0])
+				log.Debugf("rds (%s) zone (%s) not found", rds.InstanceId, rds.ZoneNames[0], logger.NewORGPrefix(b.orgID))
 				continue
 			}
 
@@ -104,7 +105,7 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 				rdsEngine = common.RDS_UNKNOWN
 			}
 
-			rdsLcuuid := common.GenerateUUID(rds.InstanceId)
+			rdsLcuuid := common.GenerateUUIDByOrgID(b.orgID, rds.InstanceId)
 			retRDSInstances = append(retRDSInstances, model.RDSInstance{
 				Lcuuid:       rdsLcuuid,
 				Name:         rdsName,
@@ -116,24 +117,23 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 				Model:        common.RDS_MODEL_PRIMARY,
 				VPCLcuuid:    vpcLcuuid,
 				AZLcuuid:     azLcuuid,
-				RegionLcuuid: region.Lcuuid,
+				RegionLcuuid: b.regionLcuuid,
 			})
 			b.azLcuuidToResourceNum[azLcuuid]++
-			b.regionLcuuidToResourceNum[region.Lcuuid]++
 
 			if len(rds.Subnets) == 0 {
-				log.Debugf("rds (%s) with no subnets", rds.InstanceId)
+				log.Debugf("rds (%s) with no subnets", rds.InstanceId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 			networkLcuuid, ok := networkIdToLcuuid[rds.Subnets[0].SubnetId]
 			if !ok {
-				log.Debugf("rds (%s) network (%s) not found", rds.InstanceId, rds.Subnets[0].SubnetId)
+				log.Debugf("rds (%s) network (%s) not found", rds.InstanceId, rds.Subnets[0].SubnetId, logger.NewORGPrefix(b.orgID))
 				continue
 			}
 
 			// 内网接口 + IP
 			if rds.Endpoint.VnetIp != "" {
-				vinterfaceLcuuid := common.GenerateUUID(rdsLcuuid + rds.Endpoint.VnetIp)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, rdsLcuuid+rds.Endpoint.VnetIp)
 				retVInterfaces = append(retVInterfaces, model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.VIF_TYPE_LAN,
@@ -142,20 +142,20 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 					DeviceType:    common.VIF_DEVICE_TYPE_RDS_INSTANCE,
 					NetworkLcuuid: networkLcuuid,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  region.Lcuuid,
+					RegionLcuuid:  b.regionLcuuid,
 				})
 				retIPs = append(retIPs, model.IP{
-					Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + rds.Endpoint.VnetIp),
+					Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+rds.Endpoint.VnetIp),
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               rds.Endpoint.VnetIp,
-					SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-					RegionLcuuid:     region.Lcuuid,
+					SubnetLcuuid:     common.GenerateUUIDByOrgID(b.orgID, networkLcuuid),
+					RegionLcuuid:     b.regionLcuuid,
 				})
 			}
 
 			// 公网接口 + IP
 			if rds.Endpoint.InetIp != "" {
-				vinterfaceLcuuid := common.GenerateUUID(rdsLcuuid + rds.Endpoint.InetIp)
+				vinterfaceLcuuid := common.GenerateUUIDByOrgID(b.orgID, rdsLcuuid+rds.Endpoint.InetIp)
 				retVInterfaces = append(retVInterfaces, model.VInterface{
 					Lcuuid:        vinterfaceLcuuid,
 					Type:          common.VIF_TYPE_WAN,
@@ -164,17 +164,17 @@ func (b *BaiduBce) getRDSInstances(region model.Region, vpcIdToLcuuid, networkId
 					DeviceType:    common.VIF_DEVICE_TYPE_RDS_INSTANCE,
 					NetworkLcuuid: common.NETWORK_ISP_LCUUID,
 					VPCLcuuid:     vpcLcuuid,
-					RegionLcuuid:  region.Lcuuid,
+					RegionLcuuid:  b.regionLcuuid,
 				})
 				retIPs = append(retIPs, model.IP{
-					Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + rds.Endpoint.InetIp),
+					Lcuuid:           common.GenerateUUIDByOrgID(b.orgID, vinterfaceLcuuid+rds.Endpoint.InetIp),
 					VInterfaceLcuuid: vinterfaceLcuuid,
 					IP:               rds.Endpoint.InetIp,
-					RegionLcuuid:     region.Lcuuid,
+					RegionLcuuid:     b.regionLcuuid,
 				})
 			}
 		}
 	}
-	log.Debug("get rds_instances complete")
+	log.Debug("get rds_instances complete", logger.NewORGPrefix(b.orgID))
 	return retRDSInstances, retVInterfaces, retIPs, nil
 }

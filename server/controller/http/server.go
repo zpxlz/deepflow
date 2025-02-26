@@ -24,13 +24,17 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/op/go-logging"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/http/appender"
 	"github.com/deepflowio/deepflow/server/controller/http/common/registrant"
 	"github.com/deepflowio/deepflow/server/controller/http/router"
+	"github.com/deepflowio/deepflow/server/controller/http/router/agent"
 	"github.com/deepflowio/deepflow/server/controller/http/router/resource"
+	"github.com/deepflowio/deepflow/server/controller/http/router/vtap"
 	"github.com/deepflowio/deepflow/server/controller/manager"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
 	trouter "github.com/deepflowio/deepflow/server/controller/trisolaris/server/http"
@@ -58,6 +62,13 @@ func NewServer(logFile string, cfg *config.ControllerConfig) *Server {
 	g := gin.New()
 	g.Use(gin.Recovery())
 	g.Use(gin.LoggerWithFormatter(logger.GinLogFormat))
+	// set custom middleware
+	g.Use(HandleORGIDMiddleware())
+
+	appender.SetSwaggerConfig(cfg)
+	if cfg.SwaggerCfg.Enabled {
+		g.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	}
 	s.engine = g
 	return s
 }
@@ -94,6 +105,10 @@ func (s *Server) RegisterRouters() {
 		i.RegisterTo(s.engine)
 	}
 	trouter.RegisterTo(s.engine)
+
+	for _, route := range s.engine.Routes() {
+		log.Infof(" TODO method: %s, path: %s", route.Method, route.Path)
+	}
 }
 
 func (s *Server) appendRegistrant() []registrant.Registrant {
@@ -106,14 +121,22 @@ func (s *Server) appendRegistrant() []registrant.Registrant {
 		router.NewVtap(s.controllerConfig),
 		router.NewVtapGroup(s.controllerConfig),
 		router.NewDataSource(s.controllerConfig),
-		router.NewVTapGroupConfig(),
-		router.NewVTapInterface(),
+		router.NewVTapGroupConfig(s.controllerConfig),
+		router.NewVTapInterface(s.controllerConfig.FPermit),
 		router.NewVtapRepo(),
 		router.NewPlugin(),
 		router.NewMail(),
+		router.NewDatabase(s.controllerConfig),
+		router.NewAgentGroupConfig(s.controllerConfig),
+
+		// icon
+		router.NewIcon(s.controllerConfig),
 
 		// resource
 		resource.NewDomain(s.controllerConfig),
+
+		agent.NewAgentCMD(s.controllerConfig),
+		vtap.NewAgentCMD(s.controllerConfig), // TODO remove
 	}
 
 	// appends routers supported in CE or EE

@@ -30,7 +30,35 @@ const (
 )
 
 const (
-	TAP_PORT_HOST     = "tap_port_host"
-	TAP_PORT_CHOST    = "tap_port_chost"
-	TAP_PORT_POD_NODE = "tap_port_pod_node"
+	HOST_HOSTNAME     = "host_hostname"
+	HOST_IP           = "host_ip"
+	CHOST_HOSTNAME    = "chost_hostname"
+	CHOST_IP          = "chost_ip"
+	POD_NODE_HOSTNAME = "pod_node_hostname"
+	POD_NODE_IP       = "pod_node_ip"
+
+	TAP_PORT_HOST        = "tap_port_host"
+	TAP_PORT_CHOST       = "tap_port_chost"
+	TAP_PORT_POD_NODE    = "tap_port_pod_node"
+	CAPTURE_NIC_HOST     = "capture_nic_host"
+	CAPTURE_NIC_CHOST    = "capture_nic_chost"
+	CAPTURE_NIC_POD_NODE = "capture_nic_pod_node"
 )
+
+const (
+	HEADER_KEY_LANGUAGE = "X-Language"
+	HEADER_KEY_X_ORG_ID = "X-Org-Id"
+	DEFAULT_ORG_ID      = "1"
+)
+
+const NO_LIMIT = "-1"
+
+var PEER_TABLES = []string{"l4_flow_log", "l7_flow_log", "application_map", "network_map", "vtap_flow_edge_port", "vtap_app_edge_port"}
+
+var TRANS_MAP_ITEM_TAG = map[string]string{
+	"k8s.label.":      "k8s_label",
+	"k8s.annotation.": "k8s_annotation",
+	"k8s.env.":        "k8s_env",
+	"cloud.tag.":      "cloud_tag",
+	"os.app.":         "os_app",
+}

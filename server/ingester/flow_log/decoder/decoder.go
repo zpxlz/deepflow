@@ -28,9 +28,15 @@ import (
 	v1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
+	exportcommon "github.com/deepflowio/deepflow/server/ingester/exporters/common"
+	exportconfig "github.com/deepflowio/deepflow/server/ingester/exporters/config"
+	flowlogcommon "github.com/deepflowio/deepflow/server/ingester/flow_log/common"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/config"
-	"github.com/deepflowio/deepflow/server/ingester/flow_log/exporters"
+	"github.com/deepflowio/deepflow/server/ingester/flow_log/dbwriter"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/log_data"
+	"github.com/deepflowio/deepflow/server/ingester/flow_log/log_data/dd_import"
+	"github.com/deepflowio/deepflow/server/ingester/flow_log/log_data/sw_import"
 	"github.com/deepflowio/deepflow/server/ingester/flow_log/throttler"
 	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/codec"
@@ -73,15 +79,21 @@ type Counter struct {
 }
 
 type Decoder struct {
-	index         int
-	msgType       datatype.MessageType
-	platformData  *grpc.PlatformInfoTable
-	inQueue       queue.QueueReader
-	throttler     *throttler.ThrottlingQueue
-	flowTagWriter *flow_tag.FlowTagWriter
-	exporters     *exporters.Exporters
-	cfg           *config.Config
-	debugEnabled  bool
+	index               int
+	msgType             datatype.MessageType
+	dataSourceID        uint32
+	platformData        *grpc.PlatformInfoTable
+	inQueue             queue.QueueReader
+	throttler           *throttler.ThrottlingQueue
+	flowTagWriter       *flow_tag.FlowTagWriter
+	appServiceTagWriter *flow_tag.AppServiceTagWriter
+	spanWriter          *dbwriter.SpanWriter
+	spanBuf             []interface{}
+	exporters           *exporters.Exporters
+	cfg                 *config.Config
+	debugEnabled        bool
+
+	agentId, orgId, teamId uint16
 
 	fieldsBuf      []interface{}
 	fieldValuesBuf []interface{}
@@ -96,22 +108,28 @@ func NewDecoder(
 	inQueue queue.QueueReader,
 	throttler *throttler.ThrottlingQueue,
 	flowTagWriter *flow_tag.FlowTagWriter,
+	appServiceTagWriter *flow_tag.AppServiceTagWriter,
+	spanWriter *dbwriter.SpanWriter,
 	exporters *exporters.Exporters,
 	cfg *config.Config,
 ) *Decoder {
 	return &Decoder{
-		index:          index,
-		msgType:        msgType,
-		platformData:   platformData,
-		inQueue:        inQueue,
-		throttler:      throttler,
-		flowTagWriter:  flowTagWriter,
-		exporters:      exporters,
-		cfg:            cfg,
-		debugEnabled:   log.IsEnabledFor(logging.DEBUG),
-		fieldsBuf:      make([]interface{}, 0, 64),
-		fieldValuesBuf: make([]interface{}, 0, 64),
-		counter:        &Counter{},
+		index:               index,
+		msgType:             msgType,
+		dataSourceID:        exportconfig.FlowLogMessageToDataSourceID(msgType),
+		platformData:        platformData,
+		inQueue:             inQueue,
+		throttler:           throttler,
+		flowTagWriter:       flowTagWriter,
+		appServiceTagWriter: appServiceTagWriter,
+		spanWriter:          spanWriter,
+		spanBuf:             make([]interface{}, 0, BUFFER_SIZE),
+		exporters:           exporters,
+		cfg:                 cfg,
+		debugEnabled:        log.IsEnabledFor(logging.DEBUG),
+		fieldsBuf:           make([]interface{}, 0, 64),
+		fieldValuesBuf:      make([]interface{}, 0, 64),
+		counter:             &Counter{},
 	}
 }
 
@@ -137,6 +155,7 @@ func (d *Decoder) Run() {
 	decoder := &codec.SimpleDecoder{}
 	pbTaggedFlow := pb.NewTaggedFlow()
 	pbTracesData := &v1.TracesData{}
+	pbThirdPartyTrace := &pb.ThirdPartyTrace{}
 	for {
 		n := d.inQueue.Gets(buffer)
 		start := time.Now()
@@ -151,18 +170,24 @@ func (d *Decoder) Run() {
 				log.Warning("get decode queue data type wrong")
 				continue
 			}
+
 			decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
+			d.agentId, d.orgId, d.teamId = recvBytes.VtapID, uint16(recvBytes.OrgID), uint16(recvBytes.TeamID)
 			switch d.msgType {
 			case datatype.MESSAGE_TYPE_PROTOCOLLOG:
 				d.handleProtoLog(decoder)
 			case datatype.MESSAGE_TYPE_TAGGEDFLOW:
 				d.handleTaggedFlow(decoder, pbTaggedFlow)
 			case datatype.MESSAGE_TYPE_OPENTELEMETRY:
-				d.handleOpenTelemetry(recvBytes.VtapID, decoder, pbTracesData, false)
+				d.handleOpenTelemetry(decoder, pbTracesData, false)
 			case datatype.MESSAGE_TYPE_OPENTELEMETRY_COMPRESSED:
-				d.handleOpenTelemetry(recvBytes.VtapID, decoder, pbTracesData, true)
+				d.handleOpenTelemetry(decoder, pbTracesData, true)
 			case datatype.MESSAGE_TYPE_PACKETSEQUENCE:
-				d.handleL4Packet(recvBytes.VtapID, decoder)
+				d.handleL4Packet(decoder)
+			case datatype.MESSAGE_TYPE_SKYWALKING:
+				d.handleSkyWalking(decoder, pbThirdPartyTrace, false)
+			case datatype.MESSAGE_TYPE_DATADOG:
+				d.handleDatadog(decoder, pbThirdPartyTrace, false)
 			default:
 				log.Warningf("unknown msg type: %d", d.msgType)
 
@@ -216,7 +241,7 @@ func decompressOpenTelemetry(compressed []byte) ([]byte, error) {
 	return ioutil.ReadAll(reader)
 }
 
-func (d *Decoder) handleOpenTelemetry(vtapID uint16, decoder *codec.SimpleDecoder, pbTracesData *v1.TracesData, compressed bool) {
+func (d *Decoder) handleOpenTelemetry(decoder *codec.SimpleDecoder, pbTracesData *v1.TracesData, compressed bool) {
 	var err error
 	for !decoder.IsEnd() {
 		pbTracesData.Reset()
@@ -236,16 +261,16 @@ func (d *Decoder) handleOpenTelemetry(vtapID uint16, decoder *codec.SimpleDecode
 			d.counter.ErrorCount++
 			return
 		}
-		d.sendOpenMetetry(vtapID, pbTracesData)
+		d.sendOpenMetetry(pbTracesData)
 	}
 }
 
-func (d *Decoder) sendOpenMetetry(vtapID uint16, tracesData *v1.TracesData) {
+func (d *Decoder) sendOpenMetetry(tracesData *v1.TracesData) {
 	if d.debugEnabled {
-		log.Debugf("decoder %d vtap %d recv otel: %s", d.index, vtapID, tracesData)
+		log.Debugf("decoder %d vtap %d recv otel: %s", d.index, d.agentId, tracesData)
 	}
 	d.counter.Count++
-	ls := log_data.OTelTracesDataToL7FlowLogs(vtapID, tracesData, d.platformData, d.cfg)
+	ls := log_data.OTelTracesDataToL7FlowLogs(d.agentId, d.orgId, d.teamId, tracesData, d.platformData, d.cfg)
 	for _, l := range ls {
 		l.AddReferenceCount()
 		if !d.throttler.SendWithThrottling(l) {
@@ -254,15 +279,114 @@ func (d *Decoder) sendOpenMetetry(vtapID uint16, tracesData *v1.TracesData) {
 			d.fieldsBuf, d.fieldValuesBuf = d.fieldsBuf[:0], d.fieldValuesBuf[:0]
 			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
 			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
-			d.export(l)
+			d.appServiceTagWrite(l)
+			d.spanWrite(l)
 		}
 		l.Release()
 	}
 }
 
-func (d *Decoder) handleL4Packet(vtapID uint16, decoder *codec.SimpleDecoder) {
+func (d *Decoder) handleSkyWalking(decoder *codec.SimpleDecoder, pbThirdPartyTrace *pb.ThirdPartyTrace, compressed bool) {
+	var err error
+	buffer := log_data.GetBuffer()
 	for !decoder.IsEnd() {
-		l4Packet, err := log_data.DecodePacketSequence(decoder, vtapID)
+		pbThirdPartyTrace.Reset()
+		pbThirdPartyTrace.Data = buffer.Bytes()
+		bytes := decoder.ReadBytes()
+		if len(bytes) > 0 {
+			// universal compression
+			if compressed {
+				bytes, err = decompressOpenTelemetry(bytes)
+			}
+			if err == nil {
+				err = proto.Unmarshal(bytes, pbThirdPartyTrace)
+			}
+		}
+		if decoder.Failed() || err != nil {
+			if d.counter.ErrorCount == 0 {
+				log.Errorf("skywalking data decode failed, offset=%d len=%d err: %s", decoder.Offset(), len(decoder.Bytes()), err)
+			}
+			d.counter.ErrorCount++
+			continue
+		}
+		d.sendSkyWalking(pbThirdPartyTrace.Data, pbThirdPartyTrace.PeerIp, pbThirdPartyTrace.Uri)
+		log_data.PutBuffer(buffer)
+	}
+}
+
+func (d *Decoder) sendSkyWalking(segmentData, peerIP []byte, uri string) {
+	if d.debugEnabled {
+		log.Debugf("decoder %d vtap %d recv skywalking data length: %d", d.index, d.agentId, len(segmentData))
+	}
+	d.counter.Count++
+	ls := sw_import.SkyWalkingDataToL7FlowLogs(d.agentId, d.orgId, d.teamId, segmentData, peerIP, uri, d.platformData, d.cfg)
+	for _, l := range ls {
+		l.AddReferenceCount()
+		if !d.throttler.SendWithThrottling(l) {
+			d.counter.DropCount++
+		} else {
+			d.fieldsBuf, d.fieldValuesBuf = d.fieldsBuf[:0], d.fieldValuesBuf[:0]
+			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
+			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
+			d.appServiceTagWrite(l)
+			d.spanWrite(l)
+		}
+		l.Release()
+	}
+}
+
+func (d *Decoder) handleDatadog(decoder *codec.SimpleDecoder, pbThirdPartyTrace *pb.ThirdPartyTrace, compressed bool) {
+	var err error
+	buffer := log_data.GetBuffer()
+	for !decoder.IsEnd() {
+		pbThirdPartyTrace.Reset()
+		pbThirdPartyTrace.Data = buffer.Bytes()
+		bytes := decoder.ReadBytes()
+		if len(bytes) > 0 {
+			// universal compression
+			if compressed {
+				bytes, err = decompressOpenTelemetry(bytes)
+			}
+			if err == nil {
+				err = proto.Unmarshal(bytes, pbThirdPartyTrace)
+			}
+		}
+		if decoder.Failed() || err != nil {
+			if d.counter.ErrorCount == 0 {
+				log.Errorf("datadog data decode failed, offset=%d len=%d err: %s", decoder.Offset(), len(decoder.Bytes()), err)
+			}
+			d.counter.ErrorCount++
+			continue
+		}
+		d.sendDatadog(pbThirdPartyTrace)
+		log_data.PutBuffer(buffer)
+	}
+}
+
+func (d *Decoder) sendDatadog(ddogData *pb.ThirdPartyTrace) {
+	if d.debugEnabled {
+		log.Debugf("decoder %d vtap %d recv datadog data length: %d", d.index, d.agentId, len(ddogData.Data))
+	}
+	d.counter.Count++
+	ls := dd_import.DDogDataToL7FlowLogs(d.agentId, d.orgId, d.teamId, ddogData, d.platformData, d.cfg)
+	for _, l := range ls {
+		l.AddReferenceCount()
+		if !d.throttler.SendWithThrottling(l) {
+			d.counter.DropCount++
+		} else {
+			d.fieldsBuf, d.fieldValuesBuf = d.fieldsBuf[:0], d.fieldValuesBuf[:0]
+			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
+			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
+			d.appServiceTagWrite(l)
+			d.spanWrite(l)
+		}
+		l.Release()
+	}
+}
+
+func (d *Decoder) handleL4Packet(decoder *codec.SimpleDecoder) {
+	for !decoder.IsEnd() {
+		l4Packet, err := log_data.DecodePacketSequence(d.agentId, d.orgId, d.teamId, decoder)
 		if decoder.Failed() || err != nil {
 			if d.counter.ErrorCount == 0 {
 				log.Errorf("packet sequence decode failed, offset=%d len=%d, err: %s", decoder.Offset(), len(decoder.Bytes()), err)
@@ -273,7 +397,7 @@ func (d *Decoder) handleL4Packet(vtapID uint16, decoder *codec.SimpleDecoder) {
 		}
 
 		if d.debugEnabled {
-			log.Debugf("decoder %d vtap %d recv l4 packet: %s", d.index, vtapID, l4Packet)
+			log.Debugf("decoder %d vtap %d recv l4 packet: %s", d.index, d.agentId, l4Packet)
 		}
 		d.counter.Count++
 		d.throttler.SendWithoutThrottling(l4Packet)
@@ -285,21 +409,61 @@ func (d *Decoder) sendFlow(flow *pb.TaggedFlow) {
 		log.Debugf("decoder %d recv flow: %s", d.index, flow)
 	}
 	d.counter.Count++
-	l := log_data.TaggedFlowToL4FlowLog(flow, d.platformData)
+	l := log_data.TaggedFlowToL4FlowLog(d.orgId, d.teamId, flow, d.platformData)
 
 	if l.HitPcapPolicy() {
+		d.export(l)
 		d.throttler.SendWithoutThrottling(l)
 	} else {
+		l.AddReferenceCount()
 		if !d.throttler.SendWithThrottling(l) {
 			d.counter.DropCount++
+		} else {
+			d.export(l)
+		}
+		l.Release()
+	}
+}
+
+func (d *Decoder) export(l exportcommon.ExportItem) {
+	if d.exporters != nil {
+		d.exporters.Put(d.dataSourceID, d.index, l)
+	}
+}
+
+func (d *Decoder) spanWrite(l *log_data.L7FlowLog) {
+	if d.spanWriter == nil {
+		return
+	}
+
+	if l == nil {
+		if len(d.spanBuf) == 0 {
+			return
+		}
+		d.spanWriter.Put(d.spanBuf)
+		d.spanBuf = d.spanBuf[:0]
+		return
+	}
+
+	if (l.SignalSource == uint16(datatype.SIGNAL_SOURCE_EBPF) ||
+		l.SignalSource == uint16(datatype.SIGNAL_SOURCE_OTEL)) && l.TraceId != "" {
+		l.AddReferenceCount()
+		d.spanBuf = append(d.spanBuf, (*dbwriter.SpanWithTraceID)(l))
+		if len(d.spanBuf) >= BUFFER_SIZE {
+			d.spanWriter.Put(d.spanBuf)
+			d.spanBuf = d.spanBuf[:0]
 		}
 	}
 }
 
-func (d *Decoder) export(l *log_data.L7FlowLog) {
-	if d.exporters != nil {
-		d.exporters.Put(l, d.index)
+func (d *Decoder) appServiceTagWrite(l *log_data.L7FlowLog) {
+	if d.appServiceTagWriter == nil {
+		return
 	}
+	if l.AppService == "" && l.AppInstance == "" {
+		return
+	}
+	d.appServiceTagWriter.Write(l.Time, flowlogcommon.L7_FLOW_ID.String(), l.AppService, l.AppInstance, l.OrgId, l.TeamID)
 }
 
 func (d *Decoder) sendProto(proto *pb.AppProtoLogsData) {
@@ -307,7 +471,7 @@ func (d *Decoder) sendProto(proto *pb.AppProtoLogsData) {
 		log.Debugf("decoder %d recv proto: %s", d.index, proto)
 	}
 
-	l := log_data.ProtoLogToL7FlowLog(proto, d.platformData, d.cfg)
+	l := log_data.ProtoLogToL7FlowLog(d.orgId, d.teamId, proto, d.platformData, d.cfg)
 	l.AddReferenceCount()
 	sent := d.throttler.SendWithThrottling(l)
 	if sent {
@@ -316,7 +480,9 @@ func (d *Decoder) sendProto(proto *pb.AppProtoLogsData) {
 			l.GenerateNewFlowTags(d.flowTagWriter.Cache)
 			d.flowTagWriter.WriteFieldsAndFieldValuesInCache()
 		}
+		d.appServiceTagWrite(l)
 		d.export(l)
+		d.spanWrite(l)
 	}
 	d.updateCounter(datatype.L7Protocol(proto.Base.Head.Proto), !sent)
 	l.Release()
@@ -359,4 +525,7 @@ func (d *Decoder) flush() {
 		d.throttler.SendWithoutThrottling(nil)
 	}
 	d.export(nil)
+	if d.spanWriter != nil {
+		d.spanWrite(nil)
+	}
 }

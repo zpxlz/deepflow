@@ -17,36 +17,36 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChPrometheusLabelName struct {
-	UpdaterBase[mysql.ChPrometheusLabelName, IDKey]
+	UpdaterComponent[metadbmodel.ChPrometheusLabelName, IDKey]
 }
 
 func NewChPrometheusLabelName() *ChPrometheusLabelName {
 	updater := &ChPrometheusLabelName{
-		UpdaterBase[mysql.ChPrometheusLabelName, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_LABEL_NAME,
-		},
+		newUpdaterComponent[metadbmodel.ChPrometheusLabelName, IDKey](
+			RESOURCE_TYPE_CH_LABEL_NAME,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (l *ChPrometheusLabelName) generateNewData() (map[IDKey]mysql.ChPrometheusLabelName, bool) {
-	var prometheusLabelName []mysql.PrometheusLabelName
-
-	err := mysql.Db.Unscoped().Find(&prometheusLabelName).Error
+func (l *ChPrometheusLabelName) generateNewData(db *metadb.DB) (map[IDKey]metadbmodel.ChPrometheusLabelName, bool) {
+	var prometheusLabelName []metadbmodel.PrometheusLabelName
+	err := db.Unscoped().Find(&prometheusLabelName).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChPrometheusLabelName)
+	keyToItem := make(map[IDKey]metadbmodel.ChPrometheusLabelName)
 	for _, labelName := range prometheusLabelName {
-		keyToItem[IDKey{ID: labelName.ID}] = mysql.ChPrometheusLabelName{
+		keyToItem[IDKey{ID: labelName.ID}] = metadbmodel.ChPrometheusLabelName{
 			ID:   labelName.ID,
 			Name: labelName.Name,
 		}
@@ -54,11 +54,11 @@ func (l *ChPrometheusLabelName) generateNewData() (map[IDKey]mysql.ChPrometheusL
 	return keyToItem, true
 }
 
-func (l *ChPrometheusLabelName) generateKey(dbItem mysql.ChPrometheusLabelName) IDKey {
+func (l *ChPrometheusLabelName) generateKey(dbItem metadbmodel.ChPrometheusLabelName) IDKey {
 	return IDKey{ID: dbItem.ID}
 }
 
-func (l *ChPrometheusLabelName) generateUpdateInfo(oldItem, newItem mysql.ChPrometheusLabelName) (map[string]interface{}, bool) {
+func (l *ChPrometheusLabelName) generateUpdateInfo(oldItem, newItem metadbmodel.ChPrometheusLabelName) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.Name != newItem.Name {
 		updateInfo["name"] = newItem.Name

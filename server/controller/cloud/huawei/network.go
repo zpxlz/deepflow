@@ -22,6 +22,7 @@ import (
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterface, error) {
@@ -41,13 +42,13 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 		regionLcuuid := h.projectNameToRegionLcuuid(project.name)
 		for i := range jNetworks {
 			jn := jNetworks[i]
-			id := jn.Get("id").MustString()
+			id := common.IDGenerateUUID(h.orgID, jn.Get("id").MustString())
 			name := jn.Get("name").MustString()
 			if !cloudcommon.CheckJsonAttributes(jn, requiredAttrs) {
-				log.Infof("exclude network: %s, missing attr", name)
+				log.Infof("exclude network: %s, missing attr", name, logger.NewORGPrefix(h.orgID))
 				continue
 			}
-			vpcID := jn.Get("vpc_id").MustString()
+			vpcID := common.IDGenerateUUID(h.orgID, jn.Get("vpc_id").MustString())
 			azLcuuid := h.toolDataSet.azNameToAZLcuuid[jn.Get("availability_zone").MustString()]
 			network := model.Network{
 				Lcuuid:         id,
@@ -67,7 +68,7 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 
 			cidr := jn.Get("cidr").MustString()
 			if cidr != "" {
-				subnetLcuuid := common.GenerateUUID(id + cidr)
+				subnetLcuuid := common.GenerateUUIDByOrgID(h.orgID, id+cidr)
 				subnet := model.Subnet{
 					Lcuuid:        subnetLcuuid,
 					Name:          name,
@@ -80,7 +81,7 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 			}
 			cidrV6 := jn.Get("cidr_v6").MustString()
 			if cidrV6 != "" {
-				subnetLcuuid := common.GenerateUUID(id + cidrV6)
+				subnetLcuuid := common.GenerateUUIDByOrgID(h.orgID, id+cidrV6)
 				subnet := model.Subnet{
 					Lcuuid:        subnetLcuuid,
 					Name:          name + "_v6",
@@ -95,11 +96,11 @@ func (h *HuaWei) getNetworks() ([]model.Network, []model.Subnet, []model.VInterf
 			vifs = append(
 				vifs,
 				model.VInterface{
-					Lcuuid:        common.GenerateUUID(id + vpcID),
+					Lcuuid:        common.GenerateUUIDByOrgID(h.orgID, id+vpcID),
 					Type:          common.VIF_TYPE_LAN,
 					Mac:           common.VIF_DEFAULT_MAC,
 					DeviceType:    common.VIF_DEVICE_TYPE_VROUTER,
-					DeviceLcuuid:  common.GenerateUUID(vpcID),
+					DeviceLcuuid:  common.GenerateUUIDByOrgID(h.orgID, vpcID),
 					NetworkLcuuid: id,
 					VPCLcuuid:     vpcID,
 					RegionLcuuid:  regionLcuuid,

@@ -33,7 +33,7 @@ use crate::common::l7_protocol_info::L7ProtocolInfo;
 use crate::common::l7_protocol_log::{EbpfParam, L7PerfCache};
 
 use crate::config::handler::LogParserConfig;
-use crate::config::OracleParseConfig;
+use crate::config::OracleConfig;
 use crate::flow_generator::protocol_logs::pb_adapter::L7ProtocolSendLog;
 use crate::flow_generator::protocol_logs::{get_wasm_parser, L7ResponseStatus, WasmLog};
 use crate::{
@@ -60,9 +60,10 @@ fn get_req_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345678,
         parse_perf: true,
         parse_log: true,
@@ -74,7 +75,9 @@ fn get_req_param<'a>(
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 999,
+        oracle_parse_conf: OracleConfig::default(),
+        icmp_data: None,
     }
 }
 
@@ -96,9 +99,10 @@ fn get_resq_param<'a>(
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
-            process_kname: "test_wasm".to_string(),
+            process_kname: "test_wasm",
         }),
-        packet_seq: 9999999,
+        packet_start_seq: 9999999,
+        packet_end_seq: 9999999,
         time: 12345678,
         parse_perf: true,
         parse_log: true,
@@ -110,7 +114,9 @@ fn get_resq_param<'a>(
         stats_counter: None,
         rrt_timeout: Duration::from_secs(10).as_micros() as usize,
         buf_size: 999,
-        oracle_parse_conf: OracleParseConfig::default(),
+        captured_byte: 999,
+        oracle_parse_conf: OracleConfig::default(),
+        icmp_data: None,
     }
 }
 
@@ -166,9 +172,8 @@ fn test_wasm_http_req() {
         );
 
         assert_eq!(i.req.domain.as_str(), "rewrite domain");
-        assert_eq!(i.req.req_type.as_str(), "rewrite req type");
         assert_eq!(i.req.resource.as_str(), "rewrite resource");
-        assert_eq!(i.req.endpoint.as_str(), "rewrite endpoint");
+        assert_eq!(i.req.endpoint.as_str(), "/rewrite endpoint");
 
         let attr = i.ext_info.unwrap().attributes.unwrap();
 

@@ -21,22 +21,25 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getAZ() (model.AZ, error) {
-	log.Debug("get az starting")
-	azLcuuid := common.GetUUID(common.DEFAULT_REGION_NAME, uuid.Nil)
+	log.Debug("get az starting", logger.NewORGPrefix(g.orgID))
+	azName := common.DEFAULT_REGION_NAME
+	if g.regionLcuuid != common.DEFAULT_REGION {
+		azName = g.Name
+	}
+	azLcuuid := common.GetUUIDByOrgID(g.orgID, azName)
 
 	g.cloudStatsd.RefreshAPIMoniter("az", 0, time.Time{})
 
 	az := model.AZ{
 		Lcuuid:       azLcuuid,
-		RegionLcuuid: g.regionUuid,
-		Name:         common.DEFAULT_REGION_NAME,
+		RegionLcuuid: g.regionLcuuid,
+		Name:         azName,
 	}
 	g.azLcuuid = azLcuuid
-	log.Debug("get az complete")
+	log.Debug("get az complete", logger.NewORGPrefix(g.orgID))
 	return az, nil
 }

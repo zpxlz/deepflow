@@ -18,7 +18,7 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
@@ -33,7 +33,7 @@ func NewVPC(c *cache.Cache) *VPC {
 	}
 }
 
-func (v *VPC) OnUpdaterAdded(addedDBItems []*mysql.VPC) {
+func (v *VPC) OnUpdaterAdded(addedDBItems []*metadbmodel.VPC) {
 	v.cache.AddVPCs(addedDBItems)
 }
 

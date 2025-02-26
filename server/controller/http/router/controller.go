@@ -17,13 +17,17 @@
 package router
 
 import (
+	"fmt"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/election"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/router/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
+	routercommon "github.com/deepflowio/deepflow/server/controller/http/router/common"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
@@ -32,6 +36,8 @@ import (
 type Controller struct {
 	cfg *config.ControllerConfig
 	cc  *monitor.ControllerCheck
+
+	middlewares []gin.HandlerFunc
 }
 
 func NewController(cfg *config.ControllerConfig, cc *monitor.ControllerCheck) *Controller {
@@ -39,17 +45,24 @@ func NewController(cfg *config.ControllerConfig, cc *monitor.ControllerCheck) *C
 }
 
 func (c *Controller) RegisterTo(e *gin.Engine) {
-	e.GET("/v1/controllers/:lcuuid/", getController)
-	e.GET("/v1/controllers/", getControllers)
-	e.PATCH("/v1/controllers/:lcuuid/", updateController(c.cc, c.cfg))
-	e.DELETE("/v1/controllers/:lcuuid/", deleteController(c.cc, c.cfg))
+	adminRoutes := e.Group("/v1/controllers")
+	adminRoutes.Use(AdminPermissionVerificationMiddleware())
+
+	adminRoutes.GET("/:lcuuid/", getController)
+	adminRoutes.GET("/", getControllers)
+	adminRoutes.PATCH("/:lcuuid/", updateController(c.cc, c.cfg))
+	adminRoutes.DELETE("/:lcuuid/", deleteController(c.cc, c.cfg))
 }
 
 func getController(c *gin.Context) {
 	args := make(map[string]string)
 	args["lcuuid"] = c.Param("lcuuid")
-	data, err := service.GetControllers(args)
-	JsonResponse(c, data, err)
+	orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+	data, err := service.GetControllers(orgID.(int), args)
+	if err != nil {
+		err = fmt.Errorf("org id(%v), %s", orgID, err.Error())
+	}
+	response.JSON(c, response.SetData(data), response.SetError(err))
 }
 
 func getControllers(c *gin.Context) {
@@ -75,8 +88,13 @@ func getControllers(c *gin.Context) {
 	if value, ok := c.GetQuery("region"); ok {
 		args["region"] = value
 	}
-	data, err := service.GetControllers(args)
-	JsonResponse(c, data, err)
+
+	orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+	data, err := service.GetControllers(orgID.(int), args)
+	if err != nil {
+		err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+	}
+	response.JSON(c, response.SetData(data), response.SetError(err))
 }
 
 func updateController(m *monitor.ControllerCheck, cfg *config.ControllerConfig) gin.HandlerFunc {
@@ -87,14 +105,14 @@ func updateController(m *monitor.ControllerCheck, cfg *config.ControllerConfig) 
 		// 如果不是masterController，将请求转发至是masterController
 		isMasterController, masterControllerIP, _ := election.IsMasterControllerAndReturnIP()
 		if !isMasterController {
-			ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
+			routercommon.ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
 			return
 		}
 
 		// 参数校验
 		err = c.ShouldBindBodyWith(&controllerUpdate, binding.JSON)
 		if err != nil {
-			BadRequestResponse(c, httpcommon.INVALID_PARAMETERS, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(err))
 			return
 		}
 
@@ -104,8 +122,12 @@ func updateController(m *monitor.ControllerCheck, cfg *config.ControllerConfig) 
 		c.ShouldBindBodyWith(&patchMap, binding.JSON)
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.UpdateController(lcuuid, patchMap, m, cfg)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.UpdateController(orgID.(int), lcuuid, patchMap, m, cfg)
+		if err != nil {
+			err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+		}
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
@@ -114,13 +136,17 @@ func deleteController(m *monitor.ControllerCheck, cfg *config.ControllerConfig) 
 		// if not master controller，should forward to master controller
 		isMasterController, masterControllerIP, _ := election.IsMasterControllerAndReturnIP()
 		if !isMasterController {
-			ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
+			routercommon.ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
 			return
 		}
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.DeleteController(lcuuid, m)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.DeleteController(orgID.(int), lcuuid, m)
+		if err != nil {
+			err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+		}
+		response.JSON(c, response.SetData(data), response.SetError(err))
 		return
 	})
 }

@@ -31,7 +31,7 @@ use crate::common::{FlowAclListener, FlowAclListenerId};
 use crate::exception::ExceptionHandler;
 use crate::utils::stats::{Counter, CounterType, CounterValue, RefCountable};
 use npb_pcap_policy::{NpbTunnelType, NOT_SUPPORT};
-use public::proto::{common::TridentType, trident::Exception};
+use public::proto::agent::{AgentType, Exception};
 use public::utils::net::get_route_src_ip_interface_name;
 use public::LeakyBucket;
 
@@ -141,7 +141,7 @@ impl Watcher {
 
     fn npb_start(&self, tx_bps: u64) -> bool {
         self.npb_leaky_bucket
-            .set_rate(Some(self.npb_bps_threshold.load(Relaxed) / 8));
+            .set_rate(Some(self.npb_bps_threshold.load(Relaxed)));
         self.exception_handler.clear(Exception::NpbFuse);
         info!("Npb reopen, tx bandwidth is {} bps.", tx_bps);
 
@@ -205,6 +205,7 @@ impl Watcher {
 pub struct NpbBandwidthWatcher {
     watcher: Arc<Watcher>,
     thread_handler: Mutex<Option<JoinHandle<()>>>,
+    exception_handler: ExceptionHandler,
 }
 
 impl NpbBandwidthWatcher {
@@ -234,9 +235,10 @@ impl NpbBandwidthWatcher {
                     nic_name: RwLock::new("".to_string()),
                     is_running: AtomicBool::new(false),
                     traffic_count: traffic_count.clone(),
-                    exception_handler,
+                    exception_handler: exception_handler.clone(),
                 }),
                 thread_handler: Mutex::new(None),
+                exception_handler,
             })),
             traffic_count,
         )
@@ -244,7 +246,11 @@ impl NpbBandwidthWatcher {
 
     pub fn set_npb_rate(&self, threshold: u64) {
         self.watcher.npb_bps_threshold.store(threshold, Relaxed);
-        self.watcher.npb_leaky_bucket.set_rate(Some(threshold));
+        // When there is Exception::NpbFuse, npb_leaky_bucket cannot be
+        // set in order to not distribute traffic packet.
+        if !self.exception_handler.has(Exception::NpbFuse) {
+            self.watcher.npb_leaky_bucket.set_rate(Some(threshold));
+        }
     }
 
     pub fn set_nic_rate(&self, mut threshold: u64) {
@@ -317,7 +323,7 @@ impl NpbBandwidthWatcher {
 impl FlowAclListener for Arc<NpbBandwidthWatcher> {
     fn flow_acl_change(
         &mut self,
-        _trident_type: TridentType,
+        _agent_type: AgentType,
         _local_epc: i32,
         _ip_groups: &Vec<Arc<IpGroupData>>,
         _platform_data: &Vec<Arc<PlatformData>>,

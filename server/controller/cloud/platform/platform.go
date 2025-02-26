@@ -20,8 +20,6 @@ import (
 	"errors"
 	"fmt"
 
-	logging "github.com/op/go-logging"
-
 	"github.com/deepflowio/deepflow/server/controller/cloud/aliyun"
 	"github.com/deepflowio/deepflow/server/controller/cloud/aws"
 	"github.com/deepflowio/deepflow/server/controller/cloud/baidubce"
@@ -33,11 +31,14 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/cloud/qingcloud"
 	"github.com/deepflowio/deepflow/server/controller/cloud/tencent"
+	"github.com/deepflowio/deepflow/server/controller/cloud/volcengine"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("cloud.platform")
+var log = logger.MustGetLogger("cloud.platform")
 
 type Platform interface {
 	CheckAuth() error
@@ -45,29 +46,31 @@ type Platform interface {
 	ClearDebugLog()
 }
 
-func NewPlatform(domain mysql.Domain, cfg config.CloudConfig) (Platform, error) {
+func NewPlatform(domain metadbmodel.Domain, cfg config.CloudConfig, db *metadb.DB) (Platform, error) {
 	var platform Platform
 	var err error
 
 	switch domain.Type {
 	case common.ALIYUN:
-		platform, err = aliyun.NewAliyun(domain, cfg)
+		platform, err = aliyun.NewAliyun(db.ORGID, domain, cfg)
 	case common.AWS:
-		platform, err = aws.NewAws(domain, cfg)
+		platform, err = aws.NewAws(db.ORGID, domain, cfg)
 	case common.AGENT_SYNC:
-		platform, err = genesis.NewGenesis(domain, cfg)
+		platform, err = genesis.NewGenesis(db.ORGID, domain, cfg)
 	case common.QINGCLOUD:
-		platform, err = qingcloud.NewQingCloud(domain, cfg)
+		platform, err = qingcloud.NewQingCloud(db.ORGID, domain, cfg)
 	case common.BAIDU_BCE:
-		platform, err = baidubce.NewBaiduBce(domain, cfg)
+		platform, err = baidubce.NewBaiduBce(db.ORGID, domain, cfg)
 	case common.TENCENT:
-		platform, err = tencent.NewTencent(domain, cfg)
+		platform, err = tencent.NewTencent(db.ORGID, domain, cfg)
 	case common.KUBERNETES:
-		platform, err = kubernetes.NewKubernetes(domain)
+		platform, err = kubernetes.NewKubernetes(db.ORGID, domain)
 	case common.HUAWEI:
-		platform, err = huawei.NewHuaWei(domain, cfg)
+		platform, err = huawei.NewHuaWei(db.ORGID, domain, cfg)
 	case common.FILEREADER:
-		platform, err = filereader.NewFileReader(domain)
+		platform, err = filereader.NewFileReader(db.ORGID, domain)
+	case common.VOLCENGINE:
+		platform, err = volcengine.NewVolcEngine(db.ORGID, domain, cfg)
 	// TODO: other platform
 	default:
 		return nil, errors.New(fmt.Sprintf("domain type (%d) not supported", domain.Type))

@@ -24,8 +24,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/deepflowio/deepflow/server/ingester/app_log"
 	"github.com/deepflowio/deepflow/server/ingester/ckmonitor"
 	"github.com/deepflowio/deepflow/server/ingester/datasource"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/pool"
@@ -36,13 +38,13 @@ import (
 	yaml "gopkg.in/yaml.v2"
 
 	servercommon "github.com/deepflowio/deepflow/server/common"
+	applicationlogcfg "github.com/deepflowio/deepflow/server/ingester/app_log/config"
 	"github.com/deepflowio/deepflow/server/ingester/ckissu"
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
-	dropletcfg "github.com/deepflowio/deepflow/server/ingester/droplet/config"
-	"github.com/deepflowio/deepflow/server/ingester/droplet/droplet"
 	eventcfg "github.com/deepflowio/deepflow/server/ingester/event/config"
 	"github.com/deepflowio/deepflow/server/ingester/event/event"
+	exporterscfg "github.com/deepflowio/deepflow/server/ingester/exporters/config"
 	extmetricscfg "github.com/deepflowio/deepflow/server/ingester/ext_metrics/config"
 	"github.com/deepflowio/deepflow/server/ingester/ext_metrics/ext_metrics"
 	flowlogcfg "github.com/deepflowio/deepflow/server/ingester/flow_log/config"
@@ -61,7 +63,7 @@ var log = logging.MustGetLogger("ingester")
 
 const (
 	PROFILER_PORT                = 9526
-	MAX_SLAVE_PLATFORMDATA_COUNT = 64
+	MAX_SLAVE_PLATFORMDATA_COUNT = 128
 )
 
 func Start(configPath string, shared *servercommon.ControllerIngesterShared) []io.Closer {
@@ -91,13 +93,10 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 	stats.SetRemoteType(stats.REMOTE_TYPE_DFSTATSD)
 	stats.SetDFRemote(net.JoinHostPort("127.0.0.1", strconv.Itoa(int(cfg.ListenPort))))
 
-	dropletConfig := dropletcfg.Load(cfg, configPath)
-	bytes, _ = yaml.Marshal(dropletConfig)
-	log.Infof("droplet config:\n%s", string(bytes))
-
 	receiver := receiver.NewReceiver(int(cfg.ListenPort), cfg.UDPReadBuffer, cfg.TCPReadBuffer, cfg.TCPReaderBuffer)
 
-	closers := droplet.Start(dropletConfig, receiver)
+	ingesterOrgHandler := NewOrgHandler(cfg)
+	closers := []io.Closer{}
 
 	if cfg.IngesterEnabled {
 		flowLogConfig := flowlogcfg.Load(cfg, configPath)
@@ -127,6 +126,14 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 		prometheusConfig := prometheuscfg.Load(cfg, configPath)
 		bytes, _ = yaml.Marshal(prometheusConfig)
 		log.Infof("prometheus config:\n%s", string(bytes))
+
+		applicationLogConfig := applicationlogcfg.Load(cfg, configPath)
+		bytes, _ = yaml.Marshal(applicationLogConfig)
+		log.Infof("application log  config:\n%s", string(bytes))
+
+		exportersConfig := exporterscfg.Load(cfg, configPath)
+		bytes, _ = yaml.Marshal(exportersConfig)
+		log.Infof("exporters config:\n%s", string(bytes))
 
 		var issu *ckissu.Issu
 		if !cfg.StorageDisabled {
@@ -160,8 +167,14 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 			cfg.NodeIP,
 			receiver)
 
+		exporters := exporters.NewExporters(exportersConfig)
+		if exporters != nil {
+			exporters.Start()
+			closers = append(closers, exporters)
+		}
+
 		// 写流日志数据
-		flowLog, err := flowlog.NewFlowLog(flowLogConfig, receiver, platformDataManager)
+		flowLog, err := flowlog.NewFlowLog(flowLogConfig, shared.TraceTreeQueue, receiver, platformDataManager, exporters)
 		checkError(err)
 		flowLog.Start()
 		closers = append(closers, flowLog)
@@ -174,13 +187,13 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 			closers = append(closers, extMetrics)
 
 			// 写遥测数据
-			flowMetrics, err := flowmetrics.NewFlowMetrics(flowMetricsConfig, receiver, platformDataManager)
+			flowMetrics, err := flowmetrics.NewFlowMetrics(flowMetricsConfig, receiver, platformDataManager, exporters)
 			checkError(err)
 			flowMetrics.Start()
 			closers = append(closers, flowMetrics)
 
 			// write event data
-			event, err := event.NewEvent(eventConfig, shared.ResourceEventQueue, receiver, platformDataManager)
+			event, err := event.NewEvent(eventConfig, shared.ResourceEventQueue, receiver, platformDataManager, exporters)
 			checkError(err)
 			event.Start()
 			closers = append(closers, event)
@@ -202,6 +215,13 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 			checkError(err)
 			prometheus.Start()
 			closers = append(closers, prometheus)
+			ingesterOrgHandler.SetPromHandler(prometheus)
+
+			// write application log data
+			applicationLog, err := app_log.NewApplicationLogger(applicationLogConfig, receiver, platformDataManager)
+			checkError(err)
+			applicationLog.Start()
+			closers = append(closers, applicationLog)
 
 			// 检查clickhouse的磁盘空间占用，达到阈值时，自动删除老数据
 			cm, err := ckmonitor.NewCKMonitor(cfg)
@@ -213,12 +233,15 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 			time.Sleep(time.Second)
 			err = issu.Start()
 			checkError(err)
-			closers = append(closers, issu)
+			// after issu execution is completed, should close it to prevent the connection from occupying memory.
+			issu.Close()
+			issu = nil
 		}
 	}
 	// receiver后启动，防止启动后收到数据无法处理，而上报异常日志
 	receiver.Start()
 	closers = append(closers, receiver)
+	servercommon.SetOrgHandler(ingesterOrgHandler)
 
 	return closers
 }

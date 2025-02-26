@@ -21,26 +21,29 @@ import (
 
 	"github.com/cornelk/hashmap"
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 // 缓存资源可用于分配的ID，提供ID的刷新、分配、回收接口
 type metricName struct {
+	org          *common.ORG
 	lock         sync.Mutex
 	resourceType string
 	strToID      *hashmap.Map[string, int]
 	ascIDAllocator
 }
 
-func newMetricName(max int) *metricName {
+func newMetricName(org *common.ORG, max int) *metricName {
 	mn := &metricName{
+		org:          org,
 		resourceType: "metric_name",
 		strToID:      hashmap.New[string, int](),
 	}
-	mn.ascIDAllocator = newAscIDAllocator(mn.resourceType, 1, max)
+	mn.ascIDAllocator = newAscIDAllocator(org, mn.resourceType, 1, max)
 	mn.rawDataProvider = mn
 	return mn
 }
@@ -61,14 +64,14 @@ func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName,
 	defer mn.lock.Unlock()
 
 	resp := make([]*controller.PrometheusMetricName, 0)
-	dbToAdd := make([]*mysql.PrometheusMetricName, 0)
+	dbToAdd := make([]*metadbmodel.PrometheusMetricName, 0)
 	for i := range strs {
 		str := strs[i]
 		if id, ok := mn.strToID.Get(str); ok {
 			resp = append(resp, &controller.PrometheusMetricName{Name: &str, Id: proto.Uint32(uint32(id))})
 			continue
 		}
-		dbToAdd = append(dbToAdd, &mysql.PrometheusMetricName{Name: str})
+		dbToAdd = append(dbToAdd, &metadbmodel.PrometheusMetricName{Name: str})
 	}
 	if len(dbToAdd) == 0 {
 		return resp, nil
@@ -80,9 +83,9 @@ func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName,
 	for i := range dbToAdd {
 		dbToAdd[i].ID = ids[i]
 	}
-	err = addBatch(dbToAdd, mn.resourceType)
+	err = addBatch(mn.org.DB, dbToAdd, mn.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", mn.resourceType, err.Error())
+		log.Errorf("add %s error: %s", mn.resourceType, err.Error(), mn.org.LogPrefix)
 		return nil, err
 	}
 	for i := range dbToAdd {
@@ -95,10 +98,10 @@ func (mn *metricName) encode(strs []string) ([]*controller.PrometheusMetricName,
 }
 
 func (mn *metricName) load() (ids mapset.Set[int], err error) {
-	var items []*mysql.PrometheusMetricName
-	err = mysql.Db.Find(&items).Error
+	var items []*metadbmodel.PrometheusMetricName
+	err = mn.org.DB.Find(&items).Error
 	if err != nil {
-		log.Errorf("db query %s failed: %v", mn.resourceType, err)
+		log.Errorf("db query %s failed: %v", mn.resourceType, err, mn.org.LogPrefix)
 		return nil, err
 	}
 	inUseIDsSet := mapset.NewSet[int]()
@@ -110,17 +113,17 @@ func (mn *metricName) load() (ids mapset.Set[int], err error) {
 }
 
 func (mn *metricName) check(ids []int) (inUseIDs []int, err error) {
-	var dbItems []*mysql.PrometheusMetricName
-	err = mysql.Db.Unscoped().Where("id IN ?", ids).Find(&dbItems).Error
+	var dbItems []*metadbmodel.PrometheusMetricName
+	err = mn.org.DB.Unscoped().Where("id IN ?", ids).Find(&dbItems).Error
 	if err != nil {
-		log.Errorf("db query %s failed: %v", mn.resourceType, err)
+		log.Errorf("db query %s failed: %v", mn.resourceType, err, mn.org.LogPrefix)
 		return
 	}
 	if len(dbItems) != 0 {
 		for _, item := range dbItems {
 			inUseIDs = append(inUseIDs, item.ID)
 		}
-		log.Infof("%s ids: %+v are in use.", mn.resourceType, inUseIDs)
+		log.Infof("%s ids: %+v are in use.", mn.resourceType, inUseIDs, mn.org.LogPrefix)
 	}
 	return
 }

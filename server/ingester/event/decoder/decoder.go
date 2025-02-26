@@ -17,7 +17,6 @@
 package decoder
 
 import (
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -25,21 +24,23 @@ import (
 
 	logging "github.com/op/go-logging"
 
-	"github.com/deepflowio/deepflow/message/alarm_event"
+	"github.com/deepflowio/deepflow/message/alert_event"
 	"github.com/deepflowio/deepflow/message/trident"
 	ingestercommon "github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/event/common"
 	"github.com/deepflowio/deepflow/server/ingester/event/config"
 	"github.com/deepflowio/deepflow/server/ingester/event/dbwriter"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
+	exporterscommon "github.com/deepflowio/deepflow/server/ingester/exporters/common"
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/eventapi"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 )
 
 var log = logging.MustGetLogger("event.decoder")
@@ -56,23 +57,28 @@ type Counter struct {
 }
 
 type Decoder struct {
-	eventType         common.EventType
-	resourceInfoTable *ResourceInfoTable
-	platformData      *grpc.PlatformInfoTable
-	inQueue           queue.QueueReader
-	eventWriter       *dbwriter.EventWriter
-	debugEnabled      bool
-	config            *config.Config
+	index        int
+	eventType    common.EventType
+	platformData *grpc.PlatformInfoTable
+	inQueue      queue.QueueReader
+	eventWriter  *dbwriter.EventWriter
+	exporters    *exporters.Exporters
+	debugEnabled bool
+	config       *config.Config
+
+	orgId, teamId uint16
 
 	counter *Counter
 	utils.Closable
 }
 
 func NewDecoder(
+	index int,
 	eventType common.EventType,
 	inQueue queue.QueueReader,
 	eventWriter *dbwriter.EventWriter,
 	platformData *grpc.PlatformInfoTable,
+	exporters *exporters.Exporters,
 	config *config.Config,
 ) *Decoder {
 	controllers := make([]net.IP, len(config.Base.ControllerIPs))
@@ -82,19 +88,16 @@ func NewDecoder(
 			controllers[i] = controllers[i].To4()
 		}
 	}
-	var resourceInfoTable *ResourceInfoTable
-	if eventType == common.RESOURCE_EVENT {
-		resourceInfoTable = NewResourceInfoTable(controllers, int(config.Base.ControllerPort), config.Base.GrpcBufferSize)
-	}
 	return &Decoder{
-		eventType:         eventType,
-		resourceInfoTable: resourceInfoTable,
-		platformData:      platformData,
-		inQueue:           inQueue,
-		debugEnabled:      log.IsEnabledFor(logging.DEBUG),
-		eventWriter:       eventWriter,
-		config:            config,
-		counter:           &Counter{},
+		index:        index,
+		eventType:    eventType,
+		platformData: platformData,
+		inQueue:      inQueue,
+		debugEnabled: log.IsEnabledFor(logging.DEBUG),
+		eventWriter:  eventWriter,
+		exporters:    exporters,
+		config:       config,
+		counter:      &Counter{},
 	}
 }
 
@@ -105,18 +108,16 @@ func (d *Decoder) GetCounter() interface{} {
 }
 
 func (d *Decoder) Run() {
-	log.Infof("event(%s) decoder run", d.eventType)
-	if d.resourceInfoTable != nil {
-		d.resourceInfoTable.Start()
-	}
+	log.Infof("event (%s) decoder run", d.eventType)
 	ingestercommon.RegisterCountableForIngester("decoder", d, stats.OptionStatTags{
-		"event_type": d.eventType.String()})
+		"index": strconv.Itoa(d.index), "event_type": d.eventType.String()})
 	buffer := make([]interface{}, BUFFER_SIZE)
 	decoder := &codec.SimpleDecoder{}
 	for {
 		n := d.inQueue.Gets(buffer)
 		for i := 0; i < n; i++ {
 			if buffer[i] == nil {
+				d.export(nil)
 				continue
 			}
 			d.counter.InCount++
@@ -130,28 +131,33 @@ func (d *Decoder) Run() {
 				d.handleResourceEvent(event)
 				event.Release()
 			case common.PERF_EVENT:
-				if buffer[i] == nil {
-					continue
-				}
 				recvBytes, ok := buffer[i].(*receiver.RecvBuffer)
 				if !ok {
-					log.Warning("get proc event decode queue data type wrong")
+					log.Warning("get perf event decode queue data type wrong")
 					continue
 				}
 				decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
+				d.orgId, d.teamId = uint16(recvBytes.OrgID), uint16(recvBytes.TeamID)
 				d.handlePerfEvent(recvBytes.VtapID, decoder)
 				receiver.ReleaseRecvBuffer(recvBytes)
-			case common.ALARM_EVENT:
-				if buffer[i] == nil {
-					continue
-				}
+			case common.ALERT_EVENT:
 				recvBytes, ok := buffer[i].(*receiver.RecvBuffer)
 				if !ok {
-					log.Warning("get alarm event decode queue data type wrong")
+					log.Warning("get alert event decode queue data type wrong")
 					continue
 				}
 				decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
-				d.handleAlarmEvent(decoder)
+				d.handleAlertEvent(decoder)
+				receiver.ReleaseRecvBuffer(recvBytes)
+			case common.K8S_EVENT:
+				recvBytes, ok := buffer[i].(*receiver.RecvBuffer)
+				if !ok {
+					log.Warning("get k8s event decode queue data type wrong")
+					continue
+				}
+				decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
+				d.orgId, d.teamId = uint16(recvBytes.OrgID), uint16(recvBytes.TeamID)
+				d.handleK8sEvent(recvBytes.VtapID, decoder)
 				receiver.ReleaseRecvBuffer(recvBytes)
 			}
 		}
@@ -162,10 +168,12 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 	s := dbwriter.AcquireEventStore()
 	s.HasMetrics = true
 	s.Time = uint32(time.Duration(e.StartTime) / time.Second)
+	s.SetId(s.Time, d.platformData.QueryAnalyzerID())
 	s.StartTime = int64(time.Duration(e.StartTime) / time.Microsecond)
 	s.EndTime = int64(time.Duration(e.EndTime) / time.Microsecond)
 	s.Duration = uint64(e.EndTime - e.StartTime)
 	s.PodID = e.PodId
+	s.OrgId, s.TeamID = d.orgId, d.teamId
 
 	if e.EventType == pb.EventType_IoEvent {
 		s.SignalSource = uint8(dbwriter.SIGNAL_SOURCE_IO)
@@ -173,37 +181,37 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 		s.SignalSource = uint8(e.EventType)
 	}
 
-	s.GProcessID = d.platformData.QueryProcessInfo(uint32(vtapId), e.Pid)
+	s.GProcessID = d.platformData.QueryProcessInfo(s.OrgId, vtapId, e.Pid)
 	if e.IoEventData != nil {
 		ioData := e.IoEventData
 		s.EventType = strings.ToLower(ioData.Operation.String())
-		s.EventDescription = fmt.Sprintf("process %s (%d) %s %d bytes and took %dms", string(e.ProcessKname), e.Pid, s.EventType, ioData.BytesCount, ioData.Latency/uint64(time.Millisecond))
-		s.AttributeNames = append(s.AttributeNames, "file_name", "thread_id", "coroutine_id")
-		s.AttributeValues = append(s.AttributeValues, string(ioData.Filename), strconv.Itoa(int(e.ThreadId)), strconv.Itoa(int(e.CoroutineId)))
+		s.ProcessKName = string(e.ProcessKname)
+		s.AttributeNames = append(s.AttributeNames, "file_name", "thread_id", "coroutine_id", "offset")
+		s.AttributeValues = append(s.AttributeValues, string(ioData.Filename), strconv.Itoa(int(e.ThreadId)), strconv.Itoa(int(e.CoroutineId)), strconv.Itoa(int(ioData.OffBytes)))
 		s.Bytes = ioData.BytesCount
 		s.Duration = uint64(s.EndTime - s.StartTime)
 	}
 	s.VTAPID = vtapId
-	s.L3EpcID = d.platformData.QueryVtapEpc0(uint32(vtapId))
+	s.L3EpcID = d.platformData.QueryVtapEpc0(s.OrgId, vtapId)
 
 	var info *grpc.Info
 	if e.PodId != 0 {
-		info = d.platformData.QueryPodIdInfo(e.PodId)
+		info = d.platformData.QueryPodIdInfo(s.OrgId, e.PodId)
 	}
 
 	// if platformInfo cannot be obtained from PodId, finally fill with Vtap's platformInfo
 	if info == nil {
-		vtapInfo := d.platformData.QueryVtapInfo(uint32(vtapId))
+		vtapInfo := d.platformData.QueryVtapInfo(s.OrgId, vtapId)
 		if vtapInfo != nil {
 			vtapIP := net.ParseIP(vtapInfo.Ip)
 			if vtapIP != nil {
 				if ip4 := vtapIP.To4(); ip4 != nil {
 					s.IsIPv4 = true
 					s.IP4 = utils.IpToUint32(ip4)
-					info = d.platformData.QueryIPV4Infos(vtapInfo.EpcId, s.IP4)
+					info = d.platformData.QueryIPV4Infos(s.OrgId, vtapInfo.EpcId, s.IP4)
 				} else {
 					s.IP6 = vtapIP
-					info = d.platformData.QueryIPV6Infos(vtapInfo.EpcId, s.IP6)
+					info = d.platformData.QueryIPV6Infos(s.OrgId, vtapInfo.EpcId, s.IP6)
 				}
 			}
 		}
@@ -230,20 +238,29 @@ func (d *Decoder) WritePerfEvent(vtapId uint16, e *pb.ProcEvent) {
 		s.IP4 = info.IP4
 		s.IP6 = info.IP6
 		// if it is just Pod Node, there is no need to match the service
-		if ingestercommon.IsPodServiceIP(zerodoc.DeviceType(s.L3DeviceType), s.PodID, 0) {
-			s.ServiceID = d.platformData.QueryService(
+		if ingestercommon.IsPodServiceIP(flow_metrics.DeviceType(s.L3DeviceType), s.PodID, 0) {
+			s.ServiceID = d.platformData.QueryPodService(s.OrgId,
 				s.PodID, s.PodNodeID, uint32(s.PodClusterID), s.PodGroupID, s.L3EpcID, !s.IsIPv4, s.IP4, s.IP6, 0, 0)
 		}
-	} else if baseInfo := d.platformData.QueryEpcIDBaseInfo(s.L3EpcID); baseInfo != nil {
+	} else if baseInfo := d.platformData.QueryEpcIDBaseInfo(s.OrgId, s.L3EpcID); baseInfo != nil {
 		s.RegionID = uint16(baseInfo.RegionID)
 	}
 
-	s.AutoInstanceID, s.AutoInstanceType = ingestercommon.GetAutoInstance(s.PodID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint8(s.L3DeviceType), s.L3EpcID)
-	s.AutoServiceID, s.AutoServiceType = ingestercommon.GetAutoService(s.ServiceID, s.PodGroupID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint8(s.L3DeviceType), podGroupType, s.L3EpcID)
+	s.AutoInstanceID, s.AutoInstanceType = ingestercommon.GetAutoInstance(s.PodID, s.GProcessID, s.PodNodeID, s.L3DeviceID, uint32(s.SubnetID), uint8(s.L3DeviceType), s.L3EpcID)
+	customServiceID := d.platformData.QueryCustomService(s.OrgId, s.L3EpcID, !s.IsIPv4, s.IP4, s.IP6, 0)
+	s.AutoServiceID, s.AutoServiceType = ingestercommon.GetAutoService(customServiceID, s.ServiceID, s.PodGroupID, s.GProcessID, uint32(s.PodClusterID), s.L3DeviceID, uint32(s.SubnetID), uint8(s.L3DeviceType), podGroupType, s.L3EpcID)
 
 	s.AppInstance = strconv.Itoa(int(e.Pid))
 
+	d.export(s)
 	d.eventWriter.Write(s)
+}
+
+func (d *Decoder) export(item exporterscommon.ExportItem) {
+	if d.exporters == nil {
+		return
+	}
+	d.exporters.Put(d.eventType.DataSource(), d.index, item)
 }
 
 func (d *Decoder) handlePerfEvent(vtapId uint16, decoder *codec.SimpleDecoder) {
@@ -281,7 +298,7 @@ func uint32ArrayToStr(u32s []uint32) string {
 }
 
 func getAutoInstance(instanceID, instanceType, GProcessID uint32) (uint32, uint8) {
-	if GProcessID == 0 || instanceType == ingestercommon.PodType {
+	if GProcessID == 0 || instanceType == uint32(ingestercommon.PodType) {
 		return instanceID, uint8(instanceType)
 	}
 	return GProcessID, ingestercommon.ProcessType
@@ -291,12 +308,16 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 	s := dbwriter.AcquireEventStore()
 	s.HasMetrics = false
 	s.Time = uint32(event.Time)
+	s.SetId(s.Time, d.platformData.QueryAnalyzerID())
 	s.StartTime = event.TimeMilli * 1000 // convert to microsecond
 	s.EndTime = s.StartTime
 
 	s.SignalSource = uint8(dbwriter.SIGNAL_SOURCE_RESOURCE)
 	s.EventType = event.Type
 	s.EventDescription = event.Description
+
+	s.OrgId = event.ORGID
+	s.TeamID = event.TeamID
 
 	s.GProcessID = event.GProcessID
 
@@ -315,11 +336,11 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 	podGroupType := uint8(0)
 	if event.IfNeedTagged {
 		s.Tagged = 1
-		resourceInfo := d.resourceInfoTable.QueryResourceInfo(event.InstanceType, event.InstanceID)
+		resourceInfo := d.platformData.QueryResourceInfo(s.OrgId, event.InstanceType, event.InstanceID)
 		if resourceInfo != nil {
 			s.RegionID = uint16(resourceInfo.RegionID)
 			s.AZID = uint16(resourceInfo.AZID)
-			s.L3EpcID = resourceInfo.L3EpcID
+			s.L3EpcID = resourceInfo.EpcID
 			s.HostID = uint16(resourceInfo.HostID)
 			s.PodID = resourceInfo.PodID
 			s.PodNodeID = resourceInfo.PodNodeID
@@ -327,8 +348,8 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 			s.PodClusterID = uint16(resourceInfo.PodClusterID)
 			s.PodGroupID = resourceInfo.PodGroupID
 			podGroupType = resourceInfo.PodGroupType
-			s.L3DeviceType = uint8(resourceInfo.L3DeviceType)
-			s.L3DeviceID = resourceInfo.L3DeviceID
+			s.L3DeviceType = uint8(resourceInfo.DeviceType)
+			s.L3DeviceID = resourceInfo.DeviceID
 		}
 	} else {
 		s.Tagged = 0
@@ -366,6 +387,7 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 			s.GProcessID,
 			s.PodNodeID,
 			s.L3DeviceID,
+			uint32(s.SubnetID),
 			s.L3DeviceType,
 			s.L3EpcID,
 		)
@@ -376,14 +398,20 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 
 	if event.InstanceType == uint32(trident.DeviceType_DEVICE_TYPE_POD_SERVICE) {
 		s.ServiceID = event.InstanceID
+	} else if ingestercommon.IsPodServiceIP(flow_metrics.DeviceType(s.L3DeviceType), s.PodID, 0) {
+		s.ServiceID = d.platformData.QueryPodService(s.OrgId, s.PodID, s.PodNodeID, uint32(s.PodClusterID), s.PodGroupID, s.L3EpcID, !s.IsIPv4, s.IP4, s.IP6, 0, 0)
 	}
+
+	customServiceID := d.platformData.QueryCustomService(s.OrgId, s.L3EpcID, !s.IsIPv4, s.IP4, s.IP6, 0)
 	s.AutoServiceID, s.AutoServiceType =
 		ingestercommon.GetAutoService(
+			customServiceID,
 			s.ServiceID,
 			s.PodGroupID,
 			s.GProcessID,
-			s.PodNodeID,
+			uint32(s.PodClusterID),
 			s.L3DeviceID,
+			uint32(s.SubnetID),
 			s.L3DeviceType,
 			podGroupType,
 			s.L3EpcID,
@@ -393,59 +421,51 @@ func (d *Decoder) handleResourceEvent(event *eventapi.ResourceEvent) {
 	d.eventWriter.Write(s)
 }
 
-func (d *Decoder) handleAlarmEvent(decoder *codec.SimpleDecoder) {
+func (d *Decoder) handleAlertEvent(decoder *codec.SimpleDecoder) {
 	for !decoder.IsEnd() {
 		bytes := decoder.ReadBytes()
 		if decoder.Failed() {
 			if d.counter.ErrorCount == 0 {
-				log.Errorf("alarm event decode failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
+				log.Errorf("alert event decode failed, offset=%d len=%d", decoder.Offset(), len(decoder.Bytes()))
 			}
 			d.counter.ErrorCount++
 			return
 		}
-		pbAlarmEvent := &alarm_event.AlarmEvent{}
-		if err := pbAlarmEvent.Unmarshal(bytes); err != nil {
+		pbAlertEvent := &alert_event.AlertEvent{}
+		if err := pbAlertEvent.Unmarshal(bytes); err != nil {
 			if d.counter.ErrorCount == 0 {
-				log.Errorf("alarm event unmarshal failed, err: %s", err)
+				log.Errorf("alert event unmarshal failed, err: %s", err)
 			}
 			d.counter.ErrorCount++
 			continue
 		}
 		d.counter.OutCount++
-		d.writeAlarmEvent(pbAlarmEvent)
+		d.writeAlertEvent(pbAlertEvent)
 	}
 }
 
-func (d *Decoder) writeAlarmEvent(event *alarm_event.AlarmEvent) {
-	s := dbwriter.AcquireAlarmEventStore()
-	s.Time = event.GetTimestamp()
-	s.Lcuuid = event.GetLcuuid()
-	s.User = event.GetUser()
-	s.UserId = event.GetUserId()
+func (d *Decoder) writeAlertEvent(event *alert_event.AlertEvent) {
+	s := dbwriter.AcquireAlertEventStore()
+	s.Time = event.GetTime()
+	s.SetId(s.Time, d.platformData.QueryAnalyzerID())
 
 	s.PolicyId = event.GetPolicyId()
-	s.PolicyName = event.GetPolicyName()
-	s.PolicyLevel = event.GetPolicyLevel()
-	s.PolicyAppType = event.GetPolicyAppType()
-	s.PolicySubType = event.GetPolicySubType()
-	s.PolicyContrastType = event.GetPolicyContrastType()
-	s.PolicyDataLevel = event.GetPolicyDataLevel()
-	s.PolicyTargetUid = event.GetPolicyTargetUid()
-	s.PolicyTargetName = event.GetPolicyTargetName()
-	s.PolicyGoTo = event.GetPolicyGoTo()
-	s.PolicyTargetField = event.GetPolicyTargetField()
-	s.PolicyEndpoints = event.GetPolicyEndpoints()
-	s.TriggerCondition = event.GetTriggerCondition()
-	s.TriggerValue = event.GetTriggerValue()
-	s.ValueUnit = event.GetValueUnit()
-	s.EventLevel = event.GetEventLevel()
-	s.AlarmTarget = event.GetAlarmTarget()
-	s.RegionId = uint16(d.platformData.QueryRegionID())
-	s.PolicyQueryUrl = event.GetPolicyQueryUrl()
-	s.PolicyQueryConditions = event.GetPolicyQueryConditions()
-	s.PolicyThresholdCritical = event.GetPolicyThresholdCritical()
-	s.PolicyThresholdError = event.GetPolicyThresholdError()
-	s.PolicyThresholdWarning = event.GetPolicyThresholdWarning()
+	s.PolicyType = uint8(event.GetPolicyType())
+	s.AlertPolicy = event.GetAlertPolicy()
+	s.MetricValue = event.GetMetricValue()
+	s.EventLevel = uint8(event.GetEventLevel())
+	s.TargetTags = event.GetTargetTags()
 
-	d.eventWriter.WriteAlarmEvent(s)
+	s.TagStrKeys = event.GetTagStrKeys()
+	s.TagStrValues = event.GetTagStrValues()
+	s.TagIntKeys = event.GetTagIntKeys()
+	s.TagIntValues = event.GetTagIntValues()
+	s.XTargetUid = event.GetXTargetUid()
+	s.XQueryRegion = event.GetXQueryRegion()
+
+	s.OrgId = uint16(event.GetOrgId())
+	s.TeamID = uint16(event.GetTeamId())
+	s.UserId = event.GetUserId()
+
+	d.eventWriter.WriteAlertEvent(s)
 }

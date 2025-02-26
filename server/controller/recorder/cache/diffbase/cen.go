@@ -19,12 +19,12 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
 )
 
-func (b *DataSet) AddCEN(dbItem *mysql.CEN, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddCEN(dbItem *metadbmodel.CEN, seq int, toolDataSet *tool.DataSet) {
 	vpcLcuuids := []string{}
 	for _, vpcID := range rcommon.StringToIntSlice(dbItem.VPCIDs) {
 		vpcLcuuid, exists := toolDataSet.GetVPCLcuuidByID(vpcID)
@@ -40,12 +40,12 @@ func (b *DataSet) AddCEN(dbItem *mysql.CEN, seq int, toolDataSet *tool.DataSet) 
 		Name:       dbItem.Name,
 		VPCLcuuids: vpcLcuuids,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_CEN_EN, b.CENs[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_CEN_EN, b.CENs[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteCEN(lcuuid string) {
 	delete(b.CENs, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_CEN_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_CEN_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type CEN struct {

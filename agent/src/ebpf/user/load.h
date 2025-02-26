@@ -28,9 +28,7 @@
 #define EBPF_LOG_LEVEL2 2
 #define EBPF_LOG_LEVEL  (EBPF_LOG_LEVEL1 | EBPF_LOG_LEVEL2)
 
-struct elf_info;
-struct btf_ext;
-struct btf;
+#define BPF_INSN_SZ (sizeof(struct bpf_insn))
 
 #define DF_MAX_ERRNO       4095
 #define DF_IS_ERR_VALUE(x) ((x) >= (unsigned long)-DF_MAX_ERRNO)
@@ -76,8 +74,23 @@ struct ebpf_prog {
 	char *name;		// function name
 	struct bpf_insn *insns;	// instructions that belong to BPF program
 	size_t insns_cnt;
+	size_t insns_size;
 	struct ebpf_object *obj;
 	enum bpf_prog_type type;
+	/* 
+	 * The instruction offset of this program within its
+	 * associated ELF section (measured by the number of
+	 * instructions) 
+	 */
+	size_t sec_insn_off;
+
+	/*
+	 * The original instruction count of this program within
+	 * the ELF section, excluding any additional subroutine
+	 * instructions that may have been added during relocation.
+	 */
+	size_t sec_insn_cnt;
+	struct sec_desc *sec_desc;
 };
 
 struct bpf_load_map_def {
@@ -85,7 +98,10 @@ struct bpf_load_map_def {
 	unsigned int key_size;
 	unsigned int value_size;
 	unsigned int max_entries;
-	unsigned int map_flags;
+	union {
+		unsigned int map_flags;
+		uint32_t feat_flags;
+	};
 	unsigned int inner_map_idx;
 	unsigned int numa_node;
 };
@@ -96,6 +112,8 @@ struct ebpf_map {
 	size_t elf_offset;
 	struct bpf_load_map_def def;
 };
+
+#include "elf.h"
 
 struct ebpf_object {
 	char name[OBJ_NAME_SZ];
@@ -120,4 +138,11 @@ int ebpf_obj_load(struct ebpf_object *obj);
 void release_object(struct ebpf_object *obj);
 struct ebpf_prog *ebpf_obj__get_prog_by_name(const struct ebpf_object *obj,
 					     const char *name);
+// Wrapper for bcc_prog_load()
+int df_prog_load(enum bpf_prog_type prog_type, const char *name,
+		 const struct bpf_insn *insns, int prog_len);
+int suspend_stderr();
+void resume_stderr(int fd);
+int load_ebpf_prog(struct ebpf_prog *prog);
+void set_bpf_map_prealloc(bool enabled);
 #endif /* DF_BPF_LOAD_H */

@@ -18,19 +18,19 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type FloatingIP struct {
-	OperatorBase[mysql.FloatingIP]
+	OperatorBase[*metadbmodel.FloatingIP, metadbmodel.FloatingIP]
 }
 
 func NewFloatingIP() *FloatingIP {
 	return &FloatingIP{
-		OperatorBase[mysql.FloatingIP]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.FloatingIP](
+			ctrlrcommon.RESOURCE_TYPE_FLOATING_IP_EN,
+			false,
+			false,
+		),
 	}
 }

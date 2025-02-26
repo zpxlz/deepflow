@@ -21,12 +21,15 @@ import (
 
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddPod(dbItem *mysql.Pod, seq int, toolDataSet *tool.DataSet) {
-	podNodeLcuuid, _ := toolDataSet.GetPodNodeLcuuidByID(dbItem.PodNodeID)
+func (b *DataSet) AddPod(dbItem *metadbmodel.Pod, seq int, toolDataSet *tool.DataSet) {
+	var podNodeLcuuid string
+	if dbItem.PodNodeID != 0 {
+		podNodeLcuuid, _ = toolDataSet.GetPodNodeLcuuidByID(dbItem.PodNodeID)
+	}
 	var podReplicaSetLcuuid string
 	if dbItem.PodReplicaSetID != 0 {
 		podReplicaSetLcuuid, _ = toolDataSet.GetPodReplicaSetLcuuidByID(dbItem.PodReplicaSetID)
@@ -34,6 +37,10 @@ func (b *DataSet) AddPod(dbItem *mysql.Pod, seq int, toolDataSet *tool.DataSet) 
 	var podGroupLcuuid string
 	if dbItem.PodGroupID != 0 {
 		podGroupLcuuid, _ = toolDataSet.GetPodGroupLcuuidByID(dbItem.PodGroupID)
+	}
+	var podServiceLcuuid string
+	if dbItem.PodServiceID != 0 {
+		podServiceLcuuid, _ = toolDataSet.GetPodServiceLcuuidByID(dbItem.PodServiceID)
 	}
 	vpcLcuuid, _ := toolDataSet.GetVPCLcuuidByID(dbItem.VPCID)
 	b.Pods[dbItem.Lcuuid] = &Pod{
@@ -51,17 +58,18 @@ func (b *DataSet) AddPod(dbItem *mysql.Pod, seq int, toolDataSet *tool.DataSet) 
 		PodNodeLcuuid:       podNodeLcuuid,
 		PodReplicaSetLcuuid: podReplicaSetLcuuid,
 		PodGroupLcuuid:      podGroupLcuuid,
+		PodServiceLcuuid:    podServiceLcuuid,
 		VPCLcuuid:           vpcLcuuid,
 		RegionLcuuid:        dbItem.Region,
 		AZLcuuid:            dbItem.AZ,
 		SubDomainLcuuid:     dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_EN, b.Pods[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_EN, b.Pods[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePod(lcuuid string) {
 	delete(b.Pods, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type Pod struct {
@@ -76,6 +84,7 @@ type Pod struct {
 	PodNodeLcuuid       string    `json:"pod_node_lcuuid"`
 	PodReplicaSetLcuuid string    `json:"pod_replica_set_lcuuid"`
 	PodGroupLcuuid      string    `json:"pod_group_lcuuid"`
+	PodServiceLcuuid    string    `json:"pod_service_lcuuid"`
 	VPCLcuuid           string    `json:"vpc_lcuuid"`
 	RegionLcuuid        string    `json:"region_lcuuid"`
 	AZLcuuid            string    `json:"az_lcuuid"`
@@ -93,6 +102,7 @@ func (p *Pod) Update(cloudItem *cloudmodel.Pod) {
 	p.PodNodeLcuuid = cloudItem.PodNodeLcuuid
 	p.PodReplicaSetLcuuid = cloudItem.PodReplicaSetLcuuid
 	p.PodGroupLcuuid = cloudItem.PodGroupLcuuid
+	p.PodServiceLcuuid = cloudItem.PodServiceLcuuid
 	p.VPCLcuuid = cloudItem.VPCLcuuid
 	p.RegionLcuuid = cloudItem.RegionLcuuid
 	p.AZLcuuid = cloudItem.AZLcuuid

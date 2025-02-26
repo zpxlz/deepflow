@@ -22,6 +22,7 @@ import (
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (h *HuaWei) getAZs() ([]model.AZ, error) {
@@ -39,10 +40,10 @@ func (h *HuaWei) getAZs() ([]model.AZ, error) {
 			ja := jAZs[i]
 			zname := ja.Get("zoneName").MustString()
 			if !cloudcommon.CheckJsonAttributes(ja, []string{"zoneName"}) {
-				log.Infof("exclude az: %s, missing attr", zname)
+				log.Infof("exclude az: %s, missing attr", zname, logger.NewORGPrefix(h.orgID))
 				continue
 			}
-			lcuuid := common.GenerateUUID(zname + "_" + h.lcuuidGenerate)
+			lcuuid := common.GenerateUUIDByOrgID(h.orgID, zname+"_"+h.lcuuidGenerate)
 			azs = append(
 				azs,
 				model.AZ{

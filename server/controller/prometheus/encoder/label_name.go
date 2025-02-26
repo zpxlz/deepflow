@@ -19,29 +19,37 @@ package encoder
 import (
 	"sync"
 
+	"github.com/cornelk/hashmap"
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/deepflowio/deepflow/message/controller"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/prometheus/common"
 )
 
 // 缓存资源可用于分配的ID，提供ID的刷新、分配、回收接口
 type labelName struct {
+	org          *common.ORG
 	lock         sync.Mutex
 	resourceType string
-	strToID      map[string]int
+	strToID      *hashmap.Map[string, int]
 	ascIDAllocator
 }
 
-func newLabelName(max int) *labelName {
+func newLabelName(org *common.ORG, max int) *labelName {
 	ln := &labelName{
+		org:          org,
 		resourceType: "label_name",
-		strToID:      make(map[string]int),
+		strToID:      hashmap.New[string, int](),
 	}
-	ln.ascIDAllocator = newAscIDAllocator(ln.resourceType, 1, max)
+	ln.ascIDAllocator = newAscIDAllocator(org, ln.resourceType, 1, max)
 	ln.rawDataProvider = ln
 	return ln
+}
+
+func (mn *labelName) getID(str string) (int, bool) {
+	return mn.strToID.Get(str)
 }
 
 func (ln *labelName) refresh(args ...interface{}) error {
@@ -56,14 +64,14 @@ func (ln *labelName) encode(strs []string) ([]*controller.PrometheusLabelName, e
 	defer ln.lock.Unlock()
 
 	resp := make([]*controller.PrometheusLabelName, 0)
-	var dbToAdd []*mysql.PrometheusLabelName
+	var dbToAdd []*metadbmodel.PrometheusLabelName
 	for i := range strs {
 		str := strs[i]
-		if id, ok := ln.strToID[str]; ok {
+		if id, ok := ln.strToID.Get(str); ok {
 			resp = append(resp, &controller.PrometheusLabelName{Name: &str, Id: proto.Uint32(uint32(id))})
 			continue
 		}
-		dbToAdd = append(dbToAdd, &mysql.PrometheusLabelName{Name: str})
+		dbToAdd = append(dbToAdd, &metadbmodel.PrometheusLabelName{Name: str})
 	}
 	if len(dbToAdd) == 0 {
 		return resp, nil
@@ -75,47 +83,47 @@ func (ln *labelName) encode(strs []string) ([]*controller.PrometheusLabelName, e
 	for i := range ids {
 		dbToAdd[i].ID = ids[i]
 	}
-	err = addBatch(dbToAdd, ln.resourceType)
+	err = addBatch(ln.org.DB, dbToAdd, ln.resourceType)
 	if err != nil {
-		log.Errorf("add %s error: %s", ln.resourceType, err.Error())
+		log.Errorf("add %s error: %s", ln.resourceType, err.Error(), ln.org.LogPrefix)
 		return nil, err
 	}
 	for i := range dbToAdd {
 		id := dbToAdd[i].ID
 		str := dbToAdd[i].Name
-		ln.strToID[str] = id
+		ln.strToID.Set(str, id)
 		resp = append(resp, &controller.PrometheusLabelName{Name: &str, Id: proto.Uint32(uint32(id))})
 	}
 	return resp, nil
 }
 
 func (ln *labelName) load() (ids mapset.Set[int], err error) {
-	var items []*mysql.PrometheusLabelName
-	err = mysql.Db.Find(&items).Error
+	var items []*metadbmodel.PrometheusLabelName
+	err = ln.org.DB.Find(&items).Error
 	if err != nil {
-		log.Errorf("db query %s failed: %v", ln.resourceType, err)
+		log.Errorf("db query %s failed: %v", ln.resourceType, err, ln.org.LogPrefix)
 		return nil, err
 	}
 	inUseIDsSet := mapset.NewSet[int]()
 	for _, item := range items {
 		inUseIDsSet.Add(item.ID)
-		ln.strToID[item.Name] = item.ID
+		ln.strToID.Set(item.Name, item.ID)
 	}
 	return inUseIDsSet, nil
 }
 
 func (ln *labelName) check(ids []int) (inUseIDs []int, err error) {
-	var dbItems []*mysql.PrometheusLabelName
-	err = mysql.Db.Unscoped().Where("id IN ?", ids).Find(&dbItems).Error
+	var dbItems []*metadbmodel.PrometheusLabelName
+	err = ln.org.DB.Unscoped().Where("id IN ?", ids).Find(&dbItems).Error
 	if err != nil {
-		log.Errorf("db query %s failed: %v", ln.resourceType, err)
+		log.Errorf("db query %s failed: %v", ln.resourceType, err, ln.org.LogPrefix)
 		return
 	}
 	if len(dbItems) != 0 {
 		for _, item := range dbItems {
 			inUseIDs = append(inUseIDs, item.ID)
 		}
-		log.Infof("%s ids: %+v are in use.", ln.resourceType, inUseIDs)
+		log.Infof("%s ids: %+v are in use.", ln.resourceType, inUseIDs, ln.org.LogPrefix)
 	}
 	return
 }

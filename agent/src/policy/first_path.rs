@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
@@ -247,7 +248,7 @@ pub struct FirstPath {
     fast: FastPath,
 
     fast_disable: bool,
-    queue_count: usize,
+    memory_check_disable: bool,
 
     memory_limit: AtomicU64,
 }
@@ -261,7 +262,13 @@ impl FirstPath {
     const POLICY_LIMIT: u64 = 500000;
     const MEMORY_LIMIT: u64 = 1 << 20;
 
-    pub fn new(queue_count: usize, level: usize, map_size: usize, fast_disable: bool) -> FirstPath {
+    pub fn new(
+        queue_count: usize,
+        level: usize,
+        map_size: usize,
+        fast_disable: bool,
+        memory_check_disable: bool,
+    ) -> FirstPath {
         FirstPath {
             group_ip_map: Some(AHashMap::new()),
             vector_4: Vector4::default(),
@@ -280,14 +287,10 @@ impl FirstPath {
             current_level: level,
 
             fast: FastPath::new(queue_count, map_size),
-            queue_count,
             fast_disable,
+            memory_check_disable,
             memory_limit: AtomicU64::new(0),
         }
-    }
-
-    pub fn update_map_size(&mut self, map_size: usize) {
-        self.fast.update_map_size(map_size)
     }
 
     pub fn update_interfaces(&mut self, ifaces: &Vec<Arc<PlatformData>>) {
@@ -369,14 +372,25 @@ impl FirstPath {
         return false;
     }
 
-    fn memory_check(&self, size: u64) -> bool {
+    fn memory_check(&self, size: u64, disabled: bool) -> bool {
+        if self.memory_check_disable || disabled {
+            return true;
+        }
+
         let Ok(current) = get_memory_rss() else {
             warn!("Cannot check policy memory: Get process memory failed.");
             return true;
         };
         let memory_limit = self.memory_limit.load(Ordering::Relaxed);
+        if memory_limit == 0 {
+            return true;
+        }
+        if current >= memory_limit {
+            warn!("The current memory usage is greater than the memory threshold, Please reconfigure the memory threshold.");
+            return false;
+        }
 
-        memory_limit == 0 || current + size < memory_limit
+        current + size < memory_limit
     }
 
     fn generate_acl_bits(&mut self, acls: &mut Vec<Acl>) -> PResult<u64> {
@@ -441,7 +455,7 @@ impl FirstPath {
                 * dst_ipv6_count
                 * acl.src_port_ranges.len().max(1)
                 * acl.dst_port_ranges.len().max(1);
-            if !self.memory_check(need_memory as u64) {
+            if !self.memory_check(need_memory as u64, false) {
                 warn!(
                     "Memory will exceed limit {} bytes, policy {} probably need memory {} bytes.",
                     self.memory_limit.load(Ordering::Relaxed),
@@ -557,7 +571,7 @@ impl FirstPath {
             let item_count = vector_4.count + vector_6.count;
             info!("Policy memory level {}, policy count {}, item count {} + {} = {}, vector size {}, probably need memory {}B bytes.",
                 self.current_level, policy_count, vector_4.count, vector_6.count, item_count, vector_size, need_memory + acl_memory);
-            ok = self.memory_check(need_memory);
+            ok = self.memory_check(need_memory, acls.is_empty());
             if !ok {
                 if self.current_level < Self::LEVEL_MAX && item_count > policy_count {
                     self.current_level += 1;
@@ -694,6 +708,33 @@ impl FirstPath {
         return Some((forward_policy, forward_endpoints));
     }
 
+    pub fn ebpf_fast_get(
+        &mut self,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+    ) -> Option<Arc<EndpointData>> {
+        if self.fast_disable {
+            return None;
+        }
+
+        self.fast
+            .ebpf_get_endpoints(ip_src, ip_dst, l3_epc_id_src, l3_epc_id_dst)
+    }
+
+    pub fn ebpf_fast_add(
+        &mut self,
+        ip_src: IpAddr,
+        ip_dst: IpAddr,
+        l3_epc_id_src: i32,
+        l3_epc_id_dst: i32,
+        endpoints: EndpointData,
+    ) -> Arc<EndpointData> {
+        self.fast
+            .ebpf_add_endpoints(ip_src, ip_dst, l3_epc_id_src, l3_epc_id_dst, endpoints)
+    }
+
     pub fn fast_get(
         &mut self,
         key: &mut LookupKey,
@@ -721,6 +762,10 @@ impl FirstPath {
     pub fn set_memory_limit(&self, limit: u64) {
         self.memory_limit.store(limit, Ordering::Relaxed);
     }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        self.fast.reset_queue_size(queue_count);
+    }
 }
 
 #[cfg(test)]
@@ -729,7 +774,7 @@ mod tests {
 
     use super::*;
     use crate::common::endpoint::EndpointInfo;
-    use crate::common::enums::TapType;
+    use crate::common::enums::CaptureNetworkType;
     use crate::common::port_range::PortRange;
 
     use npb_pcap_policy::{NpbAction, NpbTunnelType, TapSide};
@@ -771,7 +816,7 @@ mod tests {
     }
 
     fn generate_table() -> PResult<FirstPath> {
-        let mut first = FirstPath::new(1, 8, 1 << 16, false);
+        let mut first = FirstPath::new(1, 8, 1 << 16, false, false);
         let acl = Acl::new(
             1,
             vec![10],
@@ -821,7 +866,7 @@ mod tests {
             src_port: 80,
             dst_port: 100,
             feature_flag: FeatureFlags::NONE,
-            tap_type: TapType::Cloud,
+            tap_type: CaptureNetworkType::Cloud,
             ..Default::default()
         };
 
@@ -856,7 +901,7 @@ mod tests {
             src_port: 80,
             dst_port: 100,
             feature_flag: FeatureFlags::DEDUP,
-            tap_type: TapType::Cloud,
+            tap_type: CaptureNetworkType::Cloud,
             ..Default::default()
         };
         let (policy, _) = first_get(&mut first, &mut key, endpotins).unwrap();

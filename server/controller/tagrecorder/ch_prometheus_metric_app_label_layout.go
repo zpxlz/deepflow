@@ -17,36 +17,37 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChPrometheusMetricAPPLabelLayout struct {
-	UpdaterBase[mysql.ChPrometheusMetricAPPLabelLayout, IDKey]
+	UpdaterComponent[metadbmodel.ChPrometheusMetricAPPLabelLayout, IDKey]
 }
 
 func NewChPrometheusMetricAPPLabelLayout() *ChPrometheusMetricAPPLabelLayout {
 	updater := &ChPrometheusMetricAPPLabelLayout{
-		UpdaterBase[mysql.ChPrometheusMetricAPPLabelLayout, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_PROMETHEUS_METRIC_APP_LABEL_LAYOUT,
-		},
+		newUpdaterComponent[metadbmodel.ChPrometheusMetricAPPLabelLayout, IDKey](
+			RESOURCE_TYPE_CH_PROMETHEUS_METRIC_APP_LABEL_LAYOUT,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (l *ChPrometheusMetricAPPLabelLayout) generateNewData() (map[IDKey]mysql.ChPrometheusMetricAPPLabelLayout, bool) {
-	var prometheusMetricAPPLabelLayout []mysql.PrometheusMetricAPPLabelLayout
+func (l *ChPrometheusMetricAPPLabelLayout) generateNewData(db *metadb.DB) (map[IDKey]metadbmodel.ChPrometheusMetricAPPLabelLayout, bool) {
+	var prometheusMetricAPPLabelLayout []metadbmodel.PrometheusMetricAPPLabelLayout
 
-	err := mysql.Db.Unscoped().Find(&prometheusMetricAPPLabelLayout).Error
+	err := db.Unscoped().Find(&prometheusMetricAPPLabelLayout).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChPrometheusMetricAPPLabelLayout)
+	keyToItem := make(map[IDKey]metadbmodel.ChPrometheusMetricAPPLabelLayout)
 	for _, metricAPPLabelLayout := range prometheusMetricAPPLabelLayout {
-		keyToItem[IDKey{ID: metricAPPLabelLayout.ID}] = mysql.ChPrometheusMetricAPPLabelLayout{
+		keyToItem[IDKey{ID: metricAPPLabelLayout.ID}] = metadbmodel.ChPrometheusMetricAPPLabelLayout{
 			ID:                  metricAPPLabelLayout.ID,
 			MetricName:          metricAPPLabelLayout.MetricName,
 			APPLabelName:        metricAPPLabelLayout.APPLabelName,
@@ -56,11 +57,11 @@ func (l *ChPrometheusMetricAPPLabelLayout) generateNewData() (map[IDKey]mysql.Ch
 	return keyToItem, true
 }
 
-func (l *ChPrometheusMetricAPPLabelLayout) generateKey(dbItem mysql.ChPrometheusMetricAPPLabelLayout) IDKey {
+func (l *ChPrometheusMetricAPPLabelLayout) generateKey(dbItem metadbmodel.ChPrometheusMetricAPPLabelLayout) IDKey {
 	return IDKey{ID: dbItem.ID}
 }
 
-func (l *ChPrometheusMetricAPPLabelLayout) generateUpdateInfo(oldItem, newItem mysql.ChPrometheusMetricAPPLabelLayout) (map[string]interface{}, bool) {
+func (l *ChPrometheusMetricAPPLabelLayout) generateUpdateInfo(oldItem, newItem metadbmodel.ChPrometheusMetricAPPLabelLayout) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.MetricName != newItem.MetricName {
 		updateInfo["metric_name"] = newItem.MetricName

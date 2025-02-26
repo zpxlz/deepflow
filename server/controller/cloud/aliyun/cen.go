@@ -20,17 +20,18 @@ import (
 	cbn "github.com/aliyun/alibaba-cloud-sdk-go/services/cbn"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aliyun) getCens(region model.Region) ([]model.CEN, error) {
+func (a *Aliyun) getCens(region model.Region) []model.CEN {
 	var retCens []model.CEN
 
-	log.Debug("get cens starting")
+	log.Debug("get cens starting", logger.NewORGPrefix(a.orgID))
 	request := cbn.CreateDescribeCensRequest()
 	response, err := a.getCenResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return nil, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.CEN{}
 	}
 
 	for _, r := range response {
@@ -51,8 +52,8 @@ func (a *Aliyun) getCens(region model.Region) ([]model.CEN, error) {
 			childRequest.CenId = cenId
 			childResponse, err := a.getCenAttributeResponse(region.Label, childRequest)
 			if err != nil {
-				log.Error(err)
-				return nil, err
+				log.Warning(err, logger.NewORGPrefix(a.orgID))
+				return []model.CEN{}
 			}
 
 			vpcLcuuids := []string{}
@@ -65,7 +66,7 @@ func (a *Aliyun) getCens(region model.Region) ([]model.CEN, error) {
 					}
 					vpcLcuuids = append(
 						vpcLcuuids,
-						common.GenerateUUID(cenAttr.Get("ChildInstanceId").MustString()),
+						common.GenerateUUIDByOrgID(a.orgID, cenAttr.Get("ChildInstanceId").MustString()),
 					)
 				}
 			}
@@ -73,7 +74,7 @@ func (a *Aliyun) getCens(region model.Region) ([]model.CEN, error) {
 				continue
 			}
 			retCens = append(retCens, model.CEN{
-				Lcuuid:     common.GenerateUUID(cenId),
+				Lcuuid:     common.GenerateUUIDByOrgID(a.orgID, cenId),
 				Name:       cenName,
 				Label:      cenId,
 				VPCLcuuids: vpcLcuuids,
@@ -81,6 +82,6 @@ func (a *Aliyun) getCens(region model.Region) ([]model.CEN, error) {
 		}
 	}
 
-	log.Debug("get cens complete")
-	return retCens, nil
+	log.Debug("get cens complete", logger.NewORGPrefix(a.orgID))
+	return retCens
 }

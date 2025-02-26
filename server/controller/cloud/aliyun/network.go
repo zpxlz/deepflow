@@ -20,17 +20,18 @@ import (
 	vpc "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (a *Aliyun) getNetworks(region model.Region) ([]model.Network, []model.Subnet, error) {
 	var retNetworks []model.Network
 	var retSubnets []model.Subnet
 
-	log.Debug("get networks starting")
+	log.Debug("get networks starting", logger.NewORGPrefix(a.orgID))
 	request := vpc.CreateDescribeVSwitchesRequest()
 	response, err := a.getNetworkResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(a.orgID))
 		return retNetworks, retSubnets, err
 	}
 	for _, r := range response {
@@ -54,8 +55,8 @@ func (a *Aliyun) getNetworks(region model.Region) ([]model.Network, []model.Subn
 			azId := network.Get("ZoneId").MustString()
 			cidr := network.Get("CidrBlock").MustString()
 
-			networkLcuuid := common.GenerateUUID(networkId)
-			vpcLcuuid := common.GenerateUUID(vpcId)
+			networkLcuuid := common.GenerateUUIDByOrgID(a.orgID, networkId)
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, vpcId)
 			retNetwork := model.Network{
 				Lcuuid:         networkLcuuid,
 				Name:           networkName,
@@ -64,15 +65,14 @@ func (a *Aliyun) getNetworks(region model.Region) ([]model.Network, []model.Subn
 				Shared:         false,
 				External:       false,
 				NetType:        common.NETWORK_TYPE_LAN,
-				AZLcuuid:       common.GenerateUUID(a.uuidGenerate + "_" + azId),
-				RegionLcuuid:   a.getRegionLcuuid(region.Lcuuid),
+				AZLcuuid:       common.GenerateUUIDByOrgID(a.orgID, a.uuidGenerate+"_"+azId),
+				RegionLcuuid:   a.regionLcuuid,
 			}
 			retNetworks = append(retNetworks, retNetwork)
 			a.azLcuuidToResourceNum[retNetwork.AZLcuuid]++
-			a.regionLcuuidToResourceNum[retNetwork.RegionLcuuid]++
 
 			retSubnet := model.Subnet{
-				Lcuuid:        common.GenerateUUID(networkLcuuid),
+				Lcuuid:        common.GenerateUUIDByOrgID(a.orgID, networkLcuuid),
 				Name:          networkName,
 				CIDR:          cidr,
 				NetworkLcuuid: networkLcuuid,
@@ -81,6 +81,6 @@ func (a *Aliyun) getNetworks(region model.Region) ([]model.Network, []model.Subn
 			retSubnets = append(retSubnets, retSubnet)
 		}
 	}
-	log.Debug("get networks complete")
+	log.Debug("get networks complete", logger.NewORGPrefix(a.orgID))
 	return retNetworks, retSubnets, nil
 }

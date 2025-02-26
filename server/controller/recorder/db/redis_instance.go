@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type RedisInstance struct {
-	OperatorBase[mysql.RedisInstance]
+	OperatorBase[*metadbmodel.RedisInstance, metadbmodel.RedisInstance]
 }
 
 func NewRedisInstance() *RedisInstance {
 	operater := &RedisInstance{
-		OperatorBase[mysql.RedisInstance]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.RedisInstance](
+			ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *RedisInstance) setDBItemID(dbItem *mysql.RedisInstance, id int) {
-	dbItem.ID = id
 }

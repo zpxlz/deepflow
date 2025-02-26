@@ -17,63 +17,74 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChNetwork struct {
-	UpdaterBase[mysql.ChNetwork, IDKey]
+	SubscriberComponent[*message.NetworkFieldsUpdate, message.NetworkFieldsUpdate, metadbmodel.Network, metadbmodel.ChNetwork, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChNetwork(resourceTypeToIconID map[IconKey]int) *ChNetwork {
-	updater := &ChNetwork{
-		UpdaterBase[mysql.ChNetwork, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_NETWORK,
-		},
+	mng := &ChNetwork{
+		newSubscriberComponent[*message.NetworkFieldsUpdate, message.NetworkFieldsUpdate, metadbmodel.Network, metadbmodel.ChNetwork, IDKey](
+			common.RESOURCE_TYPE_NETWORK_EN, RESOURCE_TYPE_CH_NETWORK,
+		),
 		resourceTypeToIconID,
 	}
+	mng.subscriberDG = mng
 
-	updater.dataGenerator = updater
-	return updater
+	return mng
 }
 
-func (n *ChNetwork) generateNewData() (map[IDKey]mysql.ChNetwork, bool) {
-	var networks []mysql.Network
-	err := mysql.Db.Unscoped().Find(&networks).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(n.resourceTypeName, err))
-		return nil, false
+// sourceToTarget implements SubscriberDataGenerator
+func (c *ChNetwork) sourceToTarget(md *message.Metadata, source *metadbmodel.Network) (keys []IDKey, targets []metadbmodel.ChNetwork) {
+	networkName := source.Name
+	if source.DeletedAt.Valid {
+		networkName += " (deleted)"
 	}
 
-	keyToItem := make(map[IDKey]mysql.ChNetwork)
-	for _, network := range networks {
-		networkName := network.Name
-		if network.DeletedAt.Valid {
-			networkName += " (deleted)"
-		}
-		keyToItem[IDKey{ID: network.ID}] = mysql.ChNetwork{
-			ID:     network.ID,
-			Name:   networkName,
-			IconID: n.resourceTypeToIconID[IconKey{NodeType: RESOURCE_TYPE_VL2}],
-		}
-	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: source.ID})
+	targets = append(targets, metadbmodel.ChNetwork{
+		ID:   source.ID,
+		Name: networkName,
+		IconID: c.resourceTypeToIconID[IconKey{
+			NodeType: RESOURCE_TYPE_VL2,
+		}],
+		TeamID:      md.TeamID,
+		DomainID:    md.DomainID,
+		SubDomainID: md.SubDomainID,
+		L3EPCID:     source.VPCID,
+	})
+	return
 }
 
-func (n *ChNetwork) generateKey(dbItem mysql.ChNetwork) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (n *ChNetwork) generateUpdateInfo(oldItem, newItem mysql.ChNetwork) (map[string]interface{}, bool) {
+// onResourceUpdated implements SubscriberDataGenerator
+func (c *ChNetwork) onResourceUpdated(sourceID int, fieldsUpdate *message.NetworkFieldsUpdate, db *metadb.DB) {
 	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
+
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
+	if fieldsUpdate.VPCID.IsDifferent() {
+		updateInfo["l3_epc_id"] = fieldsUpdate.VPCID.GetNew()
 	}
 	if len(updateInfo) > 0 {
-		return updateInfo, true
+		var chItem metadbmodel.ChNetwork
+		db.Where("id = ?", sourceID).First(&chItem)
+		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
 	}
-	return nil, false
+}
+
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (c *ChNetwork) softDeletedTargetsUpdated(targets []metadbmodel.ChNetwork, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

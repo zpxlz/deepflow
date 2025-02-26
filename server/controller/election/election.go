@@ -40,6 +40,19 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/utils/atomicbool"
 )
 
+var (
+	acquireTime = int64(0)
+	startTime   = time.Now().Unix()
+)
+
+func GetAcquireTime() int64 { // 提供给 trisolairs 使用，确保各个 server 的 trisolairs 版本号是一致的
+	if common.IsStandaloneRunningMode() {
+		// in standalone mode, the local machine is the master node because of all in one deployment
+		return startTime
+	}
+	return acquireTime
+}
+
 const (
 	ID_ITEM_NUM = 4
 )
@@ -120,7 +133,7 @@ func getCurrentLeader(ctx context.Context, lock *resourcelock.LeaseLock) string 
 	return record.HolderIdentity
 }
 
-func checkLeaderValid(ctx context.Context, lock *resourcelock.LeaseLock) {
+func checkLeaderValid(ctx context.Context, lock *resourcelock.LeaseLock) { // server 启动后，确保设置稳定的 leaderData
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	ctx, cancel := context.WithCancel(ctx)
@@ -146,7 +159,8 @@ func checkLeaderValid(ctx context.Context, lock *resourcelock.LeaseLock) {
 				log.Error(err)
 				continue
 			}
-			if !record.RenewTime.Equal(&observedTime) {
+			if !record.RenewTime.Equal(&observedTime) { // ticker 时间需要小于 leaderelection.LeaderElectionConfig.RenewDeadline 设置
+				acquireTime = record.AcquireTime.Unix()
 				leaderData.setValide()
 				leaderData.SetLeader(record.HolderIdentity)
 				log.Infof("check leader finish, leader is %s", record.HolderIdentity)
@@ -199,9 +213,9 @@ func Start(ctx context.Context, cfg *config.ControllerConfig) {
 		// get elected before your background loop finished, violating
 		// the stated goal of the lease.
 		ReleaseOnCancel: true,
-		LeaseDuration:   60 * time.Second,
-		RenewDeadline:   15 * time.Second,
-		RetryPeriod:     5 * time.Second,
+		LeaseDuration:   15 * time.Second,
+		RenewDeadline:   10 * time.Second,
+		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				// we're notified when we start - this is where you would

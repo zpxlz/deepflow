@@ -21,7 +21,7 @@ use std::sync::{
 };
 
 use ahash::AHashMap;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use pnet::datalink;
 use public::enums::IpProtocol;
 
@@ -32,7 +32,7 @@ use super::{
     Result as PResult,
 };
 use crate::common::endpoint::{EndpointData, EndpointDataPov};
-use crate::common::enums::TapType;
+use crate::common::enums::CaptureNetworkType;
 use crate::common::flow::{PacketDirection, SignalSource};
 use crate::common::lookup_key::LookupKey;
 use crate::common::platform_data::PlatformData;
@@ -43,8 +43,7 @@ use crate::common::MetaPacket;
 use crate::common::TapPort;
 use crate::common::{FlowAclListener, FlowAclListenerId};
 use npb_pcap_policy::PolicyData;
-use public::proto::common::TridentType;
-use public::proto::trident::RoleType;
+use public::proto::agent::{AgentType, RoleType};
 use public::queue::Sender;
 
 pub struct PolicyMonitor {
@@ -94,7 +93,6 @@ pub struct Policy {
 
     nat: RwLock<Vec<AHashMap<u128, GpidEntry>>>,
 
-    queue_count: usize,
     first_hit: usize,
     fast_hit: usize,
 
@@ -110,13 +108,23 @@ impl Policy {
         map_size: usize,
         forward_capacity: usize,
         fast_disable: bool,
+        memory_check_disable: bool,
     ) -> (PolicySetter, PolicyGetter) {
+        if memory_check_disable {
+            info!("The policy module does not check the memory.");
+        }
+
         let policy = Box::into_raw(Box::new(Policy {
             labeler: Labeler::default(),
-            table: FirstPath::new(queue_count, level, map_size, fast_disable),
+            table: FirstPath::new(
+                queue_count,
+                level,
+                map_size,
+                fast_disable,
+                memory_check_disable,
+            ),
             forward: Forward::new(queue_count, forward_capacity),
             nat: RwLock::new(vec![AHashMap::new(), AHashMap::new()]),
-            queue_count,
             first_hit: 0,
             fast_hit: 0,
             monitor: None,
@@ -133,7 +141,7 @@ impl Policy {
     pub fn lookup_l3(&mut self, packet: &mut MetaPacket) {
         let key = &mut packet.lookup_key;
         let index = key.fast_index;
-        if key.tap_type != TapType::Cloud {
+        if key.tap_type != CaptureNetworkType::Cloud {
             return;
         }
         if key.src_ip.is_loopback() {
@@ -266,8 +274,8 @@ impl Policy {
         let key = &mut packet.lookup_key;
 
         if packet.signal_source == SignalSource::EBPF {
-            let (endpoints, gpid_entries) = self.lookup_all_by_epc(key, local_epc_id);
-            packet.endpoint_data = Some(EndpointDataPov::new(Arc::new(endpoints)));
+            let (endpoints, gpid_entries) = self.lookup_from_ebpf(key, local_epc_id);
+            packet.endpoint_data = Some(EndpointDataPov::new(endpoints));
             packet.policy_data = Some(Arc::new(PolicyData::default())); // Only endpoint is required for ebpf data
             Self::fill_gpid_entry(packet, &gpid_entries);
             return;
@@ -355,12 +363,13 @@ impl Policy {
         endpoints.dst_info.l3_epc_id
     }
 
+    // NOTE: This function has insufficient performance and is only used in low PPS scenarios.
+    // Currently, only the Integration collector is calling this function.
     pub fn lookup_all_by_epc(
         &self,
         key: &mut LookupKey,
         local_epc_id: i32,
     ) -> (EndpointData, GpidEntry) {
-        // TODO：可能也需要走fast提升性能
         let (l3_epc_id_0, l3_epc_id_1) = if key.l2_end_0 {
             (local_epc_id, 0)
         } else {
@@ -383,22 +392,66 @@ impl Policy {
         (endpoints, entry)
     }
 
-    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+    fn lookup_from_ebpf(
+        &mut self,
+        key: &mut LookupKey,
+        local_epc_id: i32,
+    ) -> (Arc<EndpointData>, GpidEntry) {
+        let (l3_epc_id_0, l3_epc_id_1) = if key.l2_end_0 {
+            (local_epc_id, 0)
+        } else {
+            (0, local_epc_id)
+        };
+
+        if let Some(endpoints) =
+            self.table
+                .ebpf_fast_get(key.src_ip, key.dst_ip, l3_epc_id_0, l3_epc_id_1)
+        {
+            let entry = self.lookup_gpid_entry(key, &endpoints);
+            self.send_ebpf(
+                key.src_ip,
+                key.dst_ip,
+                key.src_port,
+                key.dst_port,
+                endpoints.src_info.l3_epc_id,
+                endpoints.dst_info.l3_epc_id,
+                &entry,
+            );
+            return (endpoints, entry);
+        }
+
+        let endpoints =
+            self.labeler
+                .get_endpoint_data_by_epc(key.src_ip, key.dst_ip, l3_epc_id_0, l3_epc_id_1);
+        let endpoints =
+            self.table
+                .ebpf_fast_add(key.src_ip, key.dst_ip, l3_epc_id_0, l3_epc_id_1, endpoints);
+        let entry = self.lookup_gpid_entry(key, &endpoints);
+        self.send_ebpf(
+            key.src_ip,
+            key.dst_ip,
+            key.src_port,
+            key.dst_port,
+            endpoints.src_info.l3_epc_id,
+            endpoints.dst_info.l3_epc_id,
+            &entry,
+        );
+
+        (endpoints, entry)
+    }
+
+    pub fn lookup_pod_id(&self, container_id: &str) -> u32 {
         self.labeler.lookup_pod_id(container_id)
     }
 
-    pub fn update_interfaces(
-        &mut self,
-        trident_type: TridentType,
-        ifaces: &Vec<Arc<PlatformData>>,
-    ) {
+    pub fn update_interfaces(&mut self, agent_type: AgentType, ifaces: &Vec<Arc<PlatformData>>) {
         self.labeler.update_interface_table(ifaces);
         self.table.update_interfaces(ifaces);
 
         // TODO: 后续需要添加监控本地网卡，如果网卡配置有变化应该也需要出发表更新
         let local_interfaces = datalink::interfaces();
         self.forward
-            .update_from_config(trident_type, ifaces, &local_interfaces);
+            .update_from_config(agent_type, ifaces, &local_interfaces);
     }
 
     pub fn update_ip_group(&mut self, groups: &Vec<Arc<IpGroupData>>) {
@@ -511,6 +564,10 @@ impl Policy {
     pub fn set_memory_limit(&self, limit: u64) {
         self.table.set_memory_limit(limit);
     }
+
+    pub fn reset_queue_size(&mut self, queue_count: usize) {
+        self.table.reset_queue_size(queue_count);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -549,7 +606,7 @@ impl PolicyGetter {
         self.policy().lookup_epc_by_epc(src, dst, l3_epc_id_src)
     }
 
-    pub fn lookup_pod_id(&self, container_id: &String) -> u32 {
+    pub fn lookup_pod_id(&self, container_id: &str) -> u32 {
         self.policy().lookup_pod_id(container_id)
     }
 }
@@ -580,7 +637,7 @@ impl From<*mut Policy> for PolicySetter {
 impl FlowAclListener for PolicySetter {
     fn flow_acl_change(
         &mut self,
-        trident_type: TridentType,
+        agent_type: AgentType,
         local_epc: i32,
         ip_groups: &Vec<Arc<IpGroupData>>,
         platform_data: &Vec<Arc<PlatformData>>,
@@ -589,7 +646,7 @@ impl FlowAclListener for PolicySetter {
         acls: &Vec<Arc<Acl>>,
     ) -> Result<(), String> {
         self.update_local_epc(local_epc);
-        self.update_interfaces(trident_type, platform_data);
+        self.update_interfaces(agent_type, platform_data);
         self.update_ip_group(ip_groups);
         self.update_peer_connections(peers);
         self.update_cidr(cidrs);
@@ -615,20 +672,12 @@ impl PolicySetter {
         unsafe { &mut *self.policy }
     }
 
-    pub fn update_map_size(&mut self, map_size: usize) {
-        self.policy().table.update_map_size(map_size);
-    }
-
     pub fn update_local_epc(&mut self, local_epc: i32) {
         self.policy().labeler.update_local_epc(local_epc);
     }
 
-    pub fn update_interfaces(
-        &mut self,
-        trident_type: TridentType,
-        ifaces: &Vec<Arc<PlatformData>>,
-    ) {
-        self.policy().update_interfaces(trident_type, ifaces);
+    pub fn update_interfaces(&mut self, agent_type: AgentType, ifaces: &Vec<Arc<PlatformData>>) {
+        self.policy().update_interfaces(agent_type, ifaces);
     }
 
     pub fn update_ip_group(&mut self, groups: &Vec<Arc<IpGroupData>>) {
@@ -680,6 +729,10 @@ impl PolicySetter {
     pub fn set_memory_limit(&self, limit: u64) {
         self.policy().set_memory_limit(limit)
     }
+
+    pub fn reset_queue_size(&self, queue_count: usize) {
+        self.policy().reset_queue_size(queue_count);
+    }
 }
 
 #[cfg(test)]
@@ -696,7 +749,7 @@ mod test {
 
     #[test]
     fn test_policy_normal() {
-        let (mut setter, mut getter) = Policy::new(10, 0, 1024, 1024, false);
+        let (mut setter, mut getter) = Policy::new(10, 0, 1024, 1024, false, false);
         let interface: PlatformData = PlatformData {
             mac: 0x002233445566,
             ips: vec![IpSubnet {
@@ -712,7 +765,7 @@ mod test {
             cidr_type: CidrType::Wan,
             ..Default::default()
         };
-        setter.update_interfaces(TridentType::TtHostPod, &vec![Arc::new(interface)]);
+        setter.update_interfaces(AgentType::TtHostPod, &vec![Arc::new(interface)]);
         setter.update_cidr(&vec![Arc::new(cidr)]);
         setter.flush();
 
@@ -729,7 +782,7 @@ mod test {
         let result = getter.lookup_all_by_key(&mut key);
         assert_eq!(result.is_some(), true);
         if let Some((p, e, _)) = result {
-            assert_eq!(Arc::strong_count(&p), 1);
+            assert_eq!(Arc::strong_count(&p), 2);
             assert_eq!(2, e.src_info.l3_epc_id);
             assert_eq!(10, e.dst_info.l3_epc_id);
         }

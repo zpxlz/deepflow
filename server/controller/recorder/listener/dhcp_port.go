@@ -18,38 +18,31 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/event"
-	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type DHCPPort struct {
-	cache         *cache.Cache
-	eventProducer *event.DHCPPort
+	cache *cache.Cache
 }
 
-func NewDHCPPort(c *cache.Cache, eq *queue.OverwriteQueue) *DHCPPort {
+func NewDHCPPort(c *cache.Cache) *DHCPPort {
 	listener := &DHCPPort{
-		cache:         c,
-		eventProducer: event.NewDHCPPort(c.ToolDataSet, eq),
+		cache: c,
 	}
 	return listener
 }
 
-func (p *DHCPPort) OnUpdaterAdded(addedDBItems []*mysql.DHCPPort) {
-	p.eventProducer.ProduceByAdd(addedDBItems)
+func (p *DHCPPort) OnUpdaterAdded(addedDBItems []*metadbmodel.DHCPPort) {
 	p.cache.AddDHCPPorts(addedDBItems)
 }
 
 func (p *DHCPPort) OnUpdaterUpdated(cloudItem *cloudmodel.DHCPPort, diffBase *diffbase.DHCPPort) {
-	p.eventProducer.ProduceByUpdate(cloudItem, diffBase)
 	diffBase.Update(cloudItem)
 	p.cache.UpdateDHCPPort(cloudItem)
 }
 
 func (p *DHCPPort) OnUpdaterDeleted(lcuuids []string) {
-	p.eventProducer.ProduceByDelete(lcuuids)
 	p.cache.DeleteDHCPPorts(lcuuids)
 }

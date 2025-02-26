@@ -19,6 +19,7 @@ package qingcloud
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (q *QingCloud) GetRouterAndTables() (
@@ -29,14 +30,14 @@ func (q *QingCloud) GetRouterAndTables() (
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Info("get routers starting")
+	log.Info("get routers starting", logger.NewORGPrefix(q.orgID))
 
 	for regionId, regionLcuuid := range q.RegionIdToLcuuid {
 		// 获取普通路由表
 		kwargs := []*Param{{"zone", regionId}}
 		response, err := q.GetResponse("DescribeRouteTables", "routing_table_set", kwargs)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, nil, nil, err
 		}
 
@@ -68,16 +69,16 @@ func (q *QingCloud) GetRouterAndTables() (
 					break
 				}
 				if vxnetId == "" {
-					log.Infof("routing table (%s) vxnetId not found", routerId)
+					log.Infof("routing table (%s) vxnetId not found", routerId, logger.NewORGPrefix(q.orgID))
 					continue
 				}
 				vpcLcuuid, ok := q.VxnetIdToVPCLcuuid[vxnetId]
 				if !ok {
-					log.Infof("routing table (%s) vxnetId (%s) vpc not found", routerId, vxnetId)
+					log.Infof("routing table (%s) vxnetId (%s) vpc not found", routerId, vxnetId, logger.NewORGPrefix(q.orgID))
 					continue
 				}
 
-				routerLcuuid := common.GenerateUUID(routerId)
+				routerLcuuid := common.GenerateUUIDByOrgID(q.orgID, routerId)
 				retVRouters = append(retVRouters, model.VRouter{
 					Lcuuid:       routerLcuuid,
 					Name:         routerName,
@@ -107,7 +108,7 @@ func (q *QingCloud) GetRouterAndTables() (
 
 					routerTableId := routerTable.Get("rtable_rule_id").MustString()
 					retRoutingTables = append(retRoutingTables, model.RoutingTable{
-						Lcuuid:        common.GenerateUUID(routerTableId),
+						Lcuuid:        common.GenerateUUIDByOrgID(q.orgID, routerTableId),
 						VRouterLcuuid: routerLcuuid,
 						Destination:   routerTable.Get("network").MustString(),
 						NexthopType:   nexthopType,
@@ -120,7 +121,7 @@ func (q *QingCloud) GetRouterAndTables() (
 		kwargs = []*Param{{"zone", regionId}, {"status.1", "active"}}
 		response, err = q.GetResponse("DescribeVpcBorders", "vpc_border_set", kwargs)
 		if err != nil {
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(q.orgID))
 			return nil, nil, nil, nil, err
 		}
 
@@ -143,8 +144,8 @@ func (q *QingCloud) GetRouterAndTables() (
 				if routerId == "" {
 					continue
 				}
-				routerLcuuid := common.GenerateUUID(borderId)
-				vpcLcuuid := common.GenerateUUID(routerId)
+				routerLcuuid := common.GenerateUUIDByOrgID(q.orgID, borderId)
+				vpcLcuuid := common.GenerateUUIDByOrgID(q.orgID, routerId)
 				retVRouters = append(retVRouters, model.VRouter{
 					Lcuuid:       routerLcuuid,
 					Name:         borderName,
@@ -159,7 +160,7 @@ func (q *QingCloud) GetRouterAndTables() (
 					"DescribeBorderVxnets", "border_vxnet_set", borderNetKwargs,
 				)
 				if err != nil {
-					log.Error(err)
+					log.Error(err, logger.NewORGPrefix(q.orgID))
 					return nil, nil, nil, nil, err
 				}
 
@@ -168,7 +169,7 @@ func (q *QingCloud) GetRouterAndTables() (
 					"DescribeRouterVxnets", "router_vxnet_set", vpcNetKwargs,
 				)
 				if err != nil {
-					log.Error(err)
+					log.Error(err, logger.NewORGPrefix(q.orgID))
 					return nil, nil, nil, nil, err
 				}
 
@@ -177,17 +178,17 @@ func (q *QingCloud) GetRouterAndTables() (
 						net := rNet.GetIndex(i)
 						vxnetId := net.Get("vxnet_id").MustString()
 						if vxnetId == "" {
-							log.Debugf("border router (%s) not binding network", borderName)
+							log.Debugf("border router (%s) not binding network", borderName, logger.NewORGPrefix(q.orgID))
 							continue
 						}
-						vinterfaceLcuuid := common.GenerateUUID(vxnetId + borderId)
+						vinterfaceLcuuid := common.GenerateUUIDByOrgID(q.orgID, vxnetId+borderId)
 						retVInterfaces = append(retVInterfaces, model.VInterface{
 							Lcuuid:        vinterfaceLcuuid,
 							Type:          common.VIF_TYPE_LAN,
 							Mac:           common.VIF_DEFAULT_MAC,
 							DeviceType:    common.VIF_DEVICE_TYPE_VROUTER,
 							DeviceLcuuid:  routerLcuuid,
-							NetworkLcuuid: common.GenerateUUID(vxnetId),
+							NetworkLcuuid: common.GenerateUUIDByOrgID(q.orgID, vxnetId),
 							VPCLcuuid:     vpcLcuuid,
 							RegionLcuuid:  regionLcuuid,
 						})
@@ -197,19 +198,17 @@ func (q *QingCloud) GetRouterAndTables() (
 							continue
 						}
 						retIPs = append(retIPs, model.IP{
-							Lcuuid:           common.GenerateUUID(vinterfaceLcuuid + privateIP),
+							Lcuuid:           common.GenerateUUIDByOrgID(q.orgID, vinterfaceLcuuid+privateIP),
 							VInterfaceLcuuid: vinterfaceLcuuid,
 							IP:               privateIP,
-							SubnetLcuuid: common.GenerateUUID(
-								common.GenerateUUID(vxnetId),
-							),
-							RegionLcuuid: regionLcuuid,
+							SubnetLcuuid:     common.GenerateUUIDByOrgID(q.orgID, common.GenerateUUIDByOrgID(q.orgID, vxnetId)),
+							RegionLcuuid:     regionLcuuid,
 						})
 					}
 				}
 			}
 		}
 	}
-	log.Info("get routers complete")
+	log.Info("get routers complete", logger.NewORGPrefix(q.orgID))
 	return retVRouters, retRoutingTables, retVInterfaces, retIPs, nil
 }

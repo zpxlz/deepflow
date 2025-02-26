@@ -14,23 +14,27 @@
  * limitations under the License.
  */
 
-#[cfg(target_os = "linux")]
-pub mod kubernetes;
-#[cfg(target_os = "linux")]
-mod libvirt_xml_extractor;
-mod platform_synchronizer;
-#[cfg(target_os = "linux")]
-pub mod prometheus;
+cfg_if::cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        mod libvirt_xml_extractor;
+        pub mod kubernetes;
 
-#[cfg(target_os = "linux")]
-pub use kubernetes::{ApiWatcher, GenericPoller, Poller};
-#[cfg(target_os = "linux")]
-pub use libvirt_xml_extractor::LibvirtXmlExtractor;
+        pub use libvirt_xml_extractor::LibvirtXmlExtractor;
+        pub use kubernetes::{ApiWatcher, GenericPoller, Poller};
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use platform_synchronizer::ProcRegRewrite;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use platform_synchronizer::SocketSynchronizer;
-pub use platform_synchronizer::{process_info_enabled, PlatformSynchronizer};
+pub use platform_synchronizer::{
+    get_os_app_tag_by_exec, OsAppTag, ProcessData, ProcessDataOp, SocketSynchronizer,
+};
+
+mod platform_synchronizer;
+
+pub use platform_synchronizer::process_info_enabled;
+
+mod querier;
+pub mod synchronizer;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceEntry {

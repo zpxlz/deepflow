@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type CEN struct {
-	OperatorBase[mysql.CEN]
+	OperatorBase[*metadbmodel.CEN, metadbmodel.CEN]
 }
 
 func NewCEN() *CEN {
 	operater := &CEN{
-		OperatorBase[mysql.CEN]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_CEN_EN,
-			softDelete:       true,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.CEN](
+			ctrlrcommon.RESOURCE_TYPE_CEN_EN,
+			true,
+			false,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *CEN) setDBItemID(dbItem *mysql.CEN, id int) {
-	dbItem.ID = id
 }

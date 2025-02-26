@@ -27,7 +27,6 @@ use super::TapPort;
 
 use public::proto::flow_log;
 
-const FLOW_LOG_VERSION: u32 = 20220128;
 #[derive(Serialize, Default, Clone, Debug)]
 pub struct TaggedFlow {
     #[serde(flatten)]
@@ -105,10 +104,6 @@ impl Sendable for BoxedTaggedFlow {
     fn message_type(&self) -> SendMessageType {
         SendMessageType::TaggedFlow
     }
-
-    fn version(&self) -> u32 {
-        FLOW_LOG_VERSION
-    }
 }
 
 #[cfg(test)]
@@ -163,7 +158,7 @@ mod tests {
     #[test]
     fn encode() {
         let mut tflow = TaggedFlow::default();
-        tflow.flow.flow_key.vtap_id = 5;
+        tflow.flow.flow_key.agent_id = 5;
         tflow.flow.flow_metrics_peers[1].byte_count = 6;
         tflow.flow.tunnel.tunnel_type = TunnelType::Vxlan;
         tflow.flow.flow_id = 8;

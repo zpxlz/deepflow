@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package wasm_plugin;
+
+message NatsMessage {
+    string subject = 1;
+    string reply_to = 2;
+    bytes payload = 3;
+}
+
+message ZmtpMessage {
+    oneof subscription {
+        string match_pattern = 1;
+    }
+    bytes payload = 2;
+}

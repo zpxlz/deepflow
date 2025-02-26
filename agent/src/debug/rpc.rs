@@ -21,13 +21,12 @@ use parking_lot::RwLock;
 use tokio::runtime::Runtime;
 
 use crate::{
-    config::RuntimeConfig,
     exception::ExceptionHandler,
     rpc::{Session, StaticConfig, Status, Synchronizer},
     trident::AgentId,
 };
 use public::debug::{Error, Result};
-use public::proto::trident::SyncResponse;
+use public::proto::agent;
 
 pub struct RpcDebugger {
     session: Arc<Session>,
@@ -52,7 +51,7 @@ pub struct ConfigResp {
 pub enum RpcMessage {
     Config(Option<String>),
     PlatformData(Option<String>),
-    TapTypes(Option<String>),
+    CaptureNetworkTypes(Option<String>),
     Cidr(Option<String>),
     Groups(Option<String>),
     Acls(Option<String>),
@@ -79,7 +78,9 @@ impl RpcDebugger {
         }
     }
 
-    async fn get_rpc_response(&self) -> Result<tonic::Response<SyncResponse>, tonic::Status> {
+    async fn get_rpc_response(
+        &self,
+    ) -> Result<tonic::Response<agent::SyncResponse>, tonic::Status> {
         let exception_handler = ExceptionHandler::default();
         let req = Synchronizer::generate_sync_request(
             &self.agent_id,
@@ -99,19 +100,18 @@ impl RpcDebugger {
             .map_err(|e| Error::Tonic(e))?
             .into_inner();
 
-        if resp.config.is_none() {
+        if resp.user_config.is_none() {
             return Err(Error::NotFound(String::from(
                 "sync response's config is empty",
             )));
         }
 
-        let c = RuntimeConfig::try_from(resp.config.take().unwrap())?;
         let config = ConfigResp {
             status: resp.status() as i32,
             version_platform_data: resp.version_platform_data(),
             version_groups: resp.version_groups(),
             revision: resp.revision.take().unwrap_or_default(),
-            config: format!("{:?}", c),
+            config: resp.user_config.take().unwrap(),
             version_acls: resp.version_acls(),
             self_update_url: resp.self_update_url.take().unwrap_or_default(),
         };
@@ -128,16 +128,16 @@ impl RpcDebugger {
             .map_err(|e| Error::Tonic(e))?
             .into_inner();
 
-        if resp.tap_types.is_empty() {
+        if resp.capture_network_types.is_empty() {
             return Err(Error::NotFound(String::from(
-                "sync response's tap_types is empty",
+                "sync response's capture_network_types is empty",
             )));
         }
 
         let mut res = resp
-            .tap_types
+            .capture_network_types
             .into_iter()
-            .map(|t| RpcMessage::TapTypes(Some(format!("{:?}", t))))
+            .map(|t| RpcMessage::CaptureNetworkTypes(Some(format!("{:?}", t))))
             .collect::<Vec<_>>();
 
         res.push(RpcMessage::Fin);
@@ -265,7 +265,7 @@ impl RpcDebugger {
                 "local segments data is empty, maybe deepflow-agent is not properly configured"
                     .into(),
             ));
-        }
+        };
 
         let mut segments = resp
             .local_segments

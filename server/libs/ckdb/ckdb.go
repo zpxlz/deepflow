@@ -20,60 +20,50 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"unsafe"
 
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/ClickHouse/ch-go/proto"
 	logging "github.com/op/go-logging"
-
-	"github.com/deepflowio/deepflow/server/libs/utils"
 )
 
 var log = logging.MustGetLogger("ckdb")
 
 const DEFAULT_COLUMN_COUNT = 256
 
-type Block struct {
-	batch driver.Batch
-	items []interface{}
+type CKColumnBlock interface {
+	ToInput(input proto.Input) proto.Input
+	Reset()
 }
 
-func NewBlock(batch driver.Batch) *Block {
-	return &Block{
-		batch: batch,
-		items: make([]interface{}, 0, DEFAULT_COLUMN_COUNT),
+func AppendColNullable[T any](col *proto.ColNullable[T], v *T) {
+	if v == nil {
+		col.Append(proto.Null[T]())
+	} else {
+		col.Append(proto.NewNullable[T](*v))
 	}
 }
 
-func (b *Block) WriteAll() error {
-	err := b.batch.Append(b.items...)
-	b.items = b.items[:0]
-	return err
-}
-
-func (b *Block) Send() error {
-	return b.batch.Send()
-}
-
-func (b *Block) Write(v ...interface{}) {
-	b.items = append(b.items, v...)
-}
-
-func (b *Block) WriteBool(v bool) {
-	b.items = append(b.items, utils.Bool2UInt8(v))
-}
-
-func (b *Block) WriteDateTime(v uint32) {
-	b.items = append(b.items, v)
-}
-
-func (b *Block) WriteIPv4(v uint32) {
-	b.items = append(b.items, utils.IpFromUint32(v))
-}
-
-func (b *Block) WriteIPv6(v net.IP) {
-	if len(v) == 0 {
-		v = net.IPv6zero
+func AppendIPv6(col *proto.ColIPv6, ipv6 net.IP) {
+	if len(ipv6) == 0 {
+		col.Append(proto.IPv6{})
+	} else if len(ipv6) == net.IPv6len {
+		col.Append(*(*[16]byte)(unsafe.Pointer(&ipv6[0])))
+	} else {
+		var protoIPv6 [16]byte
+		copy(protoIPv6[:], ipv6)
+		col.Append(protoIPv6)
 	}
-	b.items = append(b.items, v)
+}
+
+func AppendColDateTime(col *proto.ColDateTime, t uint32) {
+	col.AppendRaw(proto.DateTime(t))
+}
+
+func AppendColDateTime64Micro(col *proto.ColDateTime64, t int64) {
+	if !col.PrecisionSet {
+		col.WithPrecision(proto.PrecisionMicro)
+	}
+	col.AppendRaw(proto.DateTime64(t))
 }
 
 type ColumnType uint8
@@ -113,6 +103,7 @@ const (
 	FixString8
 	LowCardinalityString
 	ArrayLowCardinalityString
+	ENUM8
 )
 
 var cloumnTypeString = []string{
@@ -150,6 +141,7 @@ var cloumnTypeString = []string{
 	FixString8:                "FixedString(8)",
 	LowCardinalityString:      "LowCardinality(String)",
 	ArrayLowCardinalityString: "Array(LowCardinality(String))",
+	ENUM8:                     "Enum8(%s)",
 }
 
 func (t ColumnType) HasDFTimeZone() bool {
@@ -178,7 +170,7 @@ var codecTypeString = []string{
 	CodecDefault:     "",
 	CodecLZ4:         "LZ4",
 	CodecLZ4HC:       "LZ4HC",
-	CodecZSTD:        "ZSTD",
+	CodecZSTD:        "ZSTD(1)",
 	CodecT64:         "T64",
 	CodecDelta:       "Delta",
 	CodecDoubleDelta: "DoubleDelta",
@@ -197,6 +189,7 @@ const (
 	IndexMinmax
 	IndexSet
 	IndexBloomfilter
+	IndexTokenbf
 )
 
 var indexTypeString = []string{
@@ -204,6 +197,7 @@ var indexTypeString = []string{
 	IndexMinmax:      "minmax",
 	IndexSet:         "set(300)",
 	IndexBloomfilter: "bloom_filter",
+	IndexTokenbf:     "tokenbf_v1(32768, 3, 0)",
 }
 
 func (t IndexType) String() string {
@@ -256,6 +250,12 @@ const (
 	ReplicatedAggregatingMergeTree
 	ReplacingMergeTree
 	SummingMergeTree
+
+	EngineByconityOffset
+	CnchMergeTree            = MergeTree + EngineByconityOffset
+	CnchAggregatingMergeTree = AggregatingMergeTree + EngineByconityOffset
+	CnchReplacingMergeTree   = ReplacingMergeTree + EngineByconityOffset
+	CnchSummingMergeTree     = SummingMergeTree + EngineByconityOffset
 )
 
 var engineTypeString = []string{
@@ -266,6 +266,11 @@ var engineTypeString = []string{
 	ReplicatedAggregatingMergeTree: "ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/%s/%s', '{replica}')",
 	ReplacingMergeTree:             "ReplacingMergeTree(%s)",
 	SummingMergeTree:               "SummingMergeTree(%s)",
+
+	CnchMergeTree:            "CnchMergeTree()",
+	CnchAggregatingMergeTree: "CnchAggregatingMergeTree()",
+	CnchReplacingMergeTree:   "CnchReplacingMergeTree(%s)",
+	CnchSummingMergeTree:     "CnchSummingMergeTree(%s)",
 }
 
 func (t EngineType) String() string {
@@ -294,19 +299,22 @@ const (
 	DF_CLUSTER            = "df_cluster"
 	DF_REPLICATED_CLUSTER = "df_replicated_cluster"
 	DF_TIMEZONE           = "Asia/Shanghai"
+	CKDBTypeClickhouse    = "clickhouse"
+	CKDBTypeByconity      = "byconity"
 )
 
 type Column struct {
-	Name    string     // 列名
-	Type    ColumnType // 数据类型
-	Codec   CodecType  // 压缩算法
-	Index   IndexType  // 二级索引
-	GroupBy bool       // 在AggregatingMergeTree表中用于group by的字段
-	Comment string     // 列注释
+	Name     string     // 列名
+	Type     ColumnType // 数据类型
+	TypeArgs string
+	Codec    CodecType // 压缩算法
+	Index    IndexType // 二级索引
+	GroupBy  bool      // 在AggregatingMergeTree表中用于group by的字段
+	Comment  string    // 列注释
 }
 
 func (c *Column) MakeModifyTimeZoneSQL(database, table, timeZone string) string {
-	if timeZone == "" || !c.Type.HasDFTimeZone() {
+	if timeZone == "" || timeZone == DF_TIMEZONE || !c.Type.HasDFTimeZone() {
 		return ""
 	}
 	newTimeZoneType := strings.ReplaceAll(c.Type.String(), DF_TIMEZONE, timeZone)
@@ -333,6 +341,11 @@ func (c *Column) SetComment(comment string) *Column {
 	return c
 }
 
+func (c *Column) SetTypeArgs(args string) *Column {
+	c.TypeArgs = args
+	return c
+}
+
 func NewColumn(name string, t ColumnType) *Column {
 	index := IndexNone
 	codec := CodecDefault
@@ -351,7 +364,7 @@ func NewColumn(name string, t ColumnType) *Column {
 		codec = CodecGorilla
 		index = IndexMinmax
 	}
-	return &Column{name, t, codec, index, false, ""}
+	return &Column{name, t, "", codec, index, false, ""}
 }
 
 func NewColumnWithGroupBy(name string, t ColumnType) *Column {

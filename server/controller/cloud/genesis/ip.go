@@ -21,34 +21,33 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (g *Genesis) getIPs() ([]model.IP, error) {
-	log.Debug("get ips starting")
+	log.Debug("get ips starting", logger.NewORGPrefix(g.orgID))
 	ips := []model.IP{}
 
 	g.cloudStatsd.RefreshAPIMoniter("ips", len(g.ips), time.Time{})
 
 	for _, i := range g.ips {
 		if i.VInterfaceLcuuid == "" || i.SubnetLcuuid == "" {
-			log.Debug("vinterface lcuuid or subnet lcuuid not found")
+			log.Debug("vinterface lcuuid or subnet lcuuid not found", logger.NewORGPrefix(g.orgID))
 			continue
 		}
 		lcuuid := i.Lcuuid
 		if lcuuid == "" {
-			lcuuid = common.GetUUID(i.VInterfaceLcuuid+i.IP, uuid.Nil)
+			lcuuid = common.GetUUIDByOrgID(g.orgID, i.VInterfaceLcuuid+i.IP)
 		}
 		ip := model.IP{
 			Lcuuid:           lcuuid,
 			VInterfaceLcuuid: i.VInterfaceLcuuid,
 			IP:               i.IP,
 			SubnetLcuuid:     i.SubnetLcuuid,
-			RegionLcuuid:     g.regionUuid,
+			RegionLcuuid:     g.regionLcuuid,
 		}
 		ips = append(ips, ip)
 	}
-	log.Debug("get ips complete")
+	log.Debug("get ips complete", logger.NewORGPrefix(g.orgID))
 	return ips, nil
 }

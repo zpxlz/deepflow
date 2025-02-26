@@ -57,6 +57,9 @@ type ResourceEvent struct {
 	PodID        uint32
 	SubnetID     uint32
 	IP           string
+
+	ORGID  uint16
+	TeamID uint16
 }
 
 type TagFieldOption func(opts *ResourceEvent)
@@ -145,6 +148,12 @@ func TagPodGroupID(id int) TagFieldOption {
 	}
 }
 
+func TagPodGroupType(t uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.PodGroupType = uint8(t)
+	}
+}
+
 func TagPodID(id int) TagFieldOption {
 	return func(r *ResourceEvent) {
 		r.PodID = uint32(id)
@@ -163,16 +172,28 @@ func TagIP(ip string) TagFieldOption {
 	}
 }
 
+func TagGProcessID(id uint32) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessID = id
+	}
+}
+
+func TagGProcessName(name string) TagFieldOption {
+	return func(r *ResourceEvent) {
+		r.GProcessName = name
+	}
+}
+
 func (r *ResourceEvent) Release() {
 	ReleaseResourceEvent(r)
 }
 
-var poolResourceEvent = pool.NewLockFreePool(func() interface{} {
+var poolResourceEvent = pool.NewLockFreePool(func() *ResourceEvent {
 	return new(ResourceEvent)
 })
 
 func AcquireResourceEvent() *ResourceEvent {
-	return poolResourceEvent.Get().(*ResourceEvent)
+	return poolResourceEvent.Get()
 }
 
 func ReleaseResourceEvent(event *ResourceEvent) {

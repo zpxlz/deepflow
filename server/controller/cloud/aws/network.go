@@ -23,11 +23,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aws) getNetworks(region awsRegion) ([]model.Network, []model.Subnet, []model.VInterface, error) {
-	log.Debug("get networks starting")
+func (a *Aws) getNetworks(client *ec2.Client) ([]model.Network, []model.Subnet, []model.VInterface, error) {
+	log.Debug("get networks starting", logger.NewORGPrefix(a.orgID))
 	var networks []model.Network
 	var subnets []model.Subnet
 	var netVinterfaces []model.VInterface
@@ -42,9 +42,9 @@ func (a *Aws) getNetworks(region awsRegion) ([]model.Network, []model.Subnet, []
 		} else {
 			input = &ec2.DescribeSubnetsInput{MaxResults: &maxResults, NextToken: &nextToken}
 		}
-		result, err := a.ec2Client.DescribeSubnets(context.TODO(), input)
+		result, err := client.DescribeSubnets(context.TODO(), input)
 		if err != nil {
-			log.Errorf("network request aws api error: (%s)", err.Error())
+			log.Errorf("network request aws api error: (%s)", err.Error(), logger.NewORGPrefix(a.orgID))
 			return []model.Network{}, []model.Subnet{}, []model.VInterface{}, err
 		}
 		retNetworks = append(retNetworks, result.Subnets...)
@@ -57,9 +57,9 @@ func (a *Aws) getNetworks(region awsRegion) ([]model.Network, []model.Subnet, []
 	for _, nData := range retNetworks {
 		networkVpcID := a.getStringPointerValue(nData.VpcId)
 		networkSubnetID := a.getStringPointerValue(nData.SubnetId)
-		networkLcuuid := common.GetUUID(networkSubnetID, uuid.Nil)
-		vpcLcuuid := common.GetUUID(networkVpcID, uuid.Nil)
-		azLcuuid := common.GetUUID(a.getStringPointerValue(nData.AvailabilityZone), uuid.Nil)
+		networkLcuuid := common.GetUUIDByOrgID(a.orgID, networkSubnetID)
+		vpcLcuuid := common.GetUUIDByOrgID(a.orgID, networkVpcID)
+		azLcuuid := common.GetUUIDByOrgID(a.orgID, a.getStringPointerValue(nData.AvailabilityZone))
 		networkName := a.getResultTagName(nData.Tags)
 		if networkName == "" {
 			networkName = networkSubnetID
@@ -73,12 +73,12 @@ func (a *Aws) getNetworks(region awsRegion) ([]model.Network, []model.Subnet, []
 			External:       false,
 			NetType:        common.NETWORK_TYPE_LAN,
 			AZLcuuid:       azLcuuid,
-			RegionLcuuid:   a.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid:   a.regionLcuuid,
 		})
 		a.azLcuuidMap[azLcuuid] = 0
 
 		subnets = append(subnets, model.Subnet{
-			Lcuuid:        common.GetUUID(networkLcuuid, uuid.Nil),
+			Lcuuid:        common.GetUUIDByOrgID(a.orgID, networkLcuuid),
 			Name:          networkName,
 			CIDR:          a.getStringPointerValue(nData.CidrBlock),
 			VPCLcuuid:     vpcLcuuid,
@@ -91,17 +91,17 @@ func (a *Aws) getNetworks(region awsRegion) ([]model.Network, []model.Subnet, []
 		}
 		if routerID != "" {
 			netVinterfaces = append(netVinterfaces, model.VInterface{
-				Lcuuid:        common.GetUUID(networkSubnetID+routerID, uuid.Nil),
+				Lcuuid:        common.GetUUIDByOrgID(a.orgID, networkSubnetID+routerID),
 				Type:          common.VIF_TYPE_LAN,
 				Mac:           common.VIF_DEFAULT_MAC,
-				DeviceLcuuid:  common.GetUUID(routerID, uuid.Nil),
+				DeviceLcuuid:  common.GetUUIDByOrgID(a.orgID, routerID),
 				DeviceType:    common.VIF_DEVICE_TYPE_VROUTER,
 				NetworkLcuuid: networkLcuuid,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  a.getRegionLcuuid(region.lcuuid),
+				RegionLcuuid:  a.regionLcuuid,
 			})
 		}
 	}
-	log.Debug("get networks complete")
+	log.Debug("get networks complete", logger.NewORGPrefix(a.orgID))
 	return networks, subnets, netVinterfaces, nil
 }

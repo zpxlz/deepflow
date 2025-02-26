@@ -19,19 +19,36 @@ package common
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/tls"
 	. "encoding/binary"
 	"encoding/csv"
 	"encoding/xml"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/deepflowio/deepflow/server/controller/common"
-	"gopkg.in/yaml.v3"
+	simplejson "github.com/bitly/go-simplejson"
 	"inet.af/netaddr"
+
+	"github.com/deepflowio/deepflow/message/agent"
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
+
+var log = logger.MustGetLogger("genesis.common")
+
+type TeamInfo struct {
+	OrgID  int
+	TeamId int
+}
 
 type VifInfo struct {
 	MaskLen uint32
@@ -112,12 +129,20 @@ type KVMDomain struct {
 	Type     string      `xml:"type,attr"`
 	UUID     string      `xml:"uuid"`
 	Name     string      `xml:"name"`
-	Label    string      `xml:"label"`
+	Title    string      `xml:"title"`
 	MetaData KVMMetaData `xml:"metadata"`
 	Devices  KVMDevices  `xml:"devices"`
 }
-type KVMDomains struct {
+type ETCDomains struct {
 	Domains []KVMDomain `xml:"domain"`
+}
+
+type DomStatus struct {
+	Domains KVMDomain `xml:"domain"`
+}
+
+type RUNDomains struct {
+	DomStatus []DomStatus `xml:"domstatus"`
 }
 
 type XMLVPC struct {
@@ -136,15 +161,6 @@ type XMLVM struct {
 	Label      string
 	VPC        XMLVPC
 	Interfaces []XMLInterface
-}
-
-type scrapeConfig struct {
-	JobName     string `yaml:"job_name"`
-	HonorLabels bool   `yaml:"honor_labels"`
-}
-
-type prometheusConfig struct {
-	ScrapeConfigs []scrapeConfig `yaml:"scrape_configs"`
 }
 
 var IfaceRegex = regexp.MustCompile("^(\\d+):\\s+([^@:]+)(@.*)?\\:")
@@ -350,32 +366,57 @@ func ParseVMStates(s string) (map[string]int, error) {
 	return vmToState, nil
 }
 
-func ParseVMXml(s string) ([]XMLVM, error) {
+func ParseVMXml(s, nameField string) ([]XMLVM, error) {
 	var vms []XMLVM
 	if s == "" {
 		return vms, nil
 	}
 
 	// ns := "http://openstack.org/xmlns/libvirt/nova/1.0"
-
-	var domains KVMDomains
-	err := xml.Unmarshal([]byte(s), &domains)
+	var domains []KVMDomain
+	var etcDomains ETCDomains
+	err := xml.Unmarshal([]byte(s), &etcDomains)
 	if err != nil {
 		return vms, err
 	}
-	for _, domain := range domains.Domains {
+	if len(etcDomains.Domains) != 0 {
+		domains = etcDomains.Domains
+	} else {
+		var runDomains RUNDomains
+		err := xml.Unmarshal([]byte(s), &runDomains)
+		if err != nil {
+			return vms, err
+		}
+		for _, d := range runDomains.DomStatus {
+			domains = append(domains, d.Domains)
+		}
+	}
+	for _, domain := range domains {
 		var vm XMLVM
 		if domain.UUID == "" {
+			log.Warning("vm uuid not found in xml")
+			continue
+		}
+		if domain.Name == "" {
+			log.Warning("vm uuid not found in xml")
 			continue
 		}
 		vm.UUID = domain.UUID
-		if domain.Name == "" {
-			continue
-		}
 		vm.Label = domain.Name
-		vm.Name = domain.MetaData.Instance.Name
+		switch nameField {
+		case "metadata":
+			vm.Name = domain.MetaData.Instance.Name
+		case "uuid":
+			vm.Name = domain.UUID
+		case "name":
+			vm.Name = domain.Name
+		case "title":
+			vm.Name = domain.Title
+		default:
+			log.Warningf("invalid config vm_name_field: (%s)", nameField)
+		}
 		if vm.Name == "" {
-			vm.Name = vm.Label
+			vm.Name = domain.Name
 		}
 		if domain.MetaData.Instance.Owner.Project.UUID != "" {
 			uuid := domain.MetaData.Instance.Owner.Project.UUID
@@ -400,15 +441,6 @@ func ParseVMXml(s string) ([]XMLVM, error) {
 		vms = append(vms, vm)
 	}
 	return vms, nil
-}
-
-func ParseYMAL(y string) (prometheusConfig, error) {
-	pConfig := prometheusConfig{}
-	err := yaml.Unmarshal([]byte(y), &pConfig)
-	if err != nil {
-		return prometheusConfig{}, err
-	}
-	return pConfig, nil
 }
 
 func ParseCompressedInfo(cInfo []byte) (bytes.Buffer, error) {
@@ -438,6 +470,88 @@ func IPInRanges(ip string, ipRanges ...netaddr.IPPrefix) bool {
 	}
 	for _, ipRange := range ipRanges {
 		if ipRange.Contains(ipObj) {
+			return true
+		}
+	}
+	return false
+}
+
+func RequestGet(url string, timeout int, queryStrings map[string]string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives: true,
+		},
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	queryData := request.URL.Query()
+	for k, v := range queryStrings {
+		queryData.Add(k, v)
+	}
+	request.URL.RawQuery = queryData.Encode()
+
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("http status failed: (%d)", response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	respJson, err := simplejson.NewJson(body)
+	if err != nil {
+		return fmt.Errorf("response body (%s) serializer to json failed: (%s)", string(body), err.Error())
+	}
+	optStatus := respJson.Get("OPT_STATUS").MustString()
+	if optStatus != "" && optStatus != "SUCCESS" {
+		description := respJson.Get("DESCRIPTION").MustString()
+		return fmt.Errorf("curl (%s) failed, (%s)", request.URL.String(), description)
+	}
+
+	return nil
+}
+
+func GetTeamShortLcuuidToInfo() (map[string]TeamInfo, error) {
+	teamIDToOrgID := map[string]TeamInfo{}
+	orgIDs, err := metadb.GetORGIDs()
+	if err != nil {
+		return teamIDToOrgID, err
+	}
+	for _, orgID := range orgIDs {
+		db, err := metadb.GetDB(orgID)
+		if err != nil {
+			log.Error(err.Error())
+			continue
+		}
+		var teams []metadbmodel.Team
+		err = db.Find(&teams).Error
+		if err != nil {
+			log.Error(err.Error())
+			continue
+		}
+		for _, team := range teams {
+			teamIDToOrgID[team.ShortLcuuid] = TeamInfo{
+				OrgID:  orgID,
+				TeamId: team.TeamID,
+			}
+		}
+	}
+	return teamIDToOrgID, nil
+}
+
+func IsAgentInterestedHost(aType agent.AgentType) bool {
+	types := []agent.AgentType{agent.AgentType_TT_PROCESS, agent.AgentType_TT_HOST_POD, agent.AgentType_TT_VM_POD, agent.AgentType_TT_PHYSICAL_MACHINE, agent.AgentType_TT_PUBLIC_CLOUD, agent.AgentType_TT_K8S_SIDECAR}
+	for _, t := range types {
+		if t == aType {
 			return true
 		}
 	}

@@ -26,34 +26,35 @@ import (
 )
 
 const (
-	FUNCTION_SUM         = "Sum"
-	FUNCTION_MAX         = "Max"
-	FUNCTION_MIN         = "Min"
-	FUNCTION_AVG         = "Avg"
-	FUNCTION_COUNTER_AVG = "Counter_Avg"
-	FUNCTION_DELAY_AVG   = "Delay_Avg"
-	FUNCTION_AAVG        = "AAvg"
-	FUNCTION_PCTL        = "Percentile"
-	FUNCTION_PCTL_EXACT  = "PercentileExact"
-	FUNCTION_STDDEV      = "Stddev"
-	FUNCTION_SPREAD      = "Spread"
-	FUNCTION_RSPREAD     = "Rspread"
-	FUNCTION_APDEX       = "Apdex"
-	FUNCTION_GROUP_ARRAY = "groupArray"
-	FUNCTION_DIV         = "/"
-	FUNCTION_PLUS        = "+"
-	FUNCTION_MINUS       = "-"
-	FUNCTION_MULTIPLY    = "*"
-	FUNCTION_COUNT       = "Count"
-	FUNCTION_UNIQ        = "Uniq"
-	FUNCTION_UNIQ_EXACT  = "UniqExact"
-	FUNCTION_PERSECOND   = "PerSecond"
-	FUNCTION_PERCENTAG   = "Percentage"
-	FUNCTION_HISTOGRAM   = "Histogram"
-	FUNCTION_LAST        = "Last"
-	FUNCTION_TOPK        = "TopK"
-	FUNCTION_ANY         = "Any"
-	FUNCTION_DERIVATIVE  = "nonNegativeDerivative"
+	FUNCTION_SUM           = "Sum"
+	FUNCTION_MAX           = "Max"
+	FUNCTION_MIN           = "Min"
+	FUNCTION_AVG           = "Avg"
+	FUNCTION_COUNTER_AVG   = "Counter_Avg"
+	FUNCTION_DELAY_AVG     = "Delay_Avg"
+	FUNCTION_AAVG          = "AAvg"
+	FUNCTION_PCTL          = "Percentile"
+	FUNCTION_PCTL_EXACT    = "PercentileExact"
+	FUNCTION_STDDEV        = "Stddev"
+	FUNCTION_SPREAD        = "Spread"
+	FUNCTION_RSPREAD       = "Rspread"
+	FUNCTION_APDEX         = "Apdex"
+	FUNCTION_GROUP_ARRAY   = "groupArray"
+	FUNCTION_DIV           = "/"
+	FUNCTION_PLUS          = "+"
+	FUNCTION_MINUS         = "-"
+	FUNCTION_MULTIPLY      = "*"
+	FUNCTION_COUNT         = "Count"
+	FUNCTION_UNIQ          = "Uniq"
+	FUNCTION_UNIQ_EXACT    = "UniqExact"
+	FUNCTION_PERSECOND     = "PerSecond"
+	FUNCTION_PERCENTAG     = "Percentage"
+	FUNCTION_HISTOGRAM     = "Histogram"
+	FUNCTION_LAST          = "Last"
+	FUNCTION_TOPK          = "TopK"
+	FUNCTION_ANY           = "Any"
+	FUNCTION_DERIVATIVE    = "nonNegativeDerivative"
+	FUNCTION_COUNTDISTINCT = "countDistinct"
 )
 
 // 对外提供的算子与数据库实际算子转换
@@ -111,7 +112,6 @@ func GetFunc(name string) Function {
 	default:
 		return &DefaultFunction{Name: name}
 	}
-	return nil
 }
 
 type Function interface {
@@ -255,7 +255,7 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	args := f.Args
 	if f.Name == FUNCTION_TOPK {
 		args = f.Args[len(f.Args)-1:]
-	} else if f.Name == FUNCTION_ANY {
+	} else if f.Name == FUNCTION_ANY || f.Name == FUNCTION_UNIQ || f.Name == FUNCTION_UNIQ_EXACT {
 		args = nil
 	}
 	if len(args) > 0 {
@@ -318,7 +318,7 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	if !f.Nest && f.Alias != "" {
 		buf.WriteString(" AS ")
 		buf.WriteString("`")
-		buf.WriteString(strings.Trim(f.Alias, "`"))
+		buf.WriteString(strings.ReplaceAll(f.Alias, "`", ""))
 		buf.WriteString("`")
 	}
 
@@ -355,6 +355,10 @@ func (f *DefaultFunction) GetDefaultAlias(inner bool) string {
 	for _, arg := range f.Args {
 		buf.WriteString("_")
 		buf.WriteString(FormatField(arg))
+	}
+	if f.Condition != "" {
+		buf.WriteString("_")
+		buf.WriteString(FormatField(f.Condition))
 	}
 	return buf.String()
 }
@@ -565,7 +569,9 @@ func (f *HistogramFunction) WriteTo(buf *bytes.Buffer) {
 	buf.WriteString("histogramIf(")
 	buf.WriteString(FormatField(f.Fields[1].ToString()))
 	buf.WriteString(")(")
+	buf.WriteString("assumeNotNull(")
 	buf.WriteString(f.Fields[0].ToString())
+	buf.WriteString(")")
 	buf.WriteString(fmt.Sprintf(",%s>0)", f.Fields[0].ToString()))
 	if f.Alias != "" {
 		buf.WriteString(" AS ")
@@ -606,7 +612,7 @@ func (f *PerSecondFunction) Init() {
 				interval = f.Time.Interval
 			}
 		} else {
-			interval = int(f.Time.TimeEnd - f.Time.TimeStart)
+			interval = int(f.Time.TimeEnd-f.Time.TimeStart) + f.Time.DatasourceInterval
 		}
 	} else {
 		interval = f.Time.DatasourceInterval
@@ -876,7 +882,11 @@ type CounterAvgFunction struct {
 func (f *CounterAvgFunction) WriteTo(buf *bytes.Buffer) {
 	var interval int
 	if f.Time.Interval > 0 {
-		interval = f.Time.Interval
+		if f.Time.DatasourceInterval > f.Time.Interval {
+			interval = f.Time.DatasourceInterval
+		} else {
+			interval = f.Time.Interval
+		}
 	} else {
 		interval = int(f.Time.TimeEnd-f.Time.TimeStart) + f.Time.DatasourceInterval
 	}

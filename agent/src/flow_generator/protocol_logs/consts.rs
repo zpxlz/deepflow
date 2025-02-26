@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+use std::fmt::Write;
+
+use public::bytes::{
+    read_f32_le, read_f64_le, read_i16_le, read_i32_le, read_i64_le, read_u16_le, read_u32_le,
+};
+
 /// HTTP constants
 pub const HTTP_RESP_MAX_LINE: usize = 40;
 pub const H2C_HEADER_SIZE: usize = 9;
@@ -26,6 +32,7 @@ pub const HTTP_METHOD_AND_SPACE_MAX_OFFSET: usize = 9; // Method：OPTIONS
 pub const HTTP_V1_0_VERSION: &str = "HTTP/1.0";
 pub const HTTP_V1_1_VERSION: &str = "HTTP/1.1";
 pub const HTTP_V1_VERSION_LEN: usize = 8;
+pub const HTTP_STATUS_OK: u16 = 200;
 pub const HTTP_STATUS_CODE_MIN: u16 = 100;
 pub const HTTP_STATUS_CODE_MAX: u16 = 600;
 pub const HTTP_STATUS_CLIENT_ERROR_MIN: u16 = 400;
@@ -50,6 +57,19 @@ pub const HTTPV2_FRAME_HEADERS_TYPE: u8 = 0x01;
 pub const HTTPV2_FRAME_TYPE_MIN: u8 = 0x00;
 pub const HTTPV2_FRAME_TYPE_MAX: u8 = 0x09;
 
+// GRPC
+pub const GRPC_HEADER_SIZE: u32 = 5;
+pub const GRPC_MESSAGE_LENGTH_OFFSET: usize = 1;
+pub const GRPC_STATUS_OK: u16 = 0;
+pub const GRPC_STATUS_CANCELLED: u16 = 1;
+pub const GRPC_STATUS_INVALID_ARGUMENT: u16 = 3;
+pub const GRPC_STATUS_NOT_FOUND: u16 = 5;
+pub const GRPC_STATUS_ALREADY_EXISTS: u16 = 6;
+pub const GRPC_STATUS_PERMISSION_DENIED: u16 = 7;
+pub const GRPC_STATUS_FAILED_PRECONDITION: u16 = 9;
+pub const GRPC_STATUS_OUT_OF_RANGE: u16 = 11;
+pub const GRPC_STATUS_UNAUTHENTICATED: u16 = 16;
+
 pub const TRACE_ID_TYPE: usize = 0;
 pub const SPAN_ID_TYPE: usize = 1;
 
@@ -58,9 +78,6 @@ pub const SPAN_ID_TYPE: usize = 1;
 // Kafka constants
 pub const KAFKA_REQ_HEADER_LEN: usize = 14;
 pub const KAFKA_RESP_HEADER_LEN: usize = 8;
-pub const KAFKA_STATUS_CODE_OFFSET: usize = 12;
-pub const KAFKA_STATUS_CODE_LEN: usize = 2;
-pub const KAFKA_STATUS_CODE_CHECKER: usize = KAFKA_STATUS_CODE_OFFSET + KAFKA_STATUS_CODE_LEN;
 
 // dubbo constants
 pub const DUBBO_MAGIC_HIGH: u8 = 0xda;
@@ -102,6 +119,10 @@ pub const BODY_PARAM_MAX: u8 = 5;
 // Mysql constants
 pub const PROTOCOL_VERSION: u8 = 10;
 
+// Compressed Header
+pub const COMPRESS_HEADER_LEN: usize = 7;
+pub const COMPRESS_HEADER_UNCOMPRESS_OFFSET: usize = 4;
+
 // Header
 pub const HEADER_LEN: usize = 4;
 
@@ -122,6 +143,252 @@ pub const THREAD_ID_OFFSET_B: usize = SERVER_VERSION_OFFSET;
 pub const COMMAND_OFFSET: usize = 0;
 pub const COMMAND_LEN: usize = 1;
 
+pub const PARAMETER_TYPE_LEN: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub enum FieldType {
+    Tiny,
+    Short,
+    Long,
+    Float,
+    Double,
+    Null,
+    Timestamp,
+    Longlong,
+    Int24,
+    Date,
+    Time,
+    Datetime,
+    Year,
+    String,
+    Unknown(u8),
+}
+
+impl From<u8> for FieldType {
+    fn from(tag: u8) -> Self {
+        match tag {
+            1 => Self::Tiny,
+            2 => Self::Short,
+            3 => Self::Long,
+            4 => Self::Float,
+            5 => Self::Double,
+            6 => Self::Null,
+            7 => Self::Timestamp,
+            8 => Self::Longlong,
+            9 => Self::Int24,
+            10 => Self::Date,
+            11 => Self::Time,
+            12 => Self::Datetime,
+            13 => Self::Year,
+            254 => Self::String,
+            _ => Self::Unknown(tag),
+        }
+    }
+}
+
+impl FieldType {
+    fn header_length(&self) -> usize {
+        match self {
+            FieldType::Tiny
+            | FieldType::String
+            | FieldType::Date
+            | FieldType::Time
+            | FieldType::Timestamp
+            | FieldType::Datetime => 1,
+            FieldType::Short | FieldType::Year => 2,
+            FieldType::Long | FieldType::Float | FieldType::Int24 => 4,
+            FieldType::Double | FieldType::Longlong => 8,
+            _ => 8,
+        }
+    }
+
+    pub fn decode(self, payload: &[u8], output: &mut String) -> Option<usize> {
+        let header_length = self.header_length();
+        if header_length > payload.len() {
+            return None;
+        }
+        let mut offset = 0;
+        match self {
+            FieldType::String => {
+                let len = payload[offset] as usize;
+                offset += header_length;
+
+                if offset + len > payload.len() {
+                    return None;
+                }
+
+                output.push_str(&String::from_utf8_lossy(&payload[offset..offset + len]));
+                offset += len;
+            }
+            FieldType::Longlong => {
+                let n = read_i64_le(&payload[offset..]);
+
+                let _ = write!(output, "LongLong({})", n);
+                offset += header_length;
+            }
+            FieldType::Long => {
+                let n = read_i32_le(&payload[offset..]);
+
+                let _ = write!(output, "Long({})", n);
+                offset += header_length;
+            }
+            FieldType::Int24 => {
+                let n = read_i32_le(&payload[offset..]);
+
+                let _ = write!(output, "Int24({})", n);
+                offset += header_length;
+            }
+            FieldType::Short => {
+                let n = read_i16_le(&payload[offset..]);
+
+                let _ = write!(output, "Short({})", n);
+                offset += header_length;
+            }
+            FieldType::Year => {
+                let n = read_i16_le(&payload[offset..]);
+
+                let _ = write!(output, "Years({})", n);
+                offset += header_length;
+            }
+            FieldType::Tiny => {
+                let n = payload[offset] as i8;
+
+                let _ = write!(output, "Tiny({})", n);
+                offset += header_length;
+            }
+            FieldType::Double => {
+                let n = read_f64_le(&payload[offset..]);
+
+                let _ = write!(output, "Double({})", n);
+                offset += header_length;
+            }
+            FieldType::Float => {
+                let n = read_f32_le(&payload[offset..]);
+
+                let _ = write!(output, "Float({})", n);
+                offset += header_length;
+            }
+            FieldType::Date | FieldType::Datetime | FieldType::Timestamp => {
+                let len = payload[offset] as usize;
+                offset += header_length;
+                if offset + len > payload.len() {
+                    return None;
+                }
+
+                // To save space the packet can be compressed:
+                match len {
+                    // if year, month, day, hour, minutes, seconds and microseconds are all 0, length is 0 and no other field is sent.
+                    0 => output.push_str("datetime 0000-00-00 00:00:00.000000"),
+                    // if hour, seconds and microseconds are all 0, length is 4 and no other field is sent.
+                    4 => {
+                        let year = read_u16_le(&payload[offset..]);
+                        let month = payload[offset + 2];
+                        let day = payload[offset + 3];
+                        offset += len;
+                        let _ = write!(output, "datetime {:04}-{:02}-{:02}", year, month, day);
+                    }
+                    // if microseconds is 0, length is 7 and micro_seconds is not sent.
+                    7 => {
+                        let year = read_u16_le(&payload[offset..]);
+                        let month = payload[offset + 2];
+                        let day = payload[offset + 3];
+                        let hour = payload[offset + 4];
+                        let minute = payload[offset + 5];
+                        let second = payload[offset + 6];
+                        offset += len;
+                        let _ = write!(
+                            output,
+                            "datetime {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            year, month, day, hour, minute, second
+                        );
+                    }
+                    // otherwise the length is 11
+                    11 => {
+                        let year = read_u16_le(&payload[offset..]);
+                        let month = payload[offset + 2];
+                        let day = payload[offset + 3];
+                        let hour = payload[offset + 4];
+                        let minute = payload[offset + 5];
+                        let second = payload[offset + 6];
+                        let microsecond = read_u32_le(&payload[offset + 7..]);
+                        offset += len;
+                        let _ = write!(
+                            output,
+                            "datetime {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                            year, month, day, hour, minute, second, microsecond
+                        );
+                    }
+                    _ => offset += len,
+                }
+            }
+            FieldType::Time => {
+                let len = payload[offset] as usize;
+                offset += header_length;
+                // To save space the packet can be compressed:
+                match len {
+                    // if day, hour, minutes, seconds and microseconds are all 0, length is 0 and no other field is sent.
+                    1 => output.push_str("time 0d 00:00:00.000000"),
+                    8 => {
+                        if offset + len > payload.len() {
+                            return None;
+                        }
+                        let is_negative = payload[offset] == 1;
+                        offset += 1;
+
+                        let days = read_u32_le(&payload[offset..]);
+                        let hour = payload[offset + 4];
+                        let minute = payload[offset + 5];
+                        let second = payload[offset + 6];
+                        if is_negative {
+                            let _ = write!(
+                                output,
+                                "time -{}d {:02}:{:02}:{:02}",
+                                days, hour, minute, second
+                            );
+                        } else {
+                            let _ = write!(
+                                output,
+                                "time {}d {:02}:{:02}:{:02}",
+                                days, hour, minute, second
+                            );
+                        }
+                    }
+                    12 => {
+                        if offset + len > payload.len() {
+                            return None;
+                        }
+                        let is_negative = payload[offset] == 1;
+                        offset += 1;
+
+                        let days = read_u32_le(&payload[offset..]);
+                        let hour = payload[offset + 4];
+                        let minute = payload[offset + 5];
+                        let second = payload[offset + 6];
+                        let microsecond = read_u32_le(&payload[offset + 7..]);
+                        if is_negative {
+                            let _ = write!(
+                                output,
+                                "time -{}d {:02}:{:02}:{:02}.{:06}",
+                                days, hour, minute, second, microsecond
+                            );
+                        } else {
+                            let _ = write!(
+                                output,
+                                "time {}d {:02}:{:02}:{:02}.{:06}",
+                                days, hour, minute, second, microsecond
+                            );
+                        }
+                    }
+                    _ => offset += len,
+                }
+            }
+            FieldType::Null => output.push_str("NULL"),
+            FieldType::Unknown(_) => return None,
+        }
+        return Some(offset);
+    }
+}
+
 // Response
 pub const RESPONSE_CODE_LEN: usize = 1;
 pub const ERROR_CODE_LEN: usize = 2;
@@ -135,6 +402,14 @@ pub const ERROR_CODE_OFFSET: usize = RESPONSE_CODE_OFFSET + RESPONSE_CODE_LEN;
 pub const AFFECTED_ROWS_OFFSET: usize = RESPONSE_CODE_OFFSET + RESPONSE_CODE_LEN;
 pub const SQL_STATE_OFFSET: usize = ERROR_CODE_OFFSET + ERROR_CODE_LEN;
 pub const STATEMENT_ID_OFFSET: usize = RESPONSE_CODE_OFFSET + RESPONSE_CODE_LEN;
+pub const EXECUTE_STATEMENT_PARAMS_OFFSET: usize = STATEMENT_ID_OFFSET + STATEMENT_ID_LEN + 5;
+
+// Login
+pub const CLIENT_PROTOCOL_41: u16 = 512;
+pub const CLIENT_CAPABILITIES_FLAGS_OFFSET: usize = 0;
+pub const FILTER_OFFSET: usize = 9;
+pub const FILTER_SIZE: usize = 23;
+pub const LOGIN_USERNAME_OFFSET: usize = 32;
 
 // int
 pub const INT_FLAGS_2: u8 = 0xfc;

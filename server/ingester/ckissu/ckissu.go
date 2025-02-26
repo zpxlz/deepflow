@@ -19,20 +19,34 @@ package ckissu
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
-
-	logging "github.com/op/go-logging"
+	"sync"
+	"time"
 
 	"database/sql"
+
+	logging "github.com/op/go-logging"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/config"
 	"github.com/deepflowio/deepflow/server/ingester/datasource"
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/nativetag"
 )
 
 var log = logging.MustGetLogger("issu")
+
+const (
+	INTERVAL_HOUR = 60
+	INTERVAL_DAY  = 1440
+	DEFAULT_TTL   = 168
+	RETRY_COUNT   = 1
+
+	MAX_JOB_COUNT   = 10
+	MIN_ORG_PER_JOB = 8
+)
 
 type Issu struct {
 	cfg                *config.Config
@@ -45,8 +59,10 @@ type Issu struct {
 	modTTLs            []*TableModTTL
 	datasourceInfo     map[string]*DatasourceInfo
 	Connections        common.DBs
+	VersionMaps        []map[string]string
 	Addrs              []string
 	username, password string
+	ckdbType           string
 	exit               bool
 }
 
@@ -68,7 +84,7 @@ type ColumnRenames struct {
 	Tables          []string
 	OldColumnNames  []string
 	CheckColumnType bool
-	OldColumnType   string
+	OldColumnTypes  []ckdb.ColumnType
 	NewColumnNames  []string
 	DropIndex       bool
 	DropMvTable     bool
@@ -79,7 +95,7 @@ type ColumnRename struct {
 	Table           string
 	OldColumnName   string
 	CheckColumnType bool
-	OldColumnType   string
+	OldColumnType   ckdb.ColumnType
 	NewColumnName   string
 	DropIndex       bool
 	DropMvTable     bool
@@ -99,6 +115,8 @@ type ColumnAdd struct {
 	ColumnName   string
 	ColumnType   ckdb.ColumnType
 	DefaultValue string
+	IsMetrics    bool
+	AggrFunc     string
 }
 
 type ColumnAdds struct {
@@ -135,902 +153,30 @@ type IndexAdd struct {
 	IndexType  ckdb.IndexType
 }
 
-var TableRenames611 = []*TableRename{
-	&TableRename{
-		OldDb:     "vtap_acl",
-		OldTables: []string{"1m_local"},
-		NewDb:     "flow_metrics",
-		NewTables: []string{"vtap_acl.1m_local"},
-	},
-	&TableRename{
-		OldDb:     "vtap_flow_port",
-		OldTables: []string{"1m_local", "1s_local"},
-		NewDb:     "flow_metrics",
-		NewTables: []string{"vtap_flow_port.1m_local", "vtap_flow_port.1s_local"},
-	},
-	&TableRename{
-		OldDb:     "vtap_flow_edge_port",
-		OldTables: []string{"1m_local", "1s_local"},
-		NewDb:     "flow_metrics",
-		NewTables: []string{"vtap_flow_edge_port.1m_local", "vtap_flow_edgeport.1s_local"},
-	},
-	&TableRename{
-		OldDb:     "vtap_app_port",
-		OldTables: []string{"1m_local", "1s_local"},
-		NewDb:     "flow_metrics",
-		NewTables: []string{"vtap_app_port.1m_local", "vtap_app_port.1s_local"},
-	},
-	&TableRename{
-		OldDb:     "vtap_app_edge_port",
-		OldTables: []string{"1m_local", "1s_local"},
-		NewDb:     "flow_metrics",
-		NewTables: []string{"vtap_app_edge_port.1m_local", "vtap_app_edge_port.1s_local"},
-	},
+type ColumnDatasourceAdds struct {
+	ColumnNames                                  []string
+	OldColumnNames                               []string
+	ColumnTypes                                  []ckdb.ColumnType
+	OnlyMapTable, OnlyAppTable, OnlyNetworkTable bool
+	DefaultValue                                 string
+	IsMetrics                                    bool
+	IsSummable                                   bool
 }
 
-var ColumnRename572 = []*ColumnRename{
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l4_flow_log",
-		OldColumnName: "retans_tx",
-		NewColumnName: "retrans_tx",
-	},
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l4_flow_log_local",
-		OldColumnName: "retans_tx",
-		NewColumnName: "retrans_tx",
-	},
+type ColumnDatasourceAdd struct {
+	ColumnName                                   string
+	OldColumnName                                string
+	ColumnType                                   ckdb.ColumnType
+	OnlyMapTable, OnlyAppTable, OnlyNetworkTable bool
+	DefaultValue                                 string
+	IsMetrics                                    bool
+	IsSummable                                   bool
 }
 
-var ColumnAdd573 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow", "vtap_flow_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"service_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow_edge", "vtap_flow_edge_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"service_id_0", "service_id_1"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local", "l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local"},
-		ColumnNames: []string{"service_id_0", "service_id_1"},
-		ColumnType:  ckdb.UInt32,
-	},
-}
-
-var ColumnAdd600 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow_port", "vtap_flow_edge_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"l7_client_error", "l7_server_error", "l7_timeout", "l7_error", "rrt_max"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow_port", "vtap_flow_edge_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"rrt_sum"},
-		ColumnType:  ckdb.Float64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow_port", "vtap_flow_edge_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"rrt_count", "l7_request", "l7_response", "tcp_transfer_fail", "tcp_rst_fail"},
-		ColumnType:  ckdb.UInt64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"vtap_flow_edge_port", "vtap_flow_port", "vtap_app_port", "vtap_app_edge_port"},
-		Tables:      []string{"1m", "1m_local", "1s", "1s_local"},
-		ColumnNames: []string{"tap_port_type", "tunnel_type"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:          []string{"flow_log"},
-		Tables:       []string{"l4_flow_log", "l4_flow_log_local", "l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local"},
-		ColumnNames:  []string{"tap_side"},
-		ColumnType:   ckdb.LowCardinalityString,
-		DefaultValue: "'rest'",
-	},
-	&ColumnAdds{
-		Dbs: []string{"flow_log"},
-		Tables: []string{"l4_flow_log", "l4_flow_log_local", "l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local",
-			"l7_mq_log", "l7_mq_log_local", "l7_sql_log", "l7_sql_log_local", "l7_nosql_log", "l7_nosql_log_local", "l7_rpc_log", "l7_rpc_log_local"},
-		ColumnNames: []string{"tap_port_type", "tunnel_type"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"syn_seq", "syn_ack_seq", "l7_error", "tunnel_tx_mac_0", "tunnel_tx_mac_1", "tunnel_rx_mac_0", "tunnel_rx_mac_1", "last_keepalive_seq", "last_keepalive_ack"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"is_new_flow"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local"},
-		ColumnNames: []string{"req_tcp_seq", "resp_tcp_seq"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:          []string{"flow_log"},
-		Tables:       []string{"l7_dns_log", "l7_dns_log_local"},
-		ColumnNames:  []string{"protocol"},
-		ColumnType:   ckdb.UInt8,
-		DefaultValue: "17",
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local"},
-		ColumnNames: []string{"status_code"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_http_log", "l7_http_log_local", "l7_dns_log", "l7_dns_log_local"},
-		ColumnNames: []string{"exception_desc"},
-		ColumnType:  ckdb.LowCardinalityString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_http_log", "l7_http_log_local"},
-		ColumnNames: []string{"response_length"},
-		ColumnType:  ckdb.Int64Nullable,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_http_log", "l7_http_log_local"},
-		ColumnNames: []string{"span_id"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnRename600 = []*ColumnRename{
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l7_http_log",
-		OldColumnName: "status_code",
-		NewColumnName: "answer_code",
-	},
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l7_http_log_local",
-		OldColumnName: "status_code",
-		NewColumnName: "answer_code",
-	},
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l7_http_log",
-		OldColumnName: "content_length",
-		NewColumnName: "request_length",
-	},
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l7_http_log_local",
-		OldColumnName: "content_length",
-		NewColumnName: "request_length",
-	},
-}
-
-var ColumnAdd610 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"auto_instance_id_0", "auto_service_id_0", "auto_instance_id_1", "auto_service_id_1"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"auto_instance_type_0", "auto_service_type_0", "auto_instance_type_1", "auto_service_type_1", "status"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      []string{"vtap_flow_port.1m", "vtap_flow_port.1m_local", "vtap_flow_port.1s", "vtap_flow_port.1s_local", "vtap_app_port.1m", "vtap_app_port.1m_local", "vtap_app_port.1s", "vtap_app_port.1s_local"},
-		ColumnNames: []string{"auto_instance_id", "auto_service_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      []string{"vtap_flow_port.1m", "vtap_flow_port.1m_local", "vtap_flow_port.1s", "vtap_flow_port.1s_local", "vtap_app_port.1m", "vtap_app_port.1m_local", "vtap_app_port.1s", "vtap_app_port.1s_local"},
-		ColumnNames: []string{"auto_instance_type", "auto_service_type"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      []string{"vtap_flow_edge_port.1m", "vtap_flow_edge_port.1m_local", "vtap_flow_edge_port.1s", "vtap_flow_edge_port.1s_local", "vtap_app_edge_port.1m", "vtap_app_edge_port.1m_local", "vtap_app_edge_port.1s", "vtap_app_edge_port.1s_local"},
-		ColumnNames: []string{"auto_instance_id_0", "auto_service_id_0", "auto_instance_id_1", "auto_service_id_1"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      []string{"vtap_flow_edge_port.1m", "vtap_flow_edge_port.1m_local", "vtap_flow_edge_port.1s", "vtap_flow_edge_port.1s_local", "vtap_app_edge_port.1m", "vtap_app_edge_port.1m_local", "vtap_app_edge_port.1s", "vtap_app_edge_port.1s_local"},
-		ColumnNames: []string{"auto_instance_type_0", "auto_service_type_0", "auto_instance_type_1", "auto_service_type_1"},
-		ColumnType:  ckdb.UInt8,
-	},
-
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"process_kname_0", "process_kname_1"},
-		ColumnType:  ckdb.String,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"syscall_thread_0", "syscall_thread_1", "syscall_cap_seq_0", "syscall_cap_seq_1"},
-		ColumnType:  ckdb.UInt32,
-	},
-}
-
-var ColumnAdd611 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"attribute_names", "attribute_values"},
-		ColumnType:  ckdb.ArrayString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"l7_protocol_str", "service_name"},
-		ColumnType:  ckdb.LowCardinalityString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"span_kind"},
-		ColumnType:  ckdb.UInt8Nullable,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"parent_span_id", "service_instance_id"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnMod611 = []*ColumnMod{
-	&ColumnMod{
-		Db:            "flow_log",
-		Table:         "l7_flow_log",
-		ColumnName:    "span_kind",
-		NewColumnType: ckdb.UInt8Nullable,
-		DropIndex:     false,
-	},
-	&ColumnMod{
-		Db:            "flow_log",
-		Table:         "l7_flow_log_local",
-		ColumnName:    "span_kind",
-		NewColumnType: ckdb.UInt8Nullable,
-		DropIndex:     true,
-	},
-}
-
-var u64ColumnNameAdd612 = []string{"syn_count", "synack_count", "retrans_syn", "retrans_synack", "cit_count"}
-var u32ColumnNameAdd612 = []string{"cit_max"}
-var f64ColumnNameAdd612 = []string{"cit_sum"}
-var vtapFlowTables = []string{
-	"vtap_flow_port.1m", "vtap_flow_port.1m_local",
-	"vtap_flow_port.1s", "vtap_flow_port.1s_local",
-	"vtap_flow_edge_port.1m", "vtap_flow_edge_port.1m_local",
-	"vtap_flow_edge_port.1s", "vtap_flow_edge_port.1s_local",
-}
-
-var ColumnAdd612 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"cit_max", "syn_count", "synack_count", "retrans_syn", "retrans_synack"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"cit_count"},
-		ColumnType:  ckdb.UInt64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"cit_sum"},
-		ColumnType:  ckdb.Float64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapFlowTables,
-		ColumnNames: u64ColumnNameAdd612,
-		ColumnType:  ckdb.UInt64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapFlowTables,
-		ColumnNames: u32ColumnNameAdd612,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapFlowTables,
-		ColumnNames: f64ColumnNameAdd612,
-		ColumnType:  ckdb.Float64,
-	},
-}
-
-var ColumnAdd613 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"acl_gids"},
-		ColumnType:  ckdb.ArrayUInt16,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"metrics_names"},
-		ColumnType:  ckdb.ArrayString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"metrics_values"},
-		ColumnType:  ckdb.ArrayFloat64,
-	},
-}
-
-var ColumnAdd615 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"endpoint"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnMod615 = []*ColumnMod{
-	&ColumnMod{
-		Db:            "flow_log",
-		Table:         "l7_flow_log",
-		ColumnName:    "response_code",
-		NewColumnType: ckdb.Int32Nullable,
-		DropIndex:     false,
-	},
-	&ColumnMod{
-		Db:            "flow_log",
-		Table:         "l7_flow_log_local",
-		ColumnName:    "response_code",
-		NewColumnType: ckdb.Int32Nullable,
-		DropIndex:     false,
-	},
-}
-
-var ColumnRename618 = []*ColumnRename{
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l4_flow_log_local",
-		OldColumnName: "flow_source",
-		NewColumnName: "signal_source",
-		DropIndex:     true,
-	},
-	&ColumnRename{
-		Db:            "flow_log",
-		Table:         "l4_flow_log",
-		OldColumnName: "flow_source",
-		NewColumnName: "signal_source",
-	},
-}
-
-var ColumnAdd618 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"signal_source"},
-		ColumnType:  ckdb.UInt16,
-	},
-}
-
-var u8ColumnNameAdd620 = []string{"nat_source"}
-var u32ColumnNameAdd620 = []string{"gprocess_id"}
-var u32ColumnNameEdgeAdd620 = []string{"gprocess_id_0", "gprocess_id_1"}
-var flowMetricsEdgeTables = []string{
-	"vtap_flow_edge_port.1m", "vtap_flow_edge_port.1m_local",
-	"vtap_flow_edge_port.1s", "vtap_flow_edge_port.1s_local",
-	"vtap_app_edge_port.1m", "vtap_app_edge_port.1m_local",
-	"vtap_app_edge_port.1s", "vtap_app_edge_port.1s_local",
-}
-var flowMetricsTables = []string{
-	"vtap_flow_port.1m", "vtap_flow_port.1m_local",
-	"vtap_flow_port.1s", "vtap_flow_port.1s_local",
-	"vtap_app_port.1m", "vtap_app_port.1m_local",
-	"vtap_app_port.1s", "vtap_app_port.1s_local",
-}
-
-var ColumnAdd620 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsEdgeTables,
-		ColumnNames: u8ColumnNameAdd620,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local", "l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: u8ColumnNameAdd620,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"nat_real_ip4_0", "nat_real_ip4_1"},
-		ColumnType:  ckdb.IPv4,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"nat_real_port_0", "nat_real_port_1"},
-		ColumnType:  ckdb.UInt16,
-	},
-
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsTables,
-		ColumnNames: u32ColumnNameAdd620,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsEdgeTables,
-		ColumnNames: u32ColumnNameEdgeAdd620,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local", "l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: u32ColumnNameEdgeAdd620,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_packet", "l4_packet_local"},
-		ColumnNames: []string{"packet_batch"},
-		ColumnType:  ckdb.String,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_packet", "l7_packet_local"},
-		ColumnNames: []string{"pcap_batch"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnRename620 = []*ColumnRename{
-	&ColumnRename{
-		Db:              "flow_log",
-		Table:           "l7_packet",
-		OldColumnName:   "pcap_batch",
-		CheckColumnType: true,
-		OldColumnType:   ckdb.ArrayUInt8.String(),
-		NewColumnName:   "pcap_batch_bak",
-	},
-	&ColumnRename{
-		Db:              "flow_log",
-		Table:           "l7_packet_local",
-		OldColumnName:   "pcap_batch",
-		CheckColumnType: true,
-		OldColumnType:   ckdb.ArrayUInt8.String(),
-		NewColumnName:   "pcap_batch_bak",
-	},
-	&ColumnRename{
-		Db:              "flow_log",
-		Table:           "l4_packet",
-		OldColumnName:   "packet_batch",
-		CheckColumnType: true,
-		OldColumnType:   ckdb.ArrayUInt8.String(),
-		NewColumnName:   "packet_batch_bak",
-	},
-	&ColumnRename{
-		Db:              "flow_log",
-		Table:           "l4_packet_local",
-		OldColumnName:   "packet_batch",
-		CheckColumnType: true,
-		OldColumnType:   ckdb.ArrayUInt8.String(),
-		NewColumnName:   "packet_batch_bak",
-	},
-}
-
-var u8OldColumnName623 = []string{"resource_gl0_type", "resource_gl2_type"}
-var u8NewColumnName623 = []string{"auto_instance_type", "auto_service_type"}
-var u32OldColumnName623 = []string{"resource_gl0_id", "resource_gl2_id"}
-var u32NewColumnName623 = []string{"auto_instance_id", "auto_service_id"}
-
-var u8OldColumnEdgeName623 = []string{"resource_gl0_type_0", "resource_gl0_type_1", "resource_gl2_type_0", "resource_gl2_type_1"}
-var u8NewColumnEdgeName623 = []string{"auto_instance_type_0", "auto_instance_type_1", "auto_service_type_0", "auto_service_type_1"}
-var u32OldColumnEdgeName623 = []string{"resource_gl0_id_0", "resource_gl0_id_1", "resource_gl2_id_0", "resource_gl2_id_1"}
-var u32NewColumnEdgeName623 = []string{"auto_instance_id_0", "auto_instance_id_1", "auto_service_id_0", "auto_service_id_1"}
-var flowLogTables = []string{"l4_flow_log", "l4_flow_log_local", "l7_flow_log", "l7_flow_log_local"}
-var vtapAppTables = []string{
-	"vtap_app_port.1m", "vtap_app_port.1m_local",
-	"vtap_app_port.1s", "vtap_app_port.1s_local",
-	"vtap_app_edge_port.1m", "vtap_app_edge_port.1m_local",
-	"vtap_app_edge_port.1s", "vtap_app_edge_port.1s_local",
-}
-
-var ColumnAdd623 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsTables,
-		ColumnNames: []string{"signal_source"},
-		ColumnType:  ckdb.UInt16,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsEdgeTables,
-		ColumnNames: []string{"signal_source"},
-		ColumnType:  ckdb.UInt16,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapAppTables,
-		ColumnNames: []string{"app_service"},
-		ColumnType:  ckdb.LowCardinalityString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapAppTables,
-		ColumnNames: []string{"app_instance", "endpoint"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnRename623 = []*ColumnRenames{
-	&ColumnRenames{
-		Db:             "flow_log",
-		Tables:         []string{"l7_flow_log", "l7_flow_log_local"},
-		OldColumnNames: []string{"service_name", "service_instance_id"},
-		NewColumnNames: []string{"app_service", "app_instance"},
-	},
-	&ColumnRenames{
-		Db:             "flow_log",
-		Tables:         flowLogTables,
-		OldColumnNames: u8OldColumnEdgeName623,
-		NewColumnNames: u8NewColumnEdgeName623,
-		DropIndex:      true,
-	},
-	&ColumnRenames{
-		Db:             "flow_log",
-		Tables:         flowLogTables,
-		OldColumnNames: u32OldColumnEdgeName623,
-		NewColumnNames: u32NewColumnEdgeName623,
-		DropIndex:      true,
-	},
-	&ColumnRenames{
-		Db:             "flow_metrics",
-		Tables:         flowMetricsTables,
-		OldColumnNames: u8OldColumnName623,
-		NewColumnNames: u8NewColumnName623,
-		DropIndex:      true,
-		DropMvTable:    true,
-	},
-	&ColumnRenames{
-		Db:             "flow_metrics",
-		Tables:         flowMetricsTables,
-		OldColumnNames: u32OldColumnName623,
-		NewColumnNames: u32NewColumnName623,
-		DropIndex:      true,
-		DropMvTable:    true,
-	},
-	&ColumnRenames{
-		Db:             "flow_metrics",
-		Tables:         flowMetricsEdgeTables,
-		OldColumnNames: u8OldColumnEdgeName623,
-		NewColumnNames: u8NewColumnEdgeName623,
-		DropIndex:      true,
-		DropMvTable:    true,
-	},
-	&ColumnRenames{
-		Db:             "flow_metrics",
-		Tables:         flowMetricsEdgeTables,
-		OldColumnNames: u32OldColumnEdgeName623,
-		NewColumnNames: u32NewColumnEdgeName623,
-		DropIndex:      true,
-		DropMvTable:    true,
-	},
-	&ColumnRenames{
-		Db:             "ext_metrics",
-		Tables:         []string{"metrics", "metrics_local"},
-		OldColumnNames: u8OldColumnName623,
-		NewColumnNames: u8NewColumnName623,
-		DropIndex:      true,
-	},
-	&ColumnRenames{
-		Db:             "ext_metrics",
-		Tables:         []string{"metrics", "metrics_local"},
-		OldColumnNames: u32OldColumnName623,
-		NewColumnNames: u32NewColumnName623,
-		DropIndex:      true,
-	},
-}
-
-var u8ColumnNameAdd625 = []string{"direction_score"}
-var ColumnAdd625 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsTables,
-		ColumnNames: u8ColumnNameAdd625,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsEdgeTables,
-		ColumnNames: u8ColumnNameAdd625,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      flowLogTables,
-		ColumnNames: u8ColumnNameAdd625,
-		ColumnType:  ckdb.UInt8,
-	},
-}
-
-var u8ColumnProfileNameAdd626 = []string{"is_ipv4"}
-var u16ColumnProfileNameAdd626 = []string{"subnet_id"}
-var profileTables = []string{"in_process", "in_process_local"}
-var ColumnAdd626 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      profileTables,
-		ColumnNames: u8ColumnProfileNameAdd626,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      profileTables,
-		ColumnNames: u16ColumnProfileNameAdd626,
-		ColumnType:  ckdb.UInt16,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"ext_metrics"},
-		Tables:      []string{"metrics", "metrics_local"},
-		ColumnNames: []string{"gprocess_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_packet", "l4_packet_local", "l7_packet", "l7_packet_local"},
-		ColumnNames: []string{"start_time"},
-		ColumnType:  ckdb.DateTime64us,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_packet", "l7_packet_local"},
-		ColumnNames: []string{"acl_gids"},
-		ColumnType:  ckdb.ArrayUInt16,
-	},
-}
-
-var TableRenames626 = []*TableRename{
-	&TableRename{
-		OldDb:     "event",
-		OldTables: []string{"event", "event_local"},
-		NewDb:     "event",
-		NewTables: []string{"event_v625", "event_local_v625"},
-	},
-}
-
-var ColumnRenames626 = []*ColumnRenames{
-	&ColumnRenames{
-		Db:             "flow_log",
-		Tables:         []string{"l7_packet", "l7_packet_local"},
-		OldColumnNames: []string{"pcap_count", "pcap_batch"},
-		NewColumnNames: []string{"packet_count", "packet_batch"},
-	},
-}
-
-var u32ColumnNameAdd633 = []string{"netns_id"}
-var u32ColumnNameEdgeAdd633 = []string{"netns_id_0", "netns_id_1"}
-var u8ColumnNameAdd633 = []string{"tag_source"}
-var u8ColumnNameEdgeAdd633 = []string{"tag_source_0", "tag_source_1"}
-var vtapAppPortTables = []string{
-	"vtap_app_port.1m", "vtap_app_port.1m_local",
-	"vtap_app_port.1s", "vtap_app_port.1s_local",
-}
-var vtapAppEdgePortTables = []string{
-	"vtap_app_edge_port.1m", "vtap_app_edge_port.1m_local",
-	"vtap_app_edge_port.1s", "vtap_app_edge_port.1s_local",
-}
-var l7FlowLogTables = []string{"l7_flow_log", "l7_flow_log_local"}
-
-var ColumnAdd633 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      []string{"vtap_flow_port.1m", "vtap_flow_port.1m_local", "vtap_flow_port.1s", "vtap_flow_port.1s_local", "vtap_app_port.1m", "vtap_app_port.1m_local", "vtap_app_port.1s", "vtap_app_port.1s_local"},
-		ColumnNames: []string{"role"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"event"},
-		Tables:      []string{"event", "event_local", "perf_event", "perf_event_local"},
-		ColumnNames: u32ColumnNameAdd633,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapAppPortTables,
-		ColumnNames: u32ColumnNameAdd633,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      vtapAppEdgePortTables,
-		ColumnNames: u32ColumnNameEdgeAdd633,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      l7FlowLogTables,
-		ColumnNames: u32ColumnNameEdgeAdd633,
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsTables,
-		ColumnNames: u8ColumnNameAdd633,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_metrics"},
-		Tables:      flowMetricsEdgeTables,
-		ColumnNames: u8ColumnNameEdgeAdd633,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local", "l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: u8ColumnNameEdgeAdd633,
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"x_request_id_0", "x_request_id_1"},
-		ColumnType:  ckdb.String,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"event"},
-		Tables:      []string{"alarm_event", "alarm_event_local"},
-		ColumnNames: []string{"alarm_target"},
-		ColumnType:  ckdb.LowCardinalityString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"event"},
-		Tables:      []string{"alarm_event", "alarm_event_local"},
-		ColumnNames: []string{"region_id"},
-		ColumnType:  ckdb.UInt16,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"event"},
-		Tables:      []string{"alarm_event", "alarm_event_local"},
-		ColumnNames: []string{"policy_query_url", "policy_query_conditions", "policy_threshold_critical", "policy_threshold_error", "policy_threshold_warning"},
-		ColumnType:  ckdb.String,
-	},
-}
-
-var ColumnAdd635 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"compression_algo"},
-		ColumnType:  ckdb.LowCardinalityString,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"process_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"process_start_time"},
-		ColumnType:  ckdb.DateTime64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"netns_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"l7_parse_failed"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"event"},
-		Tables:      []string{"alarm_event", "alarm_event_local"},
-		ColumnNames: []string{"user_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-}
-
-var ColumnDrops635 = []*ColumnDrops{
-	&ColumnDrops{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"profile_node_id", "profile_parent_node_id"},
-	},
-}
-
-var ColumnAdd64 = []*ColumnAdds{
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"syscall_coroutine_0", "syscall_coroutine_1", "trace_id_index"},
-		ColumnType:  ckdb.UInt64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
-		ColumnNames: []string{"is_tls"},
-		ColumnType:  ckdb.UInt8,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"rtt_client", "rtt_server"},
-		ColumnType:  ckdb.Float64,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"profile"},
-		Tables:      []string{"in_process", "in_process_local"},
-		ColumnNames: []string{"gprocess_id"},
-		ColumnType:  ckdb.UInt32,
-	},
-	&ColumnAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
-		ColumnNames: []string{"tls_rtt"},
-		ColumnType:  ckdb.Float64,
-	},
-}
-
-var IndexAdd64 = []*IndexAdds{
-	&IndexAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log_local"},
-		ColumnNames: []string{"trace_id", "x_request_id_0", "x_request_id_1"},
-		IndexType:   ckdb.IndexBloomfilter,
-	},
-	&IndexAdds{
-		Dbs:         []string{"flow_log"},
-		Tables:      []string{"l7_flow_log_local"},
-		ColumnNames: []string{"_id", "trace_id_index"},
-		IndexType:   ckdb.IndexMinmax,
-	},
-}
-
-var TableModTTL64 = []*TableModTTL{
-	&TableModTTL{
-		Db:     "flow_metrics",
-		Table:  "vtap_acl.1m_local",
-		NewTTL: 168,
-	},
-}
-
-func getTables(connect *sql.DB, db, tableName string) ([]string, error) {
+func getTables(connect *sql.DB, db, tablePrefix string) ([]string, error) {
 	sql := fmt.Sprintf("SHOW TABLES IN %s", db)
-	rows, err := connect.Query(sql)
+	log.Infof("exec sql: %s", sql)
+	rows, err := Query(connect, sql)
 	if err != nil {
 		return nil, err
 	}
@@ -1041,16 +187,16 @@ func getTables(connect *sql.DB, db, tableName string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(table, tableName) ||
-			len(tableName) == 0 {
+		if strings.HasPrefix(table, tablePrefix) ||
+			len(tablePrefix) == 0 {
 			tables = append(tables, table)
 		}
 	}
 	return tables, nil
 }
 
-func getMvTables(connect *sql.DB, db, tableName string) ([]string, error) {
-	tables, err := getTables(connect, db, tableName)
+func getMvTables(connect *sql.DB, db, tablePrefix string) ([]string, error) {
+	tables, err := getTables(connect, db, tablePrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,7 +223,7 @@ func (i *Issu) getDatasourceInfo(connect *sql.DB, db, mvTableName string) (*Data
 		return info, nil
 	}
 	sql := fmt.Sprintf("SHOW CREATE TABLE %s.`%s`", db, mvTableName)
-	rows, err := connect.Query(sql)
+	rows, err := Query(connect, sql)
 	if err != nil {
 		return nil, err
 	}
@@ -1088,21 +234,21 @@ func (i *Issu) getDatasourceInfo(connect *sql.DB, db, mvTableName string) (*Data
 			return nil, err
 		}
 	}
-	log.Infof("getDatasourceInfo sql: %s createSql: %s ", sql, createSql)
+	log.Debugf("getDatasourceInfo sql: %s createSql: %s ", sql, createSql)
 	var summable, unsummable, interval, baseTable string
 	var matchs [4]string
 	// 匹配 `packet_tx__agg` AggregateFunction(sum, UInt64), 中的 'sum' 为可累加聚合的方法
 	summableReg := regexp.MustCompile("`packet_tx__agg` AggregateFunction.([a-z]+)")
 	// 匹配 `rtt_sum__agg` AggregateFunction(avg, Float64), 中的 'avg' 为非可累加聚合的方法
 	unsummableReg := regexp.MustCompile("`rtt_sum__agg` AggregateFunction.([a-zA-Z]+)")
-	if strings.HasPrefix(mvTableName, "vtap_app") {
+	if strings.HasPrefix(mvTableName, "vtap_app") || strings.HasPrefix(mvTableName, "application") {
 		summableReg = regexp.MustCompile("`request__agg` AggregateFunction.([a-z]+)")
 		unsummableReg = regexp.MustCompile("`rrt_sum__agg` AggregateFunction.([a-zA-Z]+)")
 	}
 	// 匹配 toStartOfHour(time) AS time, 中的 'Hour' 为聚合时长
 	intervalReg := regexp.MustCompile("toStartOf([a-zA-Z]+)")
-	// 匹配 FROM vtap_flow.`1m_local` 中的'1m' 为原始数据源
-	baseTableReg := regexp.MustCompile("FROM .*.`(.*)_local`")
+	// 匹配 FROM vtap_flow.`1m_local` 中的'1m' 为原始数据源,
+	baseTableReg := regexp.MustCompile("FROM .*.`.*\\.(.*)_(local|agg)`")
 
 	for i, reg := range []*regexp.Regexp{summableReg, unsummableReg, intervalReg, baseTableReg} {
 		submatchs := reg.FindStringSubmatch(createSql)
@@ -1141,11 +287,12 @@ func (i *Issu) getDatasourceInfo(connect *sql.DB, db, mvTableName string) (*Data
 
 // 找出自定义数据源和参数
 func (i *Issu) getUserDefinedDatasourceInfos(connect *sql.DB, db, tableName string) ([]*DatasourceInfo, error) {
-	tables, err := getTables(connect, db, tableName)
+	tables, err := getTables(connect, db, tableName+".")
 	if err != nil {
 		log.Info(err)
 		return nil, nil
 	}
+	log.Infof("get db %s prefix %s tables: %v", db, tableName, tables)
 
 	aggTables := []string{}
 	aggSuffix := "_agg"
@@ -1155,6 +302,7 @@ func (i *Issu) getUserDefinedDatasourceInfos(connect *sql.DB, db, tableName stri
 		}
 	}
 
+	log.Infof("get agg tables: %v", aggTables)
 	dSInfos := []*DatasourceInfo{}
 	for _, name := range aggTables {
 		ds, err := i.getDatasourceInfo(connect, db, name+"_mv")
@@ -1167,213 +315,82 @@ func (i *Issu) getUserDefinedDatasourceInfos(connect *sql.DB, db, tableName stri
 	return dSInfos, nil
 }
 
-func (i *Issu) addColumnDatasource(connect *sql.DB, d *DatasourceInfo, isEdgeTable bool, isAppTable bool) ([]*ColumnAdd, error) {
+func (i *Issu) addColumnDatasource(index int, d *DatasourceInfo, isMapTable, isAppTable, isNetworkTable bool) ([]*ColumnAdd, error) {
+	connect := i.Connections[index]
 	// mod table agg, global
 	dones := []*ColumnAdd{}
 
-	columnAdds := []*ColumnAdd{}
-	var columnAddss612 = []*ColumnAdds{
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: u32ColumnNameAdd612,
-			ColumnType:  ckdb.UInt32,
-		},
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: u64ColumnNameAdd612,
-			ColumnType:  ckdb.UInt64,
-		},
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: f64ColumnNameAdd612,
-			ColumnType:  ckdb.Float64,
-		},
+	columnDatasourceAdds := []*ColumnDatasourceAdd{}
+
+	for _, version := range AllDatasourceAdds {
+		columnDatasourceAdds = append(columnDatasourceAdds, version...)
 	}
 
-	var columnAddss620 = []*ColumnAdds{
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: u8ColumnNameAdd620,
-			ColumnType:  ckdb.UInt8,
-		},
-	}
-
-	var columnAddss623 = []*ColumnAdds{
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: []string{"signal_source"},
-			ColumnType:  ckdb.UInt16,
-		},
-	}
-
-	if isAppTable {
-		columnAddss623 = append(columnAddss623, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: []string{"app_service"},
-				ColumnType:  ckdb.LowCardinalityString,
-			},
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: []string{"app_instance", "endpoint"},
-				ColumnType:  ckdb.String,
-			},
-		}...)
-	}
-
-	if isEdgeTable {
-		columnAddss620 = append(columnAddss620, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u32ColumnNameEdgeAdd620,
-				ColumnType:  ckdb.UInt32,
-			},
-		}...)
-		columnAddss623 = append(columnAddss623, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u8NewColumnEdgeName623,
-				ColumnType:  ckdb.UInt8,
-			},
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u32NewColumnEdgeName623,
-				ColumnType:  ckdb.UInt32,
-			},
-		}...)
-	} else {
-		columnAddss620 = append(columnAddss620, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u32ColumnNameAdd620,
-				ColumnType:  ckdb.UInt32,
-			},
-		}...)
-		columnAddss623 = append(columnAddss623, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u8NewColumnName623,
-				ColumnType:  ckdb.UInt8,
-			},
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: u32NewColumnName623,
-				ColumnType:  ckdb.UInt32,
-			},
-		}...)
-	}
-
-	var columnAddss625 = []*ColumnAdds{
-		&ColumnAdds{
-			Dbs:         []string{d.db},
-			Tables:      []string{d.name, d.name + "_agg"},
-			ColumnNames: u8ColumnNameAdd625,
-			ColumnType:  ckdb.UInt8,
-		},
-	}
-
-	columnAddss633 := []*ColumnAdds{}
-	if !isEdgeTable {
-		columnAddss633 = append(columnAddss633, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: []string{"role", "tag_source"},
-				ColumnType:  ckdb.UInt8,
-			},
-		}...)
-
-	} else {
-		columnAddss633 = append(columnAddss633, []*ColumnAdds{
-			&ColumnAdds{
-				Dbs:         []string{d.db},
-				Tables:      []string{d.name, d.name + "_agg"},
-				ColumnNames: []string{"tag_source_0", "tag_source_1"},
-				ColumnType:  ckdb.UInt8,
-			},
-		}...)
-	}
-
-	if isAppTable {
-		if isEdgeTable {
-			columnAddss633 = append(columnAddss633, []*ColumnAdds{
-				&ColumnAdds{
-					Dbs:         []string{d.db},
-					Tables:      []string{d.name, d.name + "_agg"},
-					ColumnNames: u32ColumnNameEdgeAdd633,
-					ColumnType:  ckdb.UInt32,
-				},
-			}...)
-		} else {
-			columnAddss633 = append(columnAddss633, []*ColumnAdds{
-				&ColumnAdds{
-					Dbs:         []string{d.db},
-					Tables:      []string{d.name, d.name + "_agg"},
-					ColumnNames: u32ColumnNameAdd633,
-					ColumnType:  ckdb.UInt32,
-				},
-			}...)
-		}
-	}
-
-	for _, version := range [][]*ColumnAdds{columnAddss612, columnAddss620, columnAddss623, columnAddss625, columnAddss633} {
-		for _, addrs := range version {
-			columnAdds = append(columnAdds, getColumnAdds(addrs)...)
-		}
-	}
-
-	for _, addColumn := range columnAdds {
-		version, err := i.getTableVersion(connect, addColumn.Db, addColumn.Table)
-		if err != nil {
-			return dones, err
-		}
+	for _, add := range columnDatasourceAdds {
+		aggTable := d.name + "_agg"
+		version, _ := i.getTableRawVersion(index, d.db, aggTable)
 		if version == common.CK_VERSION {
 			continue
 		}
+		if (add.OnlyMapTable && !isMapTable) || (add.OnlyAppTable && !isAppTable) || (add.OnlyNetworkTable && !isNetworkTable) {
+			continue
+		}
+		aggrFunc := ""
+		if add.IsMetrics && add.IsSummable {
+			aggrFunc = d.summable
+		} else if add.IsMetrics {
+			aggrFunc = d.unsummable
+		}
+		addColumn := &ColumnAdd{
+			Db:           d.db,
+			Table:        aggTable,
+			ColumnName:   add.ColumnName,
+			ColumnType:   add.ColumnType,
+			DefaultValue: add.DefaultValue,
+			IsMetrics:    add.IsMetrics,
+			AggrFunc:     aggrFunc,
+		}
 		if err := i.addColumn(connect, addColumn); err != nil {
 			return dones, err
+		}
+		if add.OldColumnName != "" {
+			sql := fmt.Sprintf("ALTER TABLE %s.`%s` update %s=%s WHERE 1",
+				d.db, aggTable, addColumn.ColumnName, add.OldColumnName)
+			log.Info("datasource copy column: ", sql)
+			if _, err := Exec(connect, sql); err != nil {
+				log.Warningf("exec sql %s failed: %s", err)
+			}
 		}
 		dones = append(dones, addColumn)
 	}
 
 	if len(dones) == 0 {
-		log.Infof("datasource db(%s) table(%s) already updated.", d.db, d.name)
+		log.Infof("datasource db (%s) table (%s) already updated.", d.db, d.name)
 		return nil, nil
 	}
 
 	// drop table mv
 	sql := fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`", d.db, d.name+"_mv")
 	log.Info(sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		return nil, err
 	}
 
-	lastUnderlineIndex := strings.LastIndex(d.name, ".")
-	if lastUnderlineIndex < 0 {
+	lastDotIndex := strings.LastIndex(d.name, ".")
+	if lastDotIndex < 0 {
 		return nil, fmt.Errorf("invalid table name %s", d.name)
 	}
-	dstTableName := d.name[lastUnderlineIndex+1:]
-	rawTable := zerodoc.GetMetricsTables(ckdb.MergeTree, common.CK_VERSION, ckdb.DF_CLUSTER, ckdb.DF_STORAGE_POLICY, 7, 1, 7, 1, i.cfg.GetCKDBColdStorages())[zerodoc.MetricsTableNameToID(d.baseTable)]
+
+	rawTable := flow_metrics.GetMetricsTables(ckdb.MergeTree, common.CK_VERSION, ckdb.DF_CLUSTER, ckdb.DF_STORAGE_POLICY, i.ckdbType, 7, 1, 7, 1, i.cfg.GetCKDBColdStorages())[flow_metrics.MetricsTableNameToID(d.name[:lastDotIndex+1]+"1m")]
 	// create table mv
-	createMvSql := datasource.MakeMVTableCreateSQL(
-		rawTable, dstTableName,
-		d.summable, d.unsummable, d.interval)
+	aggrInterval := ckdb.AggregationHour
+	if d.interval == ckdb.TimeFuncDay {
+		aggrInterval = ckdb.AggregationDay
+	}
+	createMvSql := rawTable.MakeAggrMVTableCreateSQL(parseOrgId(d.db), aggrInterval)
 	log.Info(createMvSql)
-	_, err = connect.Exec(createMvSql)
+	_, err = Exec(connect, createMvSql)
 	if err != nil {
 		return nil, err
 	}
@@ -1381,59 +398,69 @@ func (i *Issu) addColumnDatasource(connect *sql.DB, d *DatasourceInfo, isEdgeTab
 	// drop table local
 	sql = fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`", d.db, d.name+"_local")
 	log.Info(sql)
-	_, err = connect.Exec(sql)
+	_, err = Exec(connect, sql)
 	if err != nil {
 		return nil, err
 	}
 
 	// create table local
-	createLocalSql := datasource.MakeCreateTableLocal(
-		rawTable, dstTableName,
-		d.summable, d.unsummable)
+	createLocalSql := rawTable.MakeAggrLocalTableCreateSQL(parseOrgId(d.db), aggrInterval)
 	log.Info(createLocalSql)
-	_, err = connect.Exec(createLocalSql)
+	_, err = Exec(connect, createLocalSql)
 	if err != nil {
 		return nil, err
-
 	}
+
+	// create table global
+	createGlobalSql := rawTable.MakeAggrGlobalTableCreateSQL(parseOrgId(d.db), aggrInterval)
+	log.Info(createGlobalSql)
+	_, err = Exec(connect, createGlobalSql)
+	if err != nil {
+		return nil, err
+	}
+
 	return dones, nil
 }
 
 func NewCKIssu(cfg *config.Config) (*Issu, error) {
 	i := &Issu{
 		cfg:            cfg,
-		Addrs:          cfg.CKDB.ActualAddrs,
+		Addrs:          *cfg.CKDB.ActualAddrs,
 		username:       cfg.CKDBAuth.Username,
 		password:       cfg.CKDBAuth.Password,
 		datasourceInfo: make(map[string]*DatasourceInfo),
+		ckdbType:       cfg.CKDB.Type,
 	}
 
-	allVersionAdds := [][]*ColumnAdds{ColumnAdd610, ColumnAdd611, ColumnAdd612, ColumnAdd613, ColumnAdd615, ColumnAdd618, ColumnAdd620, ColumnAdd623, ColumnAdd625, ColumnAdd626, ColumnAdd633, ColumnAdd635, ColumnAdd64}
 	i.columnAdds = []*ColumnAdd{}
-	for _, versionAdd := range allVersionAdds {
+	for _, versionAdd := range AllColumnAdds {
 		for _, adds := range versionAdd {
 			i.columnAdds = append(i.columnAdds, getColumnAdds(adds)...)
 		}
 	}
 
-	for _, v := range [][]*IndexAdd{getIndexAdds(IndexAdd64)} {
+	for _, v := range AllIndexAdds {
 		i.indexAdds = append(i.indexAdds, v...)
 	}
 
-	for _, v := range [][]*ColumnMod{ColumnMod611, ColumnMod615} {
+	for _, v := range AllColumnMods {
 		i.columnMods = append(i.columnMods, v...)
 	}
 
-	for _, v := range [][]*ColumnRename{ColumnRename618, ColumnRename620, getColumnRenames(ColumnRename623), getColumnRenames(ColumnRenames626)} {
+	for _, v := range AllColumnRenames {
 		i.columnRenames = append(i.columnRenames, v...)
 	}
 
-	for _, v := range [][]*ColumnDrop{getColumnDrops(ColumnDrops635)} {
+	for _, v := range AllColumnDrops {
 		i.columnDrops = append(i.columnDrops, v...)
 	}
 
-	for _, v := range [][]*TableModTTL{TableModTTL64} {
+	for _, v := range AllTableModTTLs {
 		i.modTTLs = append(i.modTTLs, v...)
+	}
+
+	if i.ckdbType == ckdb.CKDBTypeByconity {
+		i.updateTablesForByConity()
 	}
 
 	var err error
@@ -1441,18 +468,58 @@ func NewCKIssu(cfg *config.Config) (*Issu, error) {
 	if err != nil {
 		return nil, err
 	}
+	i.VersionMaps = make([]map[string]string, len(i.Connections))
+	for idx, connect := range i.Connections {
+		m, err := i.getAllTableVersions(connect)
+		if err != nil {
+			return nil, err
+		}
+		i.VersionMaps[idx] = m
+	}
 
 	return i, nil
 }
 
-func (i *Issu) RunRenameTable(ds *datasource.DatasourceManager) error {
-	i.tableRenames = TableRenames611
-	for _, connection := range i.Connections {
-		oldVersion, err := i.getTableVersion(connection, "flow_log", "l4_flow_log_local")
-		if err != nil {
-			return err
+// ByConity does not have a local table, so you need to skip processing the local table
+func (i *Issu) updateTablesForByConity() {
+	byconityAdds := []*ColumnAdd{}
+	for _, k := range i.columnAdds {
+		if !strings.HasSuffix(k.Table, "_local") {
+			byconityAdds = append(byconityAdds, k)
 		}
-		if strings.Compare(oldVersion, "v6.1.1") >= 0 || oldVersion == "" {
+	}
+	i.columnAdds = byconityAdds
+
+	byconityMods := []*ColumnMod{}
+	for _, k := range i.columnMods {
+		if !strings.HasSuffix(k.Table, "_local") {
+			byconityMods = append(byconityMods, k)
+		}
+	}
+	i.columnMods = byconityMods
+
+	byconityRenames := []*ColumnRename{}
+	for _, k := range i.columnRenames {
+		if !strings.HasSuffix(k.Table, "_local") {
+			byconityRenames = append(byconityRenames, k)
+		}
+	}
+	i.columnRenames = byconityRenames
+}
+
+// called in server/ingester/ingester/ingester.go, executed before Start()
+func (i *Issu) RunRenameTable(ds *datasource.DatasourceManager) error {
+	err := i.renameTablesV65(ds)
+	if err != nil {
+		log.Warningf("renameTablesV65 err: %s", err)
+	}
+	if len(AllTableRenames) == 0 {
+		return nil
+	}
+	i.tableRenames = AllTableRenames
+	for idx, connection := range i.Connections {
+		oldVersion, _ := i.getTableVersion(idx, "flow_log", "l4_flow_log_local")
+		if strings.Compare(oldVersion, "v6.5") >= 0 || oldVersion == "" {
 			continue
 		}
 		for _, tableRename := range i.tableRenames {
@@ -1460,42 +527,64 @@ func (i *Issu) RunRenameTable(ds *datasource.DatasourceManager) error {
 				return err
 			}
 		}
-		if err := i.renameUserDefineDatasource(connection, ds); err != nil {
+		if err := i.renameUserDefineDatasource(connection, ckdb.DEFAULT_ORG_ID, ds); err != nil {
 			log.Warning(err)
 		}
 	}
-	i.tableRenames = TableRenames626
-	for _, connection := range i.Connections {
-		oldVersion, err := i.getTableVersion(connection, "event", "event_local")
-		if err != nil {
-			return err
-		}
-		if strings.Compare(oldVersion, "v6.2.6.2") >= 0 {
+	return nil
+}
+
+func (i *Issu) renameTablesV65(ds *datasource.DatasourceManager) error {
+	for index, connection := range i.Connections {
+		oldVersion, _ := i.getTableVersion(index, "flow_log", "l7_flow_log_local")
+		if strings.Compare(oldVersion, "v6.5.1") >= 0 {
 			continue
 		}
-		for _, tableRename := range i.tableRenames {
+
+		for _, tableRename := range TableRenames65 {
 			if err := i.renameTable(connection, tableRename); err != nil {
 				return err
 			}
 		}
+
+		for idx, oldTable := range []string{"vtap_flow_port", "vtap_flow_edge_port", "vtap_app_port", "vtap_app_edge_port"} {
+			newTables := []string{"network", "network_map", "application", "application_map"}
+			datasourceInfos, err := i.getUserDefinedDatasourceInfos(connection, "flow_metrics", oldTable)
+			if err != nil {
+				return err
+			}
+			for _, dsInfo := range datasourceInfos {
+				log.Infof("rename datasource: %+v", dsInfo)
+				// rename agg tables
+				if err := i.renameTable(connection, &TableRename{
+					OldDb:     dsInfo.db,
+					OldTables: []string{dsInfo.name + "_agg", dsInfo.name + "_mv"},
+					NewDb:     ckdb.METRICS_DB,
+					NewTables: []string{strings.Replace(dsInfo.name, oldTable, newTables[idx], 1) + "_agg", strings.Replace(dsInfo.name, oldTable, newTables[idx], 1) + "_mv"},
+				}); err != nil {
+					return err
+				}
+			}
+		}
 	}
+
 	return nil
 }
 
 func (i *Issu) renameTable(connect *sql.DB, c *TableRename) error {
 	for i := range c.OldTables {
 		createDb := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", c.NewDb)
-		_, err := connect.Exec(createDb)
+		_, err := Exec(connect, createDb)
 		if err != nil {
 			log.Error(err)
 			return err
 		}
 
-		// RENAME TABLE vtap_acl.1m TO flow_metrics."vtap_acl.1m";
-		sql := fmt.Sprintf("RENAME TABLE %s.%s to %s.\"%s\"",
+		// RENAME TABLE flow_metrics."vtap_app_prot.1m_local" TO flow_metrics."application.1m_local";
+		sql := fmt.Sprintf("RENAME TABLE %s.\"%s\" to %s.\"%s\"",
 			c.OldDb, c.OldTables[i], c.NewDb, c.NewTables[i])
 		log.Info("rename table: ", sql)
-		_, err = connect.Exec(sql)
+		_, err = Exec(connect, sql)
 		if err != nil {
 			if strings.Contains(err.Error(), "doesn't exist") {
 				log.Infof("table: %s.%s rename to table: %s.\"%s\" error: %s", c.OldDb, c.OldTables[i], c.NewDb, c.NewTables[i], err)
@@ -1516,10 +605,18 @@ func (i *Issu) addColumn(connect *sql.DB, c *ColumnAdd) error {
 	if len(c.DefaultValue) > 0 {
 		defaultValue = fmt.Sprintf("default %s", c.DefaultValue)
 	}
+
+	columnName := c.ColumnName
+	columnType := c.ColumnType.String()
+	if c.IsMetrics && c.AggrFunc != "" {
+		columnName = c.ColumnName + "__agg"
+		columnType = fmt.Sprintf("AggregateFunction(%s, %s)", c.AggrFunc, c.ColumnType)
+	}
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` ADD COLUMN %s %s %s",
-		c.Db, c.Table, c.ColumnName, c.ColumnType, defaultValue)
+		c.Db, c.Table, columnName, columnType, defaultValue)
+
 	log.Info(sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		// 如果已经增加，需要跳过该错误
 		if strings.Contains(err.Error(), "column with this name already exists") {
@@ -1541,7 +638,7 @@ func (i *Issu) addIndex(connect *sql.DB, c *IndexAdd) error {
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` ADD INDEX %s %s TYPE %s GRANULARITY 3",
 		c.Db, c.Table, indexName, c.ColumnName, c.IndexType)
 	log.Info(sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		// if it already exists, you need to skip it
 		if strings.Contains(err.Error(), "index with this name already exists") {
@@ -1558,7 +655,7 @@ func (i *Issu) addIndex(connect *sql.DB, c *IndexAdd) error {
 		sql := fmt.Sprintf("ALTER TABLE %s.`%s` MATERIALIZE INDEX %s",
 			c.Db, c.Table, indexName)
 		log.Info(sql)
-		connect.Exec(sql)
+		Exec(connect, sql)
 	}
 	return nil
 }
@@ -1566,7 +663,7 @@ func (i *Issu) addIndex(connect *sql.DB, c *IndexAdd) error {
 func (i *Issu) getColumnType(connect *sql.DB, db, table, columnName string) (string, error) {
 	sql := fmt.Sprintf("SELECT type FROM system.columns WHERE database='%s' AND table='%s' AND name='%s'",
 		db, table, columnName)
-	rows, err := connect.Query(sql)
+	rows, err := Query(connect, sql)
 	if err != nil {
 		return "", err
 	}
@@ -1587,6 +684,37 @@ func (i *Issu) saveDatasourceInfo(connect *sql.DB, db, mvTable string) {
 	}
 }
 
+// add column and copy data to new column replace rename column
+func (i *Issu) renameColumnWithAddNewColumn(connect *sql.DB, cr *ColumnRename) error {
+	// add new column
+	sql := fmt.Sprintf("ALTER TABLE %s.`%s` ADD COLUMN %s %s",
+		cr.Db, cr.Table, cr.NewColumnName, cr.OldColumnType)
+	log.Infof("rename add column: %s", sql)
+	_, err := Exec(connect, sql)
+	if err != nil {
+		// 如果已经增加，需要跳过该错误
+		if strings.Contains(err.Error(), "column with this name already exists") {
+			log.Infof("db: %s, table: %s error: %s", cr.Db, cr.Table, err)
+			return nil
+			// The 'metrics/metrics_local' table is created after receiving the ext_metric data. If the table field is modified just after the system starts, it will cause an error. Ignore it
+		} else if strings.Contains(err.Error(), "Table ext_metrics.metrics doesn't exist") || strings.Contains(err.Error(), "Table ext_metrics.metrics_local doesn't exist") {
+			log.Infof("db: %s, table: %s error: %s", cr.Db, cr.Table, err)
+			return nil
+		}
+		log.Error(err)
+		return err
+	}
+
+	// copy data to new column
+	sql = fmt.Sprintf("ALTER TABLE %s.`%s` update %s=%s WHERE 1",
+		cr.Db, cr.Table, cr.NewColumnName, cr.OldColumnName)
+	log.Info("rename copy column: ", sql)
+	// the returned error value can be ignored
+	Exec(connect, sql)
+
+	return err
+}
+
 func (i *Issu) renameColumn(connect *sql.DB, cr *ColumnRename) error {
 	if cr.CheckColumnType {
 		columnType, err := i.getColumnType(connect, cr.Db, cr.Table, cr.OldColumnName)
@@ -1594,73 +722,64 @@ func (i *Issu) renameColumn(connect *sql.DB, cr *ColumnRename) error {
 			log.Error(err)
 			return err
 		}
-		if columnType != cr.OldColumnType {
+		if columnType != cr.OldColumnType.String() {
 			return nil
 		}
 	}
 
-	// rename first. if it fails, then drop Index and MvTable and try again. prevent accidentally deleting the MvTable.
-	// ALTER TABLE flow_log.l4_flow_log  RENAME COLUMN retan_tx TO retran_tx
-	sql := fmt.Sprintf("ALTER TABLE %s.`%s` RENAME COLUMN IF EXISTS %s to %s",
-		cr.Db, cr.Table, cr.OldColumnName, cr.NewColumnName)
-	log.Info("try rename column: ", sql)
-	_, err := connect.Exec(sql)
-	if err != nil {
-		// 如果已经修改过，就会报错不存在column，需要跳过该错误
-		// Code: 10. DB::Exception: Received from localhost:9000. DB::Exception: Wrong column name. Cannot find column `retan_tx` to rename.
-		if strings.Contains(err.Error(), "Cannot find column") ||
-			strings.Contains(err.Error(), "column with this name already exists") {
-			log.Infof("db: %s, table: %s error: %s", cr.Db, cr.Table, err)
-			return nil
-		} else if strings.Contains(err.Error(), "doesn't exist") {
-			log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
+	if strings.HasSuffix(cr.Table, "_local") {
+		// rename first. if it fails, then drop Index and MvTable and try again. prevent accidentally deleting the MvTable.
+		err := i.renameColumnWithAddNewColumn(connect, cr)
+		if err == nil {
 			return nil
 		}
 		log.Infof("rename column failed, will retry rename column later. err: %s", err)
-	} else {
-		return nil
-	}
 
-	if cr.DropIndex {
-		sql := fmt.Sprintf("ALTER TABLE %s.`%s` DROP INDEX %s_idx",
-			cr.Db, cr.Table, cr.OldColumnName)
-		log.Info("drop index: ", sql)
-		_, err := connect.Exec(sql)
-		if err != nil {
-			if strings.Contains(err.Error(), "Cannot find index") {
-				log.Infof("db: %s, table: %s error: %s", cr.Db, cr.Table, err)
-			} else if strings.Contains(err.Error(), "is not supported by storage Distributed") {
-				log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
-			} else if strings.Contains(err.Error(), "doesn't exist") {
-				log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
-			} else {
-				log.Errorf("sql: %s, error: %s", sql, err)
-				return err
-			}
-		}
-	}
-
-	if cr.DropMvTable {
-		mvTables, err := getMvTables(connect, cr.Db, strings.Split(cr.Table, ".")[0])
-		if err != nil {
-			log.Error(err)
-			return err
-		}
-		for _, mvTable := range mvTables {
-			i.saveDatasourceInfo(connect, cr.Db, mvTable)
-			sql := fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`",
-				cr.Db, mvTable)
-			log.Info("drop mv talbe: ", sql)
-			_, err := connect.Exec(sql)
+		if cr.DropMvTable {
+			mvTables, err := getMvTables(connect, cr.Db, strings.Split(cr.Table, ".")[0]+".")
 			if err != nil {
 				log.Error(err)
 				return err
 			}
+			for _, mvTable := range mvTables {
+				i.saveDatasourceInfo(connect, cr.Db, mvTable)
+				sql := fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`",
+					cr.Db, mvTable)
+				log.Info("drop mv talbe: ", sql)
+				_, err := Exec(connect, sql)
+				if err != nil {
+					log.Error(err)
+					return err
+				}
+			}
 		}
+
+		if cr.DropIndex {
+			sql := fmt.Sprintf("ALTER TABLE %s.`%s` DROP INDEX %s_idx",
+				cr.Db, cr.Table, cr.OldColumnName)
+			log.Info("drop index: ", sql)
+			_, err := Exec(connect, sql)
+			if err != nil {
+				if strings.Contains(err.Error(), "Cannot find index") {
+					log.Infof("db: %s, table: %s error: %s", cr.Db, cr.Table, err)
+				} else if strings.Contains(err.Error(), "is not supported by storage Distributed") {
+					log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
+				} else if strings.Contains(err.Error(), "doesn't exist") {
+					log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
+				} else {
+					log.Errorf("sql: %s, error: %s", sql, err)
+					return err
+				}
+			}
+		}
+		return i.renameColumnWithAddNewColumn(connect, cr)
 	}
 
-	log.Info("rename column again: ", sql)
-	_, err = connect.Exec(sql)
+	// ALTER TABLE flow_log.l4_flow_log  RENAME COLUMN retan_tx TO retran_tx
+	sql := fmt.Sprintf("ALTER TABLE %s.`%s` RENAME COLUMN IF EXISTS %s to %s",
+		cr.Db, cr.Table, cr.OldColumnName, cr.NewColumnName)
+	log.Info("rename column: ", sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		// 如果已经修改过，就会报错不存在column，需要跳过该错误
 		// Code: 10. DB::Exception: Received from localhost:9000. DB::Exception: Wrong column name. Cannot find column `retan_tx` to rename.
@@ -1672,9 +791,9 @@ func (i *Issu) renameColumn(connect *sql.DB, cr *ColumnRename) error {
 			log.Infof("db: %s, table: %s info: %s", cr.Db, cr.Table, err)
 			return nil
 		}
-		log.Error(err)
 		return err
 	}
+
 	return nil
 }
 
@@ -1683,7 +802,7 @@ func (i *Issu) modColumn(connect *sql.DB, cm *ColumnMod) error {
 		sql := fmt.Sprintf("ALTER TABLE %s.`%s` DROP INDEX %s_idx",
 			cm.Db, cm.Table, cm.ColumnName)
 		log.Info("drop index: ", sql)
-		_, err := connect.Exec(sql)
+		_, err := Exec(connect, sql)
 		if err != nil {
 			if strings.Contains(err.Error(), "Cannot find index") {
 				log.Infof("db: %s, table: %s error: %s", cm.Db, cm.Table, err)
@@ -1699,7 +818,7 @@ func (i *Issu) modColumn(connect *sql.DB, cm *ColumnMod) error {
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` MODIFY COLUMN %s %s",
 		cm.Db, cm.Table, cm.ColumnName, cm.NewColumnType)
 	log.Info("modify column: ", sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		//If cannot find column, you need to skip the error
 		// Code: 10. DB::Exception: Received from localhost:9000. DB::Exception: Wrong column name. Cannot find column `span_kind` to modify.
@@ -1717,7 +836,7 @@ func (i *Issu) dropColumn(connect *sql.DB, cm *ColumnDrop) error {
 	// drop index first
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` DROP INDEX %s_idx", cm.Db, cm.Table, cm.ColumnName)
 	log.Info("drop index: ", sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		if strings.Contains(err.Error(), "Cannot find index") {
 			log.Infof("db: %s, table: %s error: %s", cm.Db, cm.Table, err)
@@ -1732,7 +851,7 @@ func (i *Issu) dropColumn(connect *sql.DB, cm *ColumnDrop) error {
 	// then drop column
 	sql = fmt.Sprintf("ALTER TABLE %s.`%s` DROP COLUMN %s", cm.Db, cm.Table, cm.ColumnName)
 	log.Info("drop column: ", sql)
-	_, err = connect.Exec(sql)
+	_, err = Exec(connect, sql)
 	if err != nil {
 		//If cannot find column, you need to skip the error
 		// Code: 10. DB::Exception: Received from localhost:9000. DB::Exception: Wrong column name. Cannot find column `span_kind` to modify.
@@ -1764,27 +883,41 @@ func getColumnDrops(columnDrops []*ColumnDrops) []*ColumnDrop {
 	return drops
 }
 
-func (i *Issu) getTableVersion(connect *sql.DB, db, table string) (string, error) {
-	sql := fmt.Sprintf("SELECT comment FROM system.columns WHERE database='%s' AND table='%s' AND name='time'",
-		db, table)
-	rows, err := connect.Query(sql)
+func (i *Issu) getAllTableVersions(connect *sql.DB) (map[string]string, error) {
+	sql := "SELECT database,table,comment FROM system.columns WHERE name='time'"
+	rows, err := Query(connect, sql)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var version string
+	versions := make(map[string]string)
 	for rows.Next() {
-		err := rows.Scan(&version)
+		var database, table, version string
+		err := rows.Scan(&database, &table, &version)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
+		versions[genKey(database, table)] = version
 	}
-	return version, nil
+	return versions, nil
+}
+
+func (i *Issu) getTableVersion(idx int, db, table string) (string, bool) {
+	version, exist := i.getTableRawVersion(idx, db, table)
+	if !exist {
+		version = common.CK_VERSION
+	}
+	return version, exist
+}
+
+func (i *Issu) getTableRawVersion(idx int, db, table string) (string, bool) {
+	version, exist := i.VersionMaps[idx][genKey(db, table)]
+	return version, exist
 }
 
 func (i *Issu) setTableVersion(connect *sql.DB, db, table string) error {
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` COMMENT COLUMN time '%s'",
 		db, table, common.CK_VERSION)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		if strings.Contains(err.Error(), "doesn't exist") {
 			log.Infof("db: %s, table: %s info: %s", db, table, err)
@@ -1792,6 +925,43 @@ func (i *Issu) setTableVersion(connect *sql.DB, db, table string) error {
 		}
 	}
 	return err
+}
+
+func Query(connect *sql.DB, sql string) (*sql.Rows, error) {
+	rows, err := connect.Query(sql)
+	retryTimes := RETRY_COUNT
+	for err != nil && retryTimes > 0 {
+		log.Warningf("Query SQL (%s) failed: %s, will retry", sql, err)
+		time.Sleep(100 * time.Millisecond)
+		rows, err = connect.Query(sql)
+		if err == nil {
+			log.Infof("Retry query SQL (%s) success", sql)
+			return rows, err
+		}
+		retryTimes--
+	}
+	return rows, err
+}
+
+func Exec(connect *sql.DB, sql string) (sql.Result, error) {
+	result, err := connect.Exec(sql)
+	retryTimes := RETRY_COUNT
+	for err != nil && retryTimes > 0 {
+		if strings.Contains(err.Error(), "already exists") ||
+			strings.Contains(err.Error(), "does not exist") {
+			log.Infof("Exec SQL (%s) result: %s", sql, err)
+			return result, nil
+		}
+		log.Warningf("Exec SQL (%s) failed: %s, will retry", sql, err)
+		time.Sleep(100 * time.Millisecond)
+		result, err = connect.Exec(sql)
+		if err == nil {
+			log.Infof("Retry exec SQL (%s) success", sql)
+			return result, err
+		}
+		retryTimes--
+	}
+	return result, err
 }
 
 func getColumnRenames(columnRenamess []*ColumnRenames) []*ColumnRename {
@@ -1804,7 +974,7 @@ func getColumnRenames(columnRenamess []*ColumnRenames) []*ColumnRename {
 					Table:           table,
 					OldColumnName:   name,
 					CheckColumnType: columnRenames.CheckColumnType,
-					OldColumnType:   columnRenames.OldColumnType,
+					OldColumnType:   columnRenames.OldColumnTypes[i],
 					NewColumnName:   columnRenames.NewColumnNames[i],
 					DropIndex:       columnRenames.DropIndex,
 					DropMvTable:     columnRenames.DropMvTable,
@@ -1815,17 +985,11 @@ func getColumnRenames(columnRenamess []*ColumnRenames) []*ColumnRename {
 	return renames
 }
 
-func (i *Issu) renameColumns(connect *sql.DB) ([]*ColumnRename, error) {
+func (i *Issu) renameColumns(index int, orgIDPrefix string, connect *sql.DB) ([]*ColumnRename, error) {
 	dones := []*ColumnRename{}
 	for _, renameColumn := range i.columnRenames {
-		version, err := i.getTableVersion(connect, renameColumn.Db, renameColumn.Table)
-		if err != nil {
-			if strings.Contains(err.Error(), "doesn't exist") {
-				log.Infof("db: %s, table: %s info: %s", renameColumn.Db, renameColumn.Table, err)
-				continue
-			}
-			return dones, err
-		}
+		renameColumn.Db = getOrgDatabase(renameColumn.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, renameColumn.Db, renameColumn.Table)
 		if version == common.CK_VERSION {
 			continue
 		}
@@ -1839,13 +1003,11 @@ func (i *Issu) renameColumns(connect *sql.DB) ([]*ColumnRename, error) {
 	return dones, nil
 }
 
-func (i *Issu) modColumns(connect *sql.DB) ([]*ColumnMod, error) {
+func (i *Issu) modColumns(index int, orgIDPrefix string, connect *sql.DB) ([]*ColumnMod, error) {
 	dones := []*ColumnMod{}
 	for _, modColumn := range i.columnMods {
-		version, err := i.getTableVersion(connect, modColumn.Db, modColumn.Table)
-		if err != nil {
-			return dones, err
-		}
+		modColumn.Db = getOrgDatabase(modColumn.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, modColumn.Db, modColumn.Table)
 		if version == common.CK_VERSION {
 			continue
 		}
@@ -1858,13 +1020,11 @@ func (i *Issu) modColumns(connect *sql.DB) ([]*ColumnMod, error) {
 	return dones, nil
 }
 
-func (i *Issu) dropColumns(connect *sql.DB) ([]*ColumnDrop, error) {
+func (i *Issu) dropColumns(index int, orgIDPrefix string, connect *sql.DB) ([]*ColumnDrop, error) {
 	dones := []*ColumnDrop{}
 	for _, dropColumn := range i.columnDrops {
-		version, err := i.getTableVersion(connect, dropColumn.Db, dropColumn.Table)
-		if err != nil {
-			return dones, err
-		}
+		dropColumn.Db = getOrgDatabase(dropColumn.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, dropColumn.Db, dropColumn.Table)
 		if version == common.CK_VERSION {
 			continue
 		}
@@ -1876,13 +1036,10 @@ func (i *Issu) dropColumns(connect *sql.DB) ([]*ColumnDrop, error) {
 	return dones, nil
 }
 
-func (i *Issu) modTableTTLs(connect *sql.DB) error {
+func (i *Issu) modTableTTLs(index int, orgIDPrefix string, connect *sql.DB) error {
 	for _, modTTL := range i.modTTLs {
-		version, err := i.getTableVersion(connect, modTTL.Db, modTTL.Table)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
+		modTTL.Db = getOrgDatabase(modTTL.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, modTTL.Db, modTTL.Table)
 		if version == common.CK_VERSION {
 			continue
 		}
@@ -1904,7 +1061,7 @@ func (i *Issu) modTTL(connect *sql.DB, mt *TableModTTL) error {
 	sql := fmt.Sprintf("ALTER TABLE %s.`%s` MODIFY TTL time + toIntervalHour(%d)",
 		mt.Db, mt.Table, mt.NewTTL)
 	log.Info("modify TTL: ", sql)
-	_, err := connect.Exec(sql)
+	_, err := Exec(connect, sql)
 	if err != nil {
 		return err
 	}
@@ -1948,15 +1105,37 @@ func getIndexAdds(indexAddss []*IndexAdds) []*IndexAdd {
 	return adds
 }
 
-func (i *Issu) addColumns(connect *sql.DB) ([]*ColumnAdd, error) {
+func getColumnDatasourceAdds(columnDatasourceAddss []*ColumnDatasourceAdds) []*ColumnDatasourceAdd {
+	adds := []*ColumnDatasourceAdd{}
+	for _, columnAdds := range columnDatasourceAddss {
+		for i, name := range columnAdds.ColumnNames {
+			OldColumnName := ""
+			if len(columnAdds.OldColumnNames) > i {
+				OldColumnName = columnAdds.OldColumnNames[i]
+			}
+			adds = append(adds, &ColumnDatasourceAdd{
+				ColumnName:       name,
+				OldColumnName:    OldColumnName,
+				ColumnType:       columnAdds.ColumnTypes[i],
+				OnlyMapTable:     columnAdds.OnlyMapTable,
+				OnlyAppTable:     columnAdds.OnlyAppTable,
+				OnlyNetworkTable: columnAdds.OnlyNetworkTable,
+				DefaultValue:     columnAdds.DefaultValue,
+				IsMetrics:        columnAdds.IsMetrics,
+				IsSummable:       columnAdds.IsSummable,
+			})
+		}
+	}
+	return adds
+}
+
+func (i *Issu) addColumns(index int, orgIDPrefix string, connect *sql.DB) ([]*ColumnAdd, error) {
 	dones := []*ColumnAdd{}
 	for _, add := range i.columnAdds {
-		version, err := i.getTableVersion(connect, add.Db, add.Table)
-		if err != nil {
-			return dones, err
-		}
+		add.Db = getOrgDatabase(add.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, add.Db, add.Table)
 		if version == common.CK_VERSION {
-			log.Infof("db(%s) table(%s) already updated", add.Db, add.Table)
+			log.Infof("db (%s) table (%s) already updated", add.Db, add.Table)
 			continue
 		}
 		if err := i.addColumn(connect, add); err != nil {
@@ -1966,16 +1145,17 @@ func (i *Issu) addColumns(connect *sql.DB) ([]*ColumnAdd, error) {
 	}
 
 	for _, tableName := range []string{
-		zerodoc.VTAP_FLOW_PORT_1M.TableName(), zerodoc.VTAP_FLOW_EDGE_PORT_1M.TableName(),
-		zerodoc.VTAP_APP_PORT_1M.TableName(), zerodoc.VTAP_APP_EDGE_PORT_1M.TableName()} {
-		datasourceInfos, err := i.getUserDefinedDatasourceInfos(connect, ckdb.METRICS_DB, strings.Split(tableName, ".")[0])
+		flow_metrics.NETWORK_1M.TableName(), flow_metrics.NETWORK_MAP_1M.TableName(),
+		flow_metrics.APPLICATION_1M.TableName(), flow_metrics.APPLICATION_MAP_1M.TableName()} {
+		datasourceInfos, err := i.getUserDefinedDatasourceInfos(connect, getOrgDatabase(ckdb.METRICS_DB, orgIDPrefix), strings.Split(tableName, ".")[0])
 		if err != nil {
 			log.Warning(err)
 			continue
 		}
 		for _, dsInfo := range datasourceInfos {
-			adds, err := i.addColumnDatasource(connect, dsInfo, strings.Contains(tableName, "_edge_"), strings.Contains(tableName, "vtap_app"))
+			adds, err := i.addColumnDatasource(index, dsInfo, strings.Contains(tableName, "_map"), strings.Contains(tableName, "application"), strings.Contains(tableName, "network"))
 			if err != nil {
+				log.Warningf("add column datasource failed: %s", err)
 				return nil, nil
 			}
 			dones = append(dones, adds...)
@@ -1985,19 +1165,17 @@ func (i *Issu) addColumns(connect *sql.DB) ([]*ColumnAdd, error) {
 	return dones, nil
 }
 
-func (i *Issu) addIndexs(connect *sql.DB) ([]*IndexAdd, error) {
+func (i *Issu) addIndexs(index int, orgIDPrefix string, connect *sql.DB) ([]*IndexAdd, error) {
 	dones := []*IndexAdd{}
 	for _, add := range i.indexAdds {
-		version, err := i.getTableVersion(connect, add.Db, add.Table)
-		if err != nil {
-			return dones, err
-		}
+		add.Db = getOrgDatabase(add.Db, orgIDPrefix)
+		version, _ := i.getTableVersion(index, add.Db, add.Table)
 		if version == common.CK_VERSION {
-			log.Infof("db(%s) table(%s) already updated", add.Db, add.Table)
+			log.Infof("db (%s) table (%s) already updated", add.Db, add.Table)
 			continue
 		}
 		if err := i.addIndex(connect, add); err != nil {
-			log.Warningf("db(%s) table(%s) add index failed.err: %s", add.Db, add.Table, err)
+			log.Warningf("db (%s) table (%s) add index failed.err: %s", add.Db, add.Table, err)
 			continue
 		}
 		dones = append(dones, add)
@@ -2005,63 +1183,245 @@ func (i *Issu) addIndexs(connect *sql.DB) ([]*IndexAdd, error) {
 	return dones, nil
 }
 
+func isNumeric(s string) bool {
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// return orgIdPrefix,raw_database from orgDatabase. eg. '0123_flow_metrics', return '0123_', 'flow_metrics'
+func parseOrgDatabase(db string) (string, string) {
+	if len(db) > ckdb.ORG_ID_PREFIX_LEN && db[ckdb.ORG_ID_LEN] == '_' && isNumeric(db[:ckdb.ORG_ID_LEN]) {
+		return db[:ckdb.ORG_ID_PREFIX_LEN], db[ckdb.ORG_ID_PREFIX_LEN:]
+	}
+	return "", db
+}
+
+func parseOrgId(db string) uint16 {
+	orgIdStr, _ := parseOrgDatabase(db)
+	if orgIdStr == "" {
+		return ckdb.DEFAULT_ORG_ID
+	}
+	orgId, err := strconv.Atoi(orgIdStr)
+	if err != nil {
+		return ckdb.DEFAULT_ORG_ID
+	}
+	return uint16(orgId)
+}
+
+func getOrgDatabase(db string, orgIDPrefix string) string {
+	_, rawDb := parseOrgDatabase(db)
+	return orgIDPrefix + rawDb
+}
+
+func genKey(db, table string) string {
+	return db + "-" + table
+}
+
+func (i *Issu) startOrg(index int, orgIDPrefix string, connect *sql.DB) error {
+	renames, errRenames := i.renameColumns(index, orgIDPrefix, connect)
+	if errRenames != nil {
+		return errRenames
+	}
+	mods, errMods := i.modColumns(index, orgIDPrefix, connect)
+	if errMods != nil {
+		return errMods
+	}
+
+	adds, errAdds := i.addColumns(index, orgIDPrefix, connect)
+	if errAdds != nil {
+		return errAdds
+	}
+
+	addIndexs, errAddIndexs := i.addIndexs(index, orgIDPrefix, connect)
+	if errAddIndexs != nil {
+		log.Warning(errAddIndexs)
+	}
+
+	drops, errDrops := i.dropColumns(index, orgIDPrefix, connect)
+	if errDrops != nil {
+		return errDrops
+	}
+
+	versionSetted := make(map[string]struct{})
+	for _, cr := range renames {
+		if _, exist := versionSetted[genKey(cr.Db, cr.Table)]; exist {
+			continue
+		}
+		if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
+			return err
+		}
+		versionSetted[genKey(cr.Db, cr.Table)] = struct{}{}
+	}
+	for _, cr := range mods {
+		if _, exist := versionSetted[genKey(cr.Db, cr.Table)]; exist {
+			continue
+		}
+		if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
+			return err
+		}
+		versionSetted[genKey(cr.Db, cr.Table)] = struct{}{}
+	}
+	for _, cr := range adds {
+		if _, exist := versionSetted[genKey(cr.Db, cr.Table)]; exist {
+			continue
+		}
+		if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
+			return err
+		}
+		versionSetted[genKey(cr.Db, cr.Table)] = struct{}{}
+	}
+	for _, cr := range addIndexs {
+		if _, exist := versionSetted[genKey(cr.Db, cr.Table)]; exist {
+			continue
+		}
+		if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
+			return err
+		}
+		versionSetted[genKey(cr.Db, cr.Table)] = struct{}{}
+	}
+	for _, cr := range drops {
+		if _, exist := versionSetted[genKey(cr.Db, cr.Table)]; exist {
+			continue
+		}
+		if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
+			return err
+		}
+		versionSetted[genKey(cr.Db, cr.Table)] = struct{}{}
+	}
+	go i.modTableTTLs(index, orgIDPrefix, connect)
+	return nil
+}
+
+func (i *Issu) getOrgIDPrefixsWithoutDefault(connect *sql.DB) ([]string, error) {
+	checkOrgDatabase := "event"
+	sql := fmt.Sprintf("SELECT name FROM system.databases WHERE name like '%%%s%%'", checkOrgDatabase)
+	rows, err := Query(connect, sql)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("get orgs sql: ", sql)
+	var db string
+	orgIDPrefixs := []string{}
+	for rows.Next() {
+		err := rows.Scan(&db)
+		if err != nil {
+			return nil, err
+		}
+
+		orgPrefix, _ := parseOrgDatabase(db)
+		if orgPrefix == "" {
+			continue
+		}
+		orgIDPrefixs = append(orgIDPrefixs, orgPrefix)
+	}
+	return orgIDPrefixs, nil
+
+}
+
 func (i *Issu) Start() error {
 	connects := i.Connections
 	if len(connects) == 0 {
 		return fmt.Errorf("connections is nil")
 	}
-	for _, connect := range connects {
-		renames, errRenames := i.renameColumns(connect)
-		if errRenames != nil {
-			return errRenames
-		}
-		mods, errMods := i.modColumns(connect)
-		if errMods != nil {
-			return errMods
-		}
 
-		adds, errAdds := i.addColumns(connect)
-		if errAdds != nil {
-			return errAdds
+	// update versionMaps
+	for idx, connect := range i.Connections {
+		m, err := i.getAllTableVersions(connect)
+		if err != nil {
+			return err
 		}
-
-		addIndexs, errAddIndexs := i.addIndexs(connect)
-		if errAddIndexs != nil {
-			log.Warning(errAddIndexs)
-		}
-
-		drops, errDrops := i.dropColumns(connect)
-		if errDrops != nil {
-			return errDrops
-		}
-
-		for _, cr := range renames {
-			if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
-				return err
-			}
-		}
-		for _, cr := range mods {
-			if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
-				return err
-			}
-		}
-		for _, cr := range adds {
-			if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
-				return err
-			}
-		}
-		for _, cr := range addIndexs {
-			if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
-				return err
-			}
-		}
-		for _, cr := range drops {
-			if err := i.setTableVersion(connect, cr.Db, cr.Table); err != nil {
-				return err
-			}
-		}
-		go i.modTableTTLs(connect)
+		i.VersionMaps[idx] = m
 	}
+
+	var err error
+	orgIDPrefixs := make([][]string, len(i.Connections))
+	nativeTags := nativetag.GetAllNativeTags()
+	// update default organization databases first
+	for index, connect := range i.Connections {
+		err = i.startOrg(index, "", connect)
+		if err != nil {
+			log.Error(err)
+			return err
+		}
+		for _, nativeTag := range nativeTags[ckdb.DEFAULT_ORG_ID] {
+			if nativeTag == nil {
+				continue
+			}
+			if e := nativetag.CKAddNativeTag(i.cfg.CKDB.Type == ckdb.CKDBTypeByconity, true, connect, ckdb.DEFAULT_ORG_ID, nativeTag); e != nil {
+				log.Error(err)
+			}
+		}
+		orgIDPrefixs[index], err = i.getOrgIDPrefixsWithoutDefault(connect)
+		if err != nil {
+			return fmt.Errorf("get orgIDs failed, err: %s", err)
+		}
+	}
+
+	// update other organization databases
+	var wg sync.WaitGroup
+	for index, prefixes := range orgIDPrefixs {
+		orgCount := len(prefixes)
+		if orgCount == 0 {
+			continue
+		}
+
+		jobNum := orgCount/MIN_ORG_PER_JOB + 1
+		if jobNum > MAX_JOB_COUNT {
+			jobNum = MAX_JOB_COUNT
+		}
+		orgPerJob := (orgCount + jobNum - 1) / jobNum
+
+		errCount := 0
+		var err error
+		for j := 0; j < jobNum; j++ {
+			minIndex := j * orgPerJob
+			maxIndex := j*orgPerJob + orgPerJob
+			if maxIndex > orgCount {
+				maxIndex = orgCount
+			}
+
+			wg.Add(1)
+			go func(orgPrefixs []string) {
+				defer wg.Done()
+				log.Infof("begin ckissu %+v", orgPrefixs)
+				connect, e := common.NewCKConnection(i.Addrs[index], i.username, i.password)
+				if err != nil {
+					err = e
+					return
+				}
+				defer connect.Close()
+				for _, orgIDPrefix := range orgPrefixs {
+					if e := i.startOrg(index, orgIDPrefix, connect); e != nil {
+						err = fmt.Errorf("orgIDPrefix %s run issu failed, err: %s", orgIDPrefix, e)
+						log.Error(err)
+						errCount++
+					}
+					orgId := parseOrgId(orgIDPrefix + "event")
+					for _, nativeTag := range nativeTags[orgId] {
+						if nativeTag == nil {
+							continue
+						}
+						if e := nativetag.CKAddNativeTag(i.cfg.CKDB.Type == ckdb.CKDBTypeByconity, true, connect, orgId, nativeTag); e != nil {
+							log.Error(err)
+						}
+					}
+				}
+
+				log.Infof("end ckissu %+v", orgPrefixs)
+			}(prefixes[minIndex:maxIndex])
+		}
+		wg.Wait()
+
+		// When only 1 non-default organization issu exception occurs, the error is ignored
+		if errCount > 1 {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -2072,27 +1432,33 @@ func (i *Issu) Close() error {
 	return i.Connections.Close()
 }
 
-func (i *Issu) renameUserDefineDatasource(connect *sql.DB, ds *datasource.DatasourceManager) error {
-	for _, dbGroup := range []string{"vtap_flow", "vtap_app"} {
-		dbName := dbGroup + "_port"
-		datasourceInfos, err := i.getUserDefinedDatasourceInfos(connect, dbName, "")
+func (i *Issu) renameUserDefineDatasource(connect *sql.DB, orgId uint16, ds *datasource.DatasourceManager) error {
+	for _, tableGroup := range []string{"application", "network"} {
+		datasourceInfos, err := i.getUserDefinedDatasourceInfos(connect, "flow_metrics", tableGroup)
 		if err != nil {
 			return err
 		}
 		for _, dsInfo := range datasourceInfos {
-			if err := i.renameTable(connect, &TableRename{
-				OldDb:     dsInfo.db,
-				OldTables: []string{dsInfo.name + "_agg"},
-				NewDb:     ckdb.METRICS_DB,
-				NewTables: []string{fmt.Sprintf("%s.%s", dsInfo.db, dsInfo.name+"_agg")},
-			}); err != nil {
+			log.Infof("get datasource info: %+v", dsInfo)
+			interval := INTERVAL_HOUR
+			if dsInfo.interval == ckdb.TimeFuncDay {
+				interval = INTERVAL_DAY
+			}
+			// drop table mv
+			sql := fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`", ckdb.OrgDatabasePrefix(orgId)+dsInfo.db, dsInfo.name+"_mv")
+			log.Info(sql)
+			_, err := Exec(connect, sql)
+			if err != nil {
 				return err
 			}
-			interval := 60
-			if dsInfo.interval == ckdb.TimeFuncDay {
-				interval = 1440
+			// dsInfo.name like 'application.1d' should convert to '1d'
+			name := dsInfo.name
+			names := strings.Split(dsInfo.name, ".")
+			if len(names) == 2 {
+				name = names[1]
 			}
-			if err := ds.Handle(dbGroup, "add", dsInfo.baseTable, dsInfo.name, dsInfo.summable, dsInfo.unsummable, interval, 7*24); err != nil {
+			//readd mvTable,localTable,gobalTable
+			if err := ds.Handle(int(orgId), datasource.ADD, tableGroup, dsInfo.baseTable, name, dsInfo.summable, dsInfo.unsummable, interval, DEFAULT_TTL); err != nil {
 				return err
 			}
 		}

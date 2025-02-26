@@ -20,21 +20,22 @@ import (
 	r_kvstore "github.com/aliyun/alibaba-cloud-sdk-go/services/r-kvstore"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (a *Aliyun) getRedisInstances(region model.Region) (
-	[]model.RedisInstance, []model.VInterface, []model.IP, error,
+	[]model.RedisInstance, []model.VInterface, []model.IP,
 ) {
 	var retRedisInstances []model.RedisInstance
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
-	log.Debug("get redis_instances starting")
+	log.Debug("get redis_instances starting", logger.NewORGPrefix(a.orgID))
 	request := r_kvstore.CreateDescribeInstancesRequest()
 	response, err := a.getRedisResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return retRedisInstances, retVInterfaces, retIPs, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.RedisInstance{}, []model.VInterface{}, []model.IP{}
 	}
 
 	for _, r := range response {
@@ -59,7 +60,7 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 			}
 			redisStatus := redis.Get("InstanceStatus").MustString()
 			if redisStatus != "Normal" {
-				log.Infof("redis (%s) invalid status (%s)", redisName, redisStatus)
+				log.Infof("redis (%s) invalid status (%s)", redisName, redisStatus, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 			vpcId := redis.Get("VpcId").MustString()
@@ -70,8 +71,8 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 			attrRequest.InstanceId = redisId
 			attrResponse, err := a.getRedisAttributeResponse(region.Label, attrRequest)
 			if err != nil {
-				log.Error(err)
-				return []model.RedisInstance{}, []model.VInterface{}, []model.IP{}, err
+				log.Warning(err, logger.NewORGPrefix(a.orgID))
+				return []model.RedisInstance{}, []model.VInterface{}, []model.IP{}
 			}
 
 			internalHost := ""
@@ -87,15 +88,15 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 				}
 			}
 
-			redisLcuuid := common.GenerateUUID(redisId)
-			vpcLcuuid := common.GenerateUUID(vpcId)
+			redisLcuuid := common.GenerateUUIDByOrgID(a.orgID, redisId)
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, vpcId)
 			retRedisInstance := model.RedisInstance{
 				Lcuuid:       redisLcuuid,
 				Name:         redisName,
 				Label:        redisId,
 				VPCLcuuid:    vpcLcuuid,
-				AZLcuuid:     common.GenerateUUID(a.uuidGenerate + "_" + zoneId),
-				RegionLcuuid: a.getRegionLcuuid(region.Lcuuid),
+				AZLcuuid:     common.GenerateUUIDByOrgID(a.orgID, a.uuidGenerate+"_"+zoneId),
+				RegionLcuuid: a.regionLcuuid,
 				InternalHost: internalHost,
 				PublicHost:   publicHost,
 				State:        common.REDIS_STATE_RUNNING,
@@ -103,22 +104,18 @@ func (a *Aliyun) getRedisInstances(region model.Region) (
 			}
 			retRedisInstances = append(retRedisInstances, retRedisInstance)
 			a.azLcuuidToResourceNum[retRedisInstance.AZLcuuid]++
-			a.regionLcuuidToResourceNum[retRedisInstance.RegionLcuuid]++
 
 			// 获取接口信息
-			tmpVInterfaces, tmpIPs, err := a.getRedisPorts(region, redisId)
-			if err != nil {
-				return []model.RedisInstance{}, []model.VInterface{}, []model.IP{}, err
-			}
+			tmpVInterfaces, tmpIPs := a.getRedisPorts(region, redisId)
 			retVInterfaces = append(retVInterfaces, tmpVInterfaces...)
 			retIPs = append(retIPs, tmpIPs...)
 		}
 	}
-	log.Debug("get redis_instances complete")
-	return retRedisInstances, retVInterfaces, retIPs, nil
+	log.Debug("get redis_instances complete", logger.NewORGPrefix(a.orgID))
+	return retRedisInstances, retVInterfaces, retIPs
 }
 
-func (a *Aliyun) getRedisPorts(region model.Region, redisId string) ([]model.VInterface, []model.IP, error) {
+func (a *Aliyun) getRedisPorts(region model.Region, redisId string) ([]model.VInterface, []model.IP) {
 	var retVInterfaces []model.VInterface
 	var retIPs []model.IP
 
@@ -126,11 +123,11 @@ func (a *Aliyun) getRedisPorts(region model.Region, redisId string) ([]model.VIn
 	request.InstanceId = redisId
 	response, err := a.getRedisVInterfaceResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return []model.VInterface{}, []model.IP{}, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.VInterface{}, []model.IP{}
 	}
 
-	redisLcuuid := common.GenerateUUID(redisId)
+	redisLcuuid := common.GenerateUUIDByOrgID(a.orgID, redisId)
 	for _, rNet := range response {
 		for j := range rNet.Get("InstanceNetInfo").MustArray() {
 			net := rNet.Get("InstanceNetInfo").GetIndex(j)
@@ -139,10 +136,10 @@ func (a *Aliyun) getRedisPorts(region model.Region, redisId string) ([]model.VIn
 			if ip == "" {
 				continue
 			}
-			portLcuuid := common.GenerateUUID(redisLcuuid + ip)
+			portLcuuid := common.GenerateUUIDByOrgID(a.orgID, redisLcuuid+ip)
 			portType := common.VIF_TYPE_LAN
-			vpcLcuuid := common.GenerateUUID(net.Get("VPCId").MustString())
-			networkLcuuid := common.GenerateUUID(net.Get("VSwitchId").MustString())
+			vpcLcuuid := common.GenerateUUIDByOrgID(a.orgID, net.Get("VPCId").MustString())
+			networkLcuuid := common.GenerateUUIDByOrgID(a.orgID, net.Get("VSwitchId").MustString())
 			if net.Get("IPType").MustString() == "Public" {
 				portType = common.VIF_TYPE_WAN
 				networkLcuuid = common.NETWORK_ISP_LCUUID
@@ -155,19 +152,19 @@ func (a *Aliyun) getRedisPorts(region model.Region, redisId string) ([]model.VIn
 				DeviceType:    common.VIF_DEVICE_TYPE_REDIS_INSTANCE,
 				NetworkLcuuid: networkLcuuid,
 				VPCLcuuid:     vpcLcuuid,
-				RegionLcuuid:  a.getRegionLcuuid(region.Lcuuid),
+				RegionLcuuid:  a.regionLcuuid,
 			}
 			retVInterfaces = append(retVInterfaces, retVInterface)
 
 			retIP := model.IP{
-				Lcuuid:           common.GenerateUUID(portLcuuid + ip),
+				Lcuuid:           common.GenerateUUIDByOrgID(a.orgID, portLcuuid+ip),
 				VInterfaceLcuuid: portLcuuid,
 				IP:               ip,
-				SubnetLcuuid:     common.GenerateUUID(networkLcuuid),
-				RegionLcuuid:     a.getRegionLcuuid(region.Lcuuid),
+				SubnetLcuuid:     common.GenerateUUIDByOrgID(a.orgID, networkLcuuid),
+				RegionLcuuid:     a.regionLcuuid,
 			}
 			retIPs = append(retIPs, retIP)
 		}
 	}
-	return retVInterfaces, retIPs, nil
+	return retVInterfaces, retIPs
 }

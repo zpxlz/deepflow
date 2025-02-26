@@ -23,12 +23,11 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/deepflowio/deepflow/message/trident"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	models "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
 	"github.com/golang/protobuf/proto"
@@ -58,45 +57,57 @@ type GroupProto struct {
 	groupVersion uint64
 	groups       *atomic.Value // []byte
 	groupHash    uint64
+	startTime    int64
+	ORGID
 }
 
-func newGroupProto() *GroupProto {
+func NewGroupProto(orgID ORGID, startTime int64) *GroupProto {
 	groups := &atomic.Value{}
 	groups.Store([]byte{})
 	return &GroupProto{
 		groupVersion: 0,
 		groups:       groups,
 		groupHash:    0,
+		startTime:    startTime,
+		ORGID:        orgID,
 	}
 }
 
 func (g *GroupProto) String() string {
 	return fmt.Sprintf("groupVersion: %d, groupHash: %d, dataLen: %d", g.groupVersion,
-		g.groupHash, len(g.getGroups()))
+		g.groupHash, len(g.GetGroups()))
+}
+
+func (g *GroupProto) SetStartTime(startTime int64) {
+	g.startTime = startTime
 }
 
 func (g *GroupProto) checkVersion(groupHash uint64) {
 	if g.groupHash != groupHash {
 		g.groupHash = groupHash
 		if g.groupVersion == 0 {
-			g.groupVersion = uint64(time.Now().Unix())
+			g.groupVersion = uint64(g.startTime)
 		} else {
 			atomic.AddUint64(&g.groupVersion, 1)
 		}
-		log.Infof("group data changed to %s", g)
+		log.Infof(g.Logf("group data changed to %s", g))
 	}
 }
 
-func (g *GroupProto) getVersion() uint64 {
+func (g *GroupProto) GetVersion() uint64 {
 	return atomic.LoadUint64(&g.groupVersion)
 }
 
-func (g *GroupProto) getGroups() []byte {
+func (g *GroupProto) GetGroups() []byte {
 	return g.groups.Load().([]byte)
 }
 
 func (g *GroupProto) updateGroups(groups []byte) {
 	g.groups.Store(groups)
+}
+
+func (g *GroupProto) GenerateIngesterGroup(groupData *GroupData) {
+	g.generateGroupProto(groupData.groupsProto, groupData.svcsProto)
 }
 
 func (g *GroupProto) generateGroupProto(groupsProto []*trident.Group, svcs []*trident.ServiceInfo) {
@@ -111,7 +122,28 @@ func (g *GroupProto) generateGroupProto(groupsProto []*trident.Group, svcs []*tr
 		h64.Write(groupBytes)
 		g.checkVersion(h64.Sum64())
 	} else {
-		log.Error(err)
+		log.Error(g.Log(err.Error()))
+	}
+}
+
+type GroupData struct {
+	groupsProto []*trident.Group
+	svcsProto   []*trident.ServiceInfo
+}
+
+func NewGroupData(groupsProto []*trident.Group, svcsProto []*trident.ServiceInfo) *GroupData {
+	return &GroupData{
+		groupsProto: groupsProto,
+		svcsProto:   svcsProto,
+	}
+}
+
+func (d *GroupData) Merge(other *GroupData) {
+	if len(other.groupsProto) > 0 {
+		d.groupsProto = append(d.groupsProto, other.groupsProto...)
+	}
+	if len(other.svcsProto) > 0 {
+		d.svcsProto = append(d.svcsProto, other.svcsProto...)
 	}
 }
 
@@ -121,6 +153,7 @@ type GroupDataOP struct {
 	groupRawData      *GroupRawData
 	tridentGroupProto *GroupProto
 	dropletGroupProto *GroupProto
+	ORGID
 }
 
 func newGroupDataOP(metaData *MetaData) *GroupDataOP {
@@ -128,8 +161,9 @@ func newGroupDataOP(metaData *MetaData) *GroupDataOP {
 		groupRawData:      newGroupRawData(),
 		serviceDataOP:     newServiceDataOP(metaData),
 		metaData:          metaData,
-		tridentGroupProto: newGroupProto(),
-		dropletGroupProto: newGroupProto(),
+		tridentGroupProto: NewGroupProto(metaData.ORGID, metaData.startTime),
+		dropletGroupProto: NewGroupProto(metaData.ORGID, metaData.startTime),
+		ORGID:             metaData.ORGID,
 	}
 }
 
@@ -138,6 +172,11 @@ var tridentGroup = []int{NPB_BUSINESS_ID, PCAP_BUSINESS_ID}
 type GroupIP struct {
 	cidrs    []string
 	ipRanges []string
+}
+
+func (g *GroupDataOP) SetStartTime(startTime int64) {
+	g.tridentGroupProto.startTime = startTime
+	g.dropletGroupProto.startTime = startTime
 }
 
 func (g *GroupDataOP) GetIDToGroup() map[int]*models.ResourceGroup {
@@ -149,19 +188,19 @@ func (g *GroupDataOP) GetGroupIDToPodServiceIDs() map[int][]int {
 }
 
 func (g *GroupDataOP) getTridentGroups() []byte {
-	return g.tridentGroupProto.getGroups()
+	return g.tridentGroupProto.GetGroups()
 }
 
 func (g *GroupDataOP) getTridentGroupsVersion() uint64 {
-	return g.tridentGroupProto.getVersion()
+	return g.tridentGroupProto.GetVersion()
 }
 
 func (g *GroupDataOP) getDropletGroups() []byte {
-	return g.dropletGroupProto.getGroups()
+	return g.dropletGroupProto.GetGroups()
 }
 
 func (g *GroupDataOP) getDropletGroupsVersion() uint64 {
-	return g.dropletGroupProto.getVersion()
+	return g.dropletGroupProto.GetVersion()
 }
 
 // The data traversal must be kept in order to ensure
@@ -187,7 +226,7 @@ func (g *GroupDataOP) generateGroupRawData() {
 				if err == nil {
 					groupIDsUsedByNpbPcap.Add(id)
 				} else {
-					log.Error(err)
+					log.Error(g.Log(err.Error()))
 				}
 			}
 			if acl.DstGroupIDs != "" {
@@ -195,7 +234,7 @@ func (g *GroupDataOP) generateGroupRawData() {
 				if err == nil {
 					groupIDsUsedByNpbPcap.Add(id)
 				} else {
-					log.Error(err)
+					log.Error(g.Log(err.Error()))
 				}
 			}
 		}
@@ -227,12 +266,12 @@ func (g *GroupDataOP) generateGroupRawData() {
 			for _, id := range ids {
 				idInt, err := strconv.Atoi(id)
 				if err != nil {
-					log.Error(err)
+					log.Error(g.Log(err.Error()))
 					continue
 				}
 				extraInfo, ok := idToExtraInfo[idInt]
 				if ok == false {
-					log.Errorf("resourceGroup(id=%d) did not find extra_info(id:%d)", resourceGroup.ID, idInt)
+					log.Errorf(g.Logf("resourceGroup(id=%d) did not find extra_info(id:%d)", resourceGroup.ID, idInt))
 					continue
 				}
 				switch resourceGroup.Type {
@@ -362,10 +401,13 @@ func (g *GroupDataOP) generateGroupRawData() {
 				for _, vmID := range vmIDs {
 					id, err := strconv.Atoi(vmID)
 					if err != nil {
-						log.Error(err)
+						log.Error(g.Log(err.Error()))
 						continue
 					}
-					if vpcData, ok := rawData.vpcIDToDeviceIPs[resourceGroup.VPCID]; ok {
+					if resourceGroup.VPCID == nil {
+						continue
+					}
+					if vpcData, ok := rawData.vpcIDToDeviceIPs[*resourceGroup.VPCID]; ok {
 						typeIDKey := TypeIDKey{
 							Type: VIF_DEVICE_TYPE_VM,
 							ID:   id,
@@ -378,7 +420,7 @@ func (g *GroupDataOP) generateGroupRawData() {
 						// Keep data in order
 						sort.Strings(ips)
 					}
-					if vpcData, ok := rawData.vpcIDToVmidFips[resourceGroup.VPCID]; ok {
+					if vpcData, ok := rawData.vpcIDToVmidFips[*resourceGroup.VPCID]; ok {
 						if vpcIPs, ok := vpcData[id]; ok {
 							for _, ip := range vpcIPs {
 								ips = append(ips, ip)
@@ -443,7 +485,7 @@ func (g *GroupDataOP) generateGroupRawData() {
 				for _, strNetworkID := range strNetworkIDs {
 					id, err := strconv.Atoi(strNetworkID)
 					if err != nil {
-						log.Error(err)
+						log.Error(g.Log(err.Error()))
 						continue
 					}
 					if tnets, ok := rawData.networkIDToSubnets[id]; ok {
@@ -514,9 +556,13 @@ func (g *GroupDataOP) generateResourceGroupData(groups []*models.ResourceGroup) 
 
 			groupType = anonymous
 		}
+		vpcID := ANY_EPC_ID_UINT32
+		if group.VPCID != nil {
+			vpcID = *group.VPCID
+		}
 		rg := &trident.Group{
 			Id:       proto.Uint32(uint32(group.ID)),
-			EpcId:    proto.Uint32(uint32(group.VPCID)),
+			EpcId:    proto.Uint32(uint32(vpcID)),
 			Type:     &groupType,
 			IpRanges: groupIP.ipRanges,
 			Ips:      groupIP.cidrs,
@@ -533,9 +579,9 @@ func (g *GroupDataOP) generateTridentGroupProto() {
 }
 
 func (g *GroupDataOP) generateDropletGroupProto() {
-	g.dropletGroupProto.generateGroupProto(
-		g.generateResourceGroupData(g.groupRawData.dropletGroups),
-		g.serviceDataOP.GetServiceData())
+	groupsProto := g.generateResourceGroupData(g.groupRawData.dropletGroups)
+	svcsProto := g.serviceDataOP.GetServiceData()
+	g.dropletGroupProto.generateGroupProto(groupsProto, svcsProto)
 }
 
 func (g *GroupDataOP) generateGroupData() {

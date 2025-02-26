@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type Host struct {
-	UpdaterBase[cloudmodel.Host, mysql.Host, *diffbase.Host]
+	UpdaterBase[
+		cloudmodel.Host,
+		*diffbase.Host,
+		*metadbmodel.Host,
+		metadbmodel.Host,
+		*message.HostAdd,
+		message.HostAdd,
+		*message.HostUpdate,
+		message.HostUpdate,
+		*message.HostFieldsUpdate,
+		message.HostFieldsUpdate,
+		*message.HostDelete,
+		message.HostDelete]
 }
 
 func NewHost(wholeCache *cache.Cache, cloudData []cloudmodel.Host) *Host {
 	updater := &Host{
-		UpdaterBase[cloudmodel.Host, mysql.Host, *diffbase.Host]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_HOST_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewHost(),
-			diffBaseData: wholeCache.DiffBaseDataSet.Hosts,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.Host,
+			*diffbase.Host,
+			*metadbmodel.Host,
+			metadbmodel.Host,
+			*message.HostAdd,
+			message.HostAdd,
+			*message.HostUpdate,
+			message.HostUpdate,
+			*message.HostFieldsUpdate,
+			message.HostFieldsUpdate,
+			*message.HostDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_HOST_EN,
+			wholeCache,
+			db.NewHost().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.Hosts,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,10 +73,11 @@ func (h *Host) getDiffBaseByCloudItem(cloudItem *cloudmodel.Host) (diffBase *dif
 	return
 }
 
-func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*mysql.Host, bool) {
-	dbItem := &mysql.Host{
+func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*metadbmodel.Host, bool) {
+	dbItem := &metadbmodel.Host{
 		Name:       cloudItem.Name,
 		IP:         cloudItem.IP,
+		Hostname:   cloudItem.Hostname,
 		Type:       cloudItem.Type,
 		HType:      cloudItem.HType,
 		VCPUNum:    cloudItem.VCPUNum,
@@ -62,41 +88,51 @@ func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*mysql.Host, boo
 		State:      ctrlrcommon.HOST_STATE_COMPLETE,
 		AZ:         cloudItem.AZLcuuid,
 		Region:     cloudItem.RegionLcuuid,
-		Domain:     h.cache.DomainLcuuid,
+		Domain:     h.metadata.Domain.Lcuuid,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (h *Host) generateUpdateInfo(diffBase *diffbase.Host, cloudItem *cloudmodel.Host) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (h *Host) generateUpdateInfo(diffBase *diffbase.Host, cloudItem *cloudmodel.Host) (*message.HostFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.HostFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.IP != cloudItem.IP {
-		updateInfo["ip"] = cloudItem.IP
+		mapInfo["ip"] = cloudItem.IP
+		structInfo.IP.Set(diffBase.IP, cloudItem.IP)
+	}
+	if diffBase.Hostname != cloudItem.Hostname {
+		mapInfo["hostname"] = cloudItem.Hostname
+		structInfo.Hostname.Set(diffBase.Hostname, cloudItem.Hostname)
 	}
 	if diffBase.HType != cloudItem.HType {
-		updateInfo["htype"] = cloudItem.HType
+		mapInfo["htype"] = cloudItem.HType
+		structInfo.HType.Set(diffBase.HType, cloudItem.HType)
 	}
 	if diffBase.VCPUNum != cloudItem.VCPUNum {
-		updateInfo["vcpu_num"] = cloudItem.VCPUNum
+		mapInfo["vcpu_num"] = cloudItem.VCPUNum
+		structInfo.VCPUNum.Set(diffBase.VCPUNum, cloudItem.VCPUNum)
 	}
 	if diffBase.MemTotal != cloudItem.MemTotal {
-		updateInfo["mem_total"] = cloudItem.MemTotal
+		mapInfo["mem_total"] = cloudItem.MemTotal
+		structInfo.MemTotal.Set(diffBase.MemTotal, cloudItem.MemTotal)
 	}
 	if diffBase.ExtraInfo != cloudItem.ExtraInfo {
-		updateInfo["extra_info"] = cloudItem.ExtraInfo
+		mapInfo["extra_info"] = cloudItem.ExtraInfo
+		structInfo.ExtraInfo.Set(diffBase.ExtraInfo, cloudItem.ExtraInfo)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		updateInfo["az"] = cloudItem.AZLcuuid
+		mapInfo["az"] = cloudItem.AZLcuuid
+		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

@@ -20,21 +20,25 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	logging "github.com/op/go-logging"
 
 	"github.com/deepflowio/deepflow/server/ingester/common"
+	"github.com/deepflowio/deepflow/server/ingester/exporters"
+	"github.com/deepflowio/deepflow/server/ingester/exporters/config"
 	"github.com/deepflowio/deepflow/server/ingester/flow_metrics/dbwriter"
+	"github.com/deepflowio/deepflow/server/ingester/flow_tag"
 	"github.com/deepflowio/deepflow/server/libs/app"
 	"github.com/deepflowio/deepflow/server/libs/codec"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
+	"github.com/deepflowio/deepflow/server/libs/flow-metrics/pb"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc/pb"
 )
 
 var log = logging.MustGetLogger("flow_metrics.unmarshaller")
@@ -46,6 +50,9 @@ const (
 	DOC_TIME_EXCEED  = 300
 	HASH_SEED        = 17
 )
+
+var exportDataSources = []config.DataSourceID{config.NETWORK_1M, config.NETWORK_MAP_1M, config.NETWORK_1S, config.NETWORK_MAP_1S,
+	config.APPLICATION_1M, config.APPLICATION_MAP_1M, config.APPLICATION_1S, config.APPLICATION_MAP_1S}
 
 type QueueCache struct {
 	values []interface{}
@@ -72,25 +79,29 @@ type Counter struct {
 }
 
 type Unmarshaller struct {
-	index              int
-	platformData       *grpc.PlatformInfoTable
-	disableSecondWrite bool
-	unmarshallQueue    queue.QueueReader
-	dbwriters          []dbwriter.DbWriter
-	queueBatchCache    QueueCache
-	counter            *Counter
-	tableCounter       [zerodoc.VTAP_TABLE_ID_MAX + 1]int64
+	index               int
+	platformData        *grpc.PlatformInfoTable
+	disableSecondWrite  bool
+	unmarshallQueue     queue.QueueReader
+	dbwriter            dbwriter.DbWriter
+	queueBatchCache     QueueCache
+	counter             *Counter
+	tableCounter        [flow_metrics.METRICS_TABLE_ID_MAX + 1]int64
+	exporters           *exporters.Exporters
+	appServiceTagWriter *flow_tag.AppServiceTagWriter
 	utils.Closable
 }
 
-func NewUnmarshaller(index int, platformData *grpc.PlatformInfoTable, disableSecondWrite bool, unmarshallQueue queue.QueueReader, dbwriters []dbwriter.DbWriter) *Unmarshaller {
+func NewUnmarshaller(index int, platformData *grpc.PlatformInfoTable, disableSecondWrite bool, unmarshallQueue queue.QueueReader, dbwriter dbwriter.DbWriter, exporters *exporters.Exporters, appServiceTagWriter *flow_tag.AppServiceTagWriter) *Unmarshaller {
 	return &Unmarshaller{
-		index:              index,
-		platformData:       platformData,
-		disableSecondWrite: disableSecondWrite,
-		unmarshallQueue:    unmarshallQueue,
-		counter:            &Counter{MaxDelay: -3600, MinDelay: 3600},
-		dbwriters:          dbwriters,
+		index:               index,
+		platformData:        platformData,
+		disableSecondWrite:  disableSecondWrite,
+		unmarshallQueue:     unmarshallQueue,
+		counter:             &Counter{MaxDelay: -3600, MinDelay: 3600},
+		dbwriter:            dbwriter,
+		exporters:           exporters,
+		appServiceTagWriter: appServiceTagWriter,
 	}
 }
 
@@ -137,28 +148,22 @@ func (u *Unmarshaller) GetCounter() interface{} {
 		counter.MinDelay = 0
 	}
 
-	counter.FlowPortCount, u.tableCounter[zerodoc.VTAP_FLOW_PORT_1M] = u.tableCounter[zerodoc.VTAP_FLOW_PORT_1M], 0
-	counter.FlowPort1sCount, u.tableCounter[zerodoc.VTAP_FLOW_PORT_1S] = u.tableCounter[zerodoc.VTAP_FLOW_PORT_1S], 0
-	counter.FlowEdgePortCount, u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1M] = u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1M], 0
-	counter.FlowEdgePort1sCount, u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1S] = u.tableCounter[zerodoc.VTAP_FLOW_EDGE_PORT_1S], 0
-	counter.AclCount, u.tableCounter[zerodoc.VTAP_ACL_1M] = u.tableCounter[zerodoc.VTAP_ACL_1M], 0
-	counter.OtherCount, u.tableCounter[zerodoc.VTAP_TABLE_ID_MAX] = u.tableCounter[zerodoc.VTAP_TABLE_ID_MAX], 0
+	counter.FlowPortCount, u.tableCounter[flow_metrics.NETWORK_1M] = u.tableCounter[flow_metrics.NETWORK_1M], 0
+	counter.FlowPort1sCount, u.tableCounter[flow_metrics.NETWORK_1S] = u.tableCounter[flow_metrics.NETWORK_1S], 0
+	counter.FlowEdgePortCount, u.tableCounter[flow_metrics.NETWORK_MAP_1M] = u.tableCounter[flow_metrics.NETWORK_MAP_1M], 0
+	counter.FlowEdgePort1sCount, u.tableCounter[flow_metrics.NETWORK_MAP_1S] = u.tableCounter[flow_metrics.NETWORK_MAP_1S], 0
+	counter.AclCount, u.tableCounter[flow_metrics.TRAFFIC_POLICY_1M] = u.tableCounter[flow_metrics.TRAFFIC_POLICY_1M], 0
+	counter.OtherCount, u.tableCounter[flow_metrics.METRICS_TABLE_ID_MAX] = u.tableCounter[flow_metrics.METRICS_TABLE_ID_MAX], 0
 
 	return counter
 }
 
-func (u *Unmarshaller) putStoreQueue(doc *app.Document) {
+func (u *Unmarshaller) putStoreQueue(doc app.Document) {
 	queueCache := &u.queueBatchCache
-	writersCount := len(u.dbwriters)
-	if writersCount-1 > 0 {
-		doc.AddReferenceCountN(int32(writersCount) - 1)
-	}
 	queueCache.values = append(queueCache.values, doc)
 
 	if len(queueCache.values) >= QUEUE_BATCH_SIZE {
-		for i := 0; i < writersCount; i++ {
-			u.dbwriters[i].Put(queueCache.values...)
-		}
+		u.dbwriter.Put(queueCache.values...)
 		queueCache.values = queueCache.values[:0]
 	}
 }
@@ -166,9 +171,7 @@ func (u *Unmarshaller) putStoreQueue(doc *app.Document) {
 func (u *Unmarshaller) flushStoreQueue() {
 	queueCache := &u.queueBatchCache
 	if len(queueCache.values) > 0 {
-		for i := 0; i < len(u.dbwriters); i++ {
-			u.dbwriters[i].Put(queueCache.values...)
-		}
+		u.dbwriter.Put(queueCache.values...)
 		queueCache.values = queueCache.values[:0]
 	}
 }
@@ -184,10 +187,10 @@ func DecodeForQueueMonitor(item interface{}) (interface{}, error) {
 	return ret, err
 }
 
-type BatchDocument []*app.Document
+type BatchDocument []app.Document
 
 func (bd BatchDocument) String() string {
-	docs := []*app.Document(bd)
+	docs := []app.Document(bd)
 	str := fmt.Sprintf("batch msg num=%d\n", len(docs))
 	for i, doc := range docs {
 		str += fmt.Sprintf("%d%s", i, doc.String())
@@ -202,7 +205,7 @@ func decodeForDebug(b []byte) (BatchDocument, error) {
 
 	decoder := &codec.SimpleDecoder{}
 	decoder.Init(b)
-	docs := make([]*app.Document, 0)
+	docs := make([]app.Document, 0)
 
 	for !decoder.IsEnd() {
 		doc, err := app.DecodeForQueueMonitor(decoder)
@@ -219,7 +222,7 @@ func (u *Unmarshaller) QueueProcess() {
 	rawDocs := make([]interface{}, GET_MAX_SIZE)
 	decoder := &codec.SimpleDecoder{}
 	pbDoc := pb.NewDocument()
-	for {
+	for !u.Closed() {
 		n := u.unmarshallQueue.Gets(rawDocs)
 		start := time.Now()
 		for i := 0; i < n; i++ {
@@ -235,19 +238,21 @@ func (u *Unmarshaller) QueueProcess() {
 						log.Warningf("Decode failed, bytes len=%d err=%s", len([]byte(bytes)), err)
 						break
 					}
-					u.isGoodDocument(int64(doc.Timestamp))
+					doc.Tags().TeamID = uint16(recvBytes.TeamID)
+					doc.Tags().OrgId = uint16(recvBytes.OrgID)
+					u.isGoodDocument(int64(doc.Time()))
 
 					// 秒级数据是否写入
 					if u.disableSecondWrite &&
-						doc.Flags&app.FLAG_PER_SECOND_METRICS != 0 {
-						app.ReleaseDocument(doc)
+						doc.Flag()&app.FLAG_PER_SECOND_METRICS != 0 {
+						doc.Release()
 						continue
 					}
 
 					if err := DocumentExpand(doc, u.platformData); err != nil {
 						log.Debug(err)
 						u.counter.DropDocCount++
-						app.ReleaseDocument(doc)
+						doc.Release()
 						continue
 					}
 
@@ -255,21 +260,68 @@ func (u *Unmarshaller) QueueProcess() {
 					if err != nil {
 						log.Debug(err)
 						u.counter.DropDocCount++
-						app.ReleaseDocument(doc)
+						doc.Release()
 						continue
 					}
 					u.tableCounter[tableID]++
 
+					u.appServiceTagWrite(tableID, doc)
+					u.export(doc)
 					u.putStoreQueue(doc)
 				}
 				receiver.ReleaseRecvBuffer(recvBytes)
-
 			} else if value == nil { // flush ticker
 				u.flushStoreQueue()
+				u.export(nil)
 			} else {
 				log.Warning("get unmarshall queue data type wrong")
 			}
 		}
 		u.counter.TotalTime += int64(time.Since(start))
 	}
+}
+
+func (u *Unmarshaller) export(doc app.Document) {
+	if u.exporters == nil {
+		return
+	}
+	if doc == nil {
+		// flush data
+		for _, v := range exportDataSources {
+			u.exporters.Put(uint32(v), u.index, nil)
+		}
+	}
+
+	switch v := doc.(type) {
+	case *app.DocumentFlow:
+		u.exporters.Put(v.DataSource(), u.index, (*ExportDocumentFlow)(v))
+	case *app.DocumentApp:
+		u.exporters.Put(v.DataSource(), u.index, (*ExportDocumentApp)(v))
+	case *app.DocumentUsage:
+		u.exporters.Put(v.DataSource(), u.index, (*ExportDocumentUsage)(v))
+	}
+}
+
+// just write the app_service_tag of `1m` data, the app_service_tag of `1s`, `1h`... and other, can also use `1m` app_service_tag.
+var APP_SERVICE_TAG_APPLICATION = strings.Split(flow_metrics.APPLICATION_1M.TableName(), ".")[0]
+var APP_SERVICE_TAG_APPLICATION_MAP = strings.Split(flow_metrics.APPLICATION_MAP_1M.TableName(), ".")[0]
+
+func (u *Unmarshaller) appServiceTagWrite(tableID uint8, doc app.Document) {
+	if u.appServiceTagWriter == nil {
+		return
+	}
+	var table string
+	if tableID == uint8(flow_metrics.APPLICATION_1M) {
+		table = APP_SERVICE_TAG_APPLICATION
+	} else if tableID == uint8(flow_metrics.APPLICATION_MAP_1M) {
+		table = APP_SERVICE_TAG_APPLICATION_MAP
+	} else {
+		return
+	}
+	tags := doc.Tags()
+	if tags.AppService == "" && tags.AppInstance == "" {
+		return
+	}
+
+	u.appServiceTagWriter.Write(doc.Time(), table, tags.AppService, tags.AppInstance, tags.OrgId, tags.TeamID)
 }

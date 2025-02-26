@@ -19,6 +19,8 @@ package datatype
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/deepflowio/deepflow/server/libs/ckdb"
 )
 
 // 本消息格式仅用于同droplet通信:
@@ -34,7 +36,7 @@ type MessageType uint8
 const (
 	MESSAGE_TYPE_COMPRESS MessageType = iota
 	MESSAGE_TYPE_SYSLOG
-	MESSAGE_TYPE_STATSD
+	MESSAGE_TYPE_SERVER_DFSTATS
 
 	MESSAGE_TYPE_METRICS
 	MESSAGE_TYPE_TAGGEDFLOW
@@ -44,19 +46,24 @@ const (
 	MESSAGE_TYPE_TELEGRAF
 	MESSAGE_TYPE_PACKETSEQUENCE
 
-	MESSAGE_TYPE_DFSTATS
+	MESSAGE_TYPE_DFSTATS // 10
 	MESSAGE_TYPE_OPENTELEMETRY_COMPRESSED
 	MESSAGE_TYPE_RAW_PCAP
 	MESSAGE_TYPE_PROFILE
 	MESSAGE_TYPE_PROC_EVENT
-	MESSAGE_TYPE_ALARM_EVENT
+	MESSAGE_TYPE_ALERT_EVENT
+	MESSAGE_TYPE_K8S_EVENT
+	MESSAGE_TYPE_APPLICATION_LOG
+	MESSAGE_TYPE_AGENT_LOG
+	MESSAGE_TYPE_SKYWALKING
+	MESSAGE_TYPE_DATADOG // 20
 	MESSAGE_TYPE_MAX
 )
 
 var MessageTypeString = [MESSAGE_TYPE_MAX]string{
-	MESSAGE_TYPE_COMPRESS: "compressed_pcap",
-	MESSAGE_TYPE_SYSLOG:   "syslog",
-	MESSAGE_TYPE_STATSD:   "statsd",
+	MESSAGE_TYPE_COMPRESS:       "compressed_pcap",
+	MESSAGE_TYPE_SYSLOG:         "syslog",
+	MESSAGE_TYPE_SERVER_DFSTATS: "deepflow_server_stats",
 
 	MESSAGE_TYPE_METRICS:        "metrics",
 	MESSAGE_TYPE_TAGGEDFLOW:     "l4_log",
@@ -71,7 +78,12 @@ var MessageTypeString = [MESSAGE_TYPE_MAX]string{
 	MESSAGE_TYPE_RAW_PCAP:                 "raw_pcap",
 	MESSAGE_TYPE_PROFILE:                  "profile",
 	MESSAGE_TYPE_PROC_EVENT:               "proc_event",
-	MESSAGE_TYPE_ALARM_EVENT:              "alarm_event",
+	MESSAGE_TYPE_ALERT_EVENT:              "alert_event",
+	MESSAGE_TYPE_K8S_EVENT:                "k8s_event",
+	MESSAGE_TYPE_APPLICATION_LOG:          "application_log",
+	MESSAGE_TYPE_AGENT_LOG:                "agent_log",
+	MESSAGE_TYPE_SKYWALKING:               "skywalking",
+	MESSAGE_TYPE_DATADOG:                  "datadog",
 }
 
 func (m MessageType) String() string {
@@ -94,9 +106,9 @@ const (
 )
 
 var MessageHeaderTypes = [MESSAGE_TYPE_MAX]MessageHeaderType{
-	MESSAGE_TYPE_COMPRESS: HEADER_TYPE_LT,
-	MESSAGE_TYPE_SYSLOG:   HEADER_TYPE_LT_NOCHECK,
-	MESSAGE_TYPE_STATSD:   HEADER_TYPE_LT_NOCHECK,
+	MESSAGE_TYPE_COMPRESS:       HEADER_TYPE_LT,
+	MESSAGE_TYPE_SYSLOG:         HEADER_TYPE_LT_NOCHECK,
+	MESSAGE_TYPE_SERVER_DFSTATS: HEADER_TYPE_LT_VTAP,
 
 	MESSAGE_TYPE_METRICS:        HEADER_TYPE_LT_VTAP,
 	MESSAGE_TYPE_TAGGEDFLOW:     HEADER_TYPE_LT_VTAP,
@@ -111,7 +123,12 @@ var MessageHeaderTypes = [MESSAGE_TYPE_MAX]MessageHeaderType{
 	MESSAGE_TYPE_RAW_PCAP:                 HEADER_TYPE_LT_VTAP,
 	MESSAGE_TYPE_PROFILE:                  HEADER_TYPE_LT_VTAP,
 	MESSAGE_TYPE_PROC_EVENT:               HEADER_TYPE_LT_VTAP,
-	MESSAGE_TYPE_ALARM_EVENT:              HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_ALERT_EVENT:              HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_K8S_EVENT:                HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_APPLICATION_LOG:          HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_AGENT_LOG:                HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_SKYWALKING:               HEADER_TYPE_LT_VTAP,
+	MESSAGE_TYPE_DATADOG:                  HEADER_TYPE_LT_VTAP,
 }
 
 func (m MessageType) HeaderType() MessageHeaderType {
@@ -135,10 +152,18 @@ const (
 )
 
 const (
-	FLOW_VERSION_OFFSET  = 0
-	FLOW_SEQUENCE_OFFSET = FLOW_VERSION_OFFSET + 4
-	FLOW_VTAPID_OFFSET   = FLOW_SEQUENCE_OFFSET + 8
-	FLOW_HEADER_LEN      = FLOW_VTAPID_OFFSET + 2
+	FLOW_VERSION_OFFSET = 0
+	FLOW_TEAMID_OFFSET  = FLOW_VERSION_OFFSET + 4
+	FLOW_ORGID_OFFSET   = FLOW_TEAMID_OFFSET + 4
+	FLOW_VTAPID_OFFSET  = FLOW_ORGID_OFFSET + 4
+	FLOW_HEADER_LEN     = FLOW_VTAPID_OFFSET + 2
+)
+
+const (
+	MESSAGE_ENCODER_RAW = iota
+	MESSAGE_ENCODER_ZLIB
+	MESSAGE_ENCODER_GZIP
+	MESSAGE_ENCODER_ZSTD
 )
 
 type BaseHeader struct {
@@ -172,20 +197,57 @@ func (h *BaseHeader) Decode(buf []byte) error {
 	return nil
 }
 
-// 多个document和taggeflow encode时共用一个header
+type FlowHeaderOld struct {
+	Version uint32 // 用来校验encode和decode是否配套
+	TeamID  uint32
+	OrgID   uint32
+	VTAPID  uint16 // trident的ID
+}
+
+const (
+	LATEST_VERSION = 0x8000 // v6.5 version
+
+	VERSION_OFFSET   = 0
+	ENCODER_OFFSET   = VERSION_OFFSET + 2
+	TEAMID_OFFSET    = ENCODER_OFFSET + 1
+	ORGID_OFFSET     = TEAMID_OFFSET + 4
+	RESERVED1_OFFSET = ORGID_OFFSET + 2
+	AGENTID_OFFSET   = RESERVED1_OFFSET + 2
+)
+
 type FlowHeader struct {
-	Version  uint32 // 用来校验encode和decode是否配套
-	Sequence uint64 // udp发送时，用来校验是否丢包
-	VTAPID   uint16 // trident的ID
+	Version   uint16 // start with 0x8000
+	Encoder   uint8  // Flag whether to use compression etc.
+	TeamID    uint32
+	OrgID     uint16
+	Reserved1 uint16
+	AgentID   uint16
+	Reserved2 uint8
+}
+
+func (h *FlowHeader) Decode(buf []byte) {
+	h.Version = binary.LittleEndian.Uint16(buf[VERSION_OFFSET:])
+	if h.Version == LATEST_VERSION {
+		h.Encoder = buf[ENCODER_OFFSET]
+		h.TeamID = binary.LittleEndian.Uint32(buf[TEAMID_OFFSET:])
+		h.OrgID = binary.LittleEndian.Uint16(buf[ORGID_OFFSET:])
+		// reserved1
+		h.AgentID = binary.LittleEndian.Uint16(buf[AGENTID_OFFSET:])
+		// reserved2
+	} else {
+		// decoding the header of the old version (version <= v6.5.8)
+		h.TeamID = ckdb.DEFAULT_TEAM_ID
+		h.OrgID = ckdb.DEFAULT_ORG_ID
+		h.AgentID = binary.LittleEndian.Uint16(buf[FLOW_VTAPID_OFFSET:])
+	}
 }
 
 func (h *FlowHeader) Encode(chunk []byte) {
-	binary.LittleEndian.PutUint32(chunk[FLOW_VERSION_OFFSET:], h.Version)
-	binary.LittleEndian.PutUint64(chunk[FLOW_SEQUENCE_OFFSET:], h.Sequence)
-	binary.LittleEndian.PutUint16(chunk[FLOW_VTAPID_OFFSET:], h.VTAPID)
-}
-func (h *FlowHeader) Decode(buf []byte) {
-	h.Version = binary.LittleEndian.Uint32(buf[FLOW_VERSION_OFFSET:])
-	h.Sequence = binary.LittleEndian.Uint64(buf[FLOW_SEQUENCE_OFFSET:])
-	h.VTAPID = binary.LittleEndian.Uint16(buf[FLOW_VTAPID_OFFSET:])
+	binary.LittleEndian.PutUint16(chunk[VERSION_OFFSET:], h.Version)
+	chunk[ENCODER_OFFSET] = h.Encoder
+	binary.LittleEndian.PutUint32(chunk[TEAMID_OFFSET:], h.TeamID)
+	binary.LittleEndian.PutUint16(chunk[ORGID_OFFSET:], h.OrgID)
+	// reserved1
+	binary.LittleEndian.PutUint16(chunk[AGENTID_OFFSET:], h.AgentID)
+	// reserved2
 }

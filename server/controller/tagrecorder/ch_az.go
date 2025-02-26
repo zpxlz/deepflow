@@ -17,78 +17,80 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type ChAZ struct {
-	UpdaterBase[mysql.ChAZ, IDKey]
+	SubscriberComponent[*message.AZFieldsUpdate, message.AZFieldsUpdate, metadbmodel.AZ, metadbmodel.ChAZ, IDKey]
 	domainLcuuidToIconID map[string]int
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChAZ(domainLcuuidToIconID map[string]int, resourceTypeToIconID map[IconKey]int) *ChAZ {
-	updater := &ChAZ{
-		UpdaterBase[mysql.ChAZ, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_AZ,
-		},
+	mng := &ChAZ{
+		newSubscriberComponent[*message.AZFieldsUpdate, message.AZFieldsUpdate, metadbmodel.AZ, metadbmodel.ChAZ, IDKey](
+			common.RESOURCE_TYPE_AZ_EN, RESOURCE_TYPE_CH_AZ,
+		),
 		domainLcuuidToIconID,
 		resourceTypeToIconID,
 	}
-	updater.dataGenerator = updater
-	return updater
+	mng.subscriberDG = mng
+	return mng
 }
 
-func (a *ChAZ) generateNewData() (map[IDKey]mysql.ChAZ, bool) {
-	log.Infof("generate data for %s", a.resourceTypeName)
-	var azs []mysql.AZ
-	err := mysql.Db.Unscoped().Find(&azs).Error
-	if err != nil {
-		log.Errorf(dbQueryResourceFailed(a.resourceTypeName, err))
-		return nil, false
+// onResourceUpdated implements SubscriberDataGenerator
+func (a *ChAZ) onResourceUpdated(sourceID int, fieldsUpdate *message.AZFieldsUpdate, db *metadb.DB) {
+	updateInfo := make(map[string]interface{})
+	if fieldsUpdate.Name.IsDifferent() {
+		updateInfo["name"] = fieldsUpdate.Name.GetNew()
 	}
+	if len(updateInfo) > 0 {
+		var chItem metadbmodel.ChAZ
+		db.Where("id = ?", sourceID).First(&chItem) // TODO use query to update ?
+		a.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
+	}
+}
 
-	keyToItem := make(map[IDKey]mysql.ChAZ)
-
-	for _, az := range azs {
-		iconID := a.domainLcuuidToIconID[az.Domain]
+// onResourceUpdated implements SubscriberDataGenerator
+func (a *ChAZ) sourceToTarget(md *message.Metadata, az *metadbmodel.AZ) (keys []IDKey, targets []metadbmodel.ChAZ) {
+	iconID := a.domainLcuuidToIconID[az.Domain]
+	var err error
+	if iconID == 0 {
+		a.domainLcuuidToIconID, a.resourceTypeToIconID, err = GetIconInfo(a.cfg)
+		if err == nil {
+			iconID = a.domainLcuuidToIconID[az.Domain]
+		}
 		if iconID == 0 {
 			key := IconKey{
 				NodeType: RESOURCE_TYPE_AZ,
 			}
 			iconID = a.resourceTypeToIconID[key]
 		}
-		if az.DeletedAt.Valid {
-			keyToItem[IDKey{ID: az.ID}] = mysql.ChAZ{
-				ID:     az.ID,
-				Name:   az.Name + " (deleted)",
-				IconID: iconID,
-			}
-		} else {
-			keyToItem[IDKey{ID: az.ID}] = mysql.ChAZ{
-				ID:     az.ID,
-				Name:   az.Name,
-				IconID: iconID,
-			}
-		}
-
 	}
-	return keyToItem, true
+	keys = append(keys, IDKey{ID: az.ID})
+	name := az.Name
+	if az.DeletedAt.Valid {
+		name += " (deleted)"
+	}
+	targets = append(targets, metadbmodel.ChAZ{
+		ID:       az.ID,
+		Name:     name,
+		IconID:   iconID,
+		TeamID:   md.TeamID,
+		DomainID: md.DomainID,
+	})
+	return
 }
 
-func (a *ChAZ) generateKey(dbItem mysql.ChAZ) IDKey {
-	return IDKey{ID: dbItem.ID}
-}
-
-func (a *ChAZ) generateUpdateInfo(oldItem, newItem mysql.ChAZ) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
-	if oldItem.Name != newItem.Name {
-		updateInfo["name"] = newItem.Name
-	}
-	if oldItem.IconID != newItem.IconID {
-		updateInfo["icon_id"] = newItem.IconID
-	}
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+// softDeletedTargetsUpdated implements SubscriberDataGenerator
+func (a *ChAZ) softDeletedTargetsUpdated(targets []metadbmodel.ChAZ, db *metadb.DB) {
+	db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name"}),
+	}).Create(&targets)
 }

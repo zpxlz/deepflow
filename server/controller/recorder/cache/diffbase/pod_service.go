@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddPodService(dbItem *mysql.PodService, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddPodService(dbItem *metadbmodel.PodService, seq int, toolDataSet *tool.DataSet) {
 	var podIngressLcuuid string
 	if dbItem.PodIngressID != 0 {
 		podIngressLcuuid, _ = toolDataSet.GetPodIngressLcuuidByID(dbItem.PodIngressID)
@@ -43,12 +43,12 @@ func (b *DataSet) AddPodService(dbItem *mysql.PodService, seq int, toolDataSet *
 		AZLcuuid:         dbItem.AZ,
 		SubDomainLcuuid:  dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, b.PodServices[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, b.PodServices[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodService(lcuuid string) {
 	delete(b.PodServices, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_SERVICE_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodService struct {
@@ -57,6 +57,7 @@ type PodService struct {
 	Label            string `json:"label"`
 	Annotation       string `json:"annotation"`
 	Selector         string `json:"selector"`
+	ExternalIP       string `json:"external_ip"`
 	ServiceClusterIP string `json:"service_cluster_ip"`
 	PodIngressLcuuid string `json:"pod_ingress_lcuuid"`
 	RegionLcuuid     string `json:"region_lcuuid"`

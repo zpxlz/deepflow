@@ -17,180 +17,245 @@
 package tagrecorder
 
 import (
+	"context"
 	"time"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql/query"
-	"github.com/deepflowio/deepflow/server/controller/tagrecorder/config"
+	"github.com/deepflowio/deepflow/server/controller/config"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/query"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-type ChResourceUpdater interface {
+type UpdaterManager struct {
+	tCtx                 context.Context
+	tCancel              context.CancelFunc
+	cfg                  config.ControllerConfig
+	domainLcuuidToIconID map[string]int // TODO
+	resourceTypeToIconID map[IconKey]int
+}
+
+func GetUpdaterManager() *UpdaterManager {
+	updaterManagerOnce.Do(func() {
+		updaterManager = &UpdaterManager{}
+	})
+	return updaterManager
+}
+
+func (u *UpdaterManager) Init(ctx context.Context, cfg config.ControllerConfig) {
+	u.cfg = cfg
+	u.tCtx, u.tCancel = context.WithCancel(ctx)
+}
+
+func (c *UpdaterManager) Start(sCtx context.Context) {
+	log.Info("tagrecorder updater manager started")
+	go func() {
+		ticker := time.NewTicker(time.Duration(c.cfg.TagRecorderCfg.Interval) * time.Second)
+		defer ticker.Stop()
+	LOOP:
+		for {
+			select {
+			case <-ticker.C:
+				c.run()
+			case <-sCtx.Done():
+				break LOOP
+			}
+		}
+	}()
+}
+
+func (t *UpdaterManager) Stop() {
+	if t.tCancel != nil {
+		t.tCancel()
+	}
+	log.Info("tagrecorder updater manager stopped")
+}
+
+func (c *UpdaterManager) run() {
+	// 调用API获取资源对应的icon_id
+	c.domainLcuuidToIconID, c.resourceTypeToIconID, _ = UpdateIconInfo(c.cfg)
+	c.refresh()
+}
+
+func (c *UpdaterManager) refresh() {
+	log.Info("tagrecorder updaters refresh")
+	// 生成各资源更新器，刷新ch数据
+	updaters := []Updater{
+		NewChRegion(c.domainLcuuidToIconID, c.resourceTypeToIconID),
+		NewChIPRelation(),
+		NewChVTapPort(),
+		NewChStringEnum(),
+		NewChIntEnum(),
+		NewChNodeType(),
+		NewChAPPLabel(),
+		// NewChTargetLabel(),
+		// NewChPrometheusTargetLabelLayout(),
+		NewChPrometheusLabelName(),
+		NewChPrometheusMetricNames(),
+		NewChPrometheusMetricAPPLabelLayout(),
+		NewChTapType(c.resourceTypeToIconID),
+		NewChVTap(c.resourceTypeToIconID),
+		NewChLbListener(c.resourceTypeToIconID),
+
+		NewChPolicy(),
+		NewChNpbTunnel(),
+		NewChAlarmPolicy(),
+	}
+
+	if c.cfg.FPermit.Enabled {
+		updaters = append(updaters, NewChUser())
+	}
+	for _, updater := range updaters {
+		updater.SetConfig(c.cfg)
+		updater.Refresh()
+	}
+}
+
+type Updater interface {
 	// 刷新ch资源入口
 	// 基于资源基础数据，构建新的ch数据
 	// 直接查询ch表，构建旧的ch数据
 	// 遍历新的ch数据，若key不在旧的ch数据中，则新增；否则检查是否有更新，若有更新，则更新
 	// 遍历旧的ch数据，若key不在新的ch数据中，则删除
 	Refresh() bool
-	SetConfig(cfg config.TagRecorderConfig)
+	SetConfig(cfg config.ControllerConfig)
 }
 
-type DataGenerator[MT MySQLChModel, KT ChModelKey] interface {
+type updaterDataGenerator[MT MySQLChModel, KT ChModelKey] interface {
 	// 根据db中的基础资源数据，构建最新的ch资源数据
-	generateNewData() (map[KT]MT, bool)
+	generateNewData(*metadb.DB) (map[KT]MT, bool)
 	// 构建ch资源的结构体key
 	generateKey(MT) KT
 	// 根据新旧数据对比，构建需要更新的ch资源数据
 	generateUpdateInfo(MT, MT) (map[string]interface{}, bool)
 }
 
-type UpdaterBase[MT MySQLChModel, KT ChModelKey] struct {
-	cfg              config.TagRecorderConfig
+type UpdaterComponent[MT MySQLChModel, KT ChModelKey] struct {
+	cfg              config.ControllerConfig
 	resourceTypeName string
-	dataGenerator    DataGenerator[MT, KT]
+	updaterDG        updaterDataGenerator[MT, KT]
+	dbOperator       operator[MT, KT]
 }
 
-func (b *UpdaterBase[MT, KT]) SetConfig(cfg config.TagRecorderConfig) {
+func newUpdaterComponent[MT MySQLChModel, KT ChModelKey](resourceTypeName string) UpdaterComponent[MT, KT] {
+	u := UpdaterComponent[MT, KT]{
+		resourceTypeName: resourceTypeName,
+	}
+	u.initDBOperator()
+	return u
+}
+
+func (b *UpdaterComponent[MT, KT]) SetConfig(cfg config.ControllerConfig) {
 	b.cfg = cfg
+	b.dbOperator.setConfig(cfg)
 }
 
-func (b *UpdaterBase[MT, KT]) Refresh() bool {
-	newKeyToDBItem, newOK := b.dataGenerator.generateNewData()
-	oldKeyToDBItem, oldOK := b.generateOldData()
-	keysToAdd := []KT{}
-	itemsToAdd := []MT{}
-	keysToDelete := []KT{}
-	itemsToDelete := []MT{}
-	isUpdate := false
-	if newOK && oldOK {
-		for key, newDBItem := range newKeyToDBItem {
-			oldDBItem, exists := oldKeyToDBItem[key]
-			if !exists {
-				keysToAdd = append(keysToAdd, key)
-				itemsToAdd = append(itemsToAdd, newDBItem)
-			} else {
-				updateInfo, ok := b.dataGenerator.generateUpdateInfo(oldDBItem, newDBItem)
-				if ok {
-					b.update(oldDBItem, updateInfo, key)
-					isUpdate = true
+func (b *UpdaterComponent[MT, KT]) initDBOperator() {
+	b.dbOperator = newOperator[MT, KT](b.resourceTypeName)
+}
+
+func (b *UpdaterComponent[MT, KT]) Refresh() bool {
+
+	// 遍历组织ID, 在每个组织的数据库中更新资源
+	// Traverse the orgIDs, updating resources in each org's database
+	orgIDs, err := metadb.GetORGIDs()
+	if err != nil {
+		log.Errorf("get org info fail : %s", err)
+		return false
+	}
+
+	for _, orgID := range orgIDs {
+		db, err := metadb.GetDB(orgID)
+		if err != nil {
+			log.Error("get org dbinfo fail", logger.NewORGPrefix(orgID))
+			continue
+		}
+		GetTeamInfo(db)
+		newKeyToDBItem, newOK := b.updaterDG.generateNewData(db)
+		oldKeyToDBItem, oldOK := b.generateOldData(db)
+		keysToAdd := []KT{}
+		itemsToAdd := []MT{}
+		keysToDelete := []KT{}
+		itemsToDelete := []MT{}
+		isUpdate := false
+		if newOK && oldOK {
+			for key, newDBItem := range newKeyToDBItem {
+				oldDBItem, exists := oldKeyToDBItem[key]
+				if !exists {
+					keysToAdd = append(keysToAdd, key)
+					itemsToAdd = append(itemsToAdd, newDBItem)
+				} else {
+					updateInfo, ok := b.updaterDG.generateUpdateInfo(oldDBItem, newDBItem)
+					if ok {
+						b.dbOperator.update(oldDBItem, updateInfo, key, db)
+						isUpdate = true
+					}
 				}
 			}
-		}
-		if len(itemsToAdd) > 0 {
-			b.operateBatch(keysToAdd, itemsToAdd, b.add)
-		}
-
-		for key, oldDBItem := range oldKeyToDBItem {
-			_, exists := newKeyToDBItem[key]
-			if !exists {
-				keysToDelete = append(keysToDelete, key)
-				itemsToDelete = append(itemsToDelete, oldDBItem)
+			if len(itemsToAdd) > 0 {
+				b.dbOperator.batchPage(keysToAdd, itemsToAdd, b.dbOperator.add, db) // 1是个占位符
 			}
-		}
-		if len(itemsToDelete) > 0 {
-			b.operateBatch(keysToDelete, itemsToDelete, b.delete)
-		}
 
-		if len(itemsToDelete) > 0 && len(itemsToAdd) == 0 && !isUpdate {
-			updateDBItem, updateOK := b.generateOneData()
-			if updateOK {
-				for key, updateDBItem := range updateDBItem {
-					updateTimeInfo := make(map[string]interface{})
-					now := time.Now()
-					updateTimeInfo["updated_at"] = now.Format("2006-01-02 15:04:05")
-					b.update(updateDBItem, updateTimeInfo, key)
+			for key, oldDBItem := range oldKeyToDBItem {
+				_, exists := newKeyToDBItem[key]
+				if !exists {
+					keysToDelete = append(keysToDelete, key)
+					itemsToDelete = append(itemsToDelete, oldDBItem)
 				}
 			}
-		}
-		if (isUpdate || len(itemsToDelete) > 0 || len(itemsToAdd) > 0) && (b.resourceTypeName == RESOURCE_TYPE_CH_APP_LABEL || b.resourceTypeName == RESOURCE_TYPE_CH_TARGET_LABEL) {
-			return true
+			if len(itemsToDelete) > 0 {
+				b.dbOperator.batchPage(keysToDelete, itemsToDelete, b.dbOperator.delete, db) // 1是个占位符
+			}
+
+			if len(itemsToDelete) > 0 && len(itemsToAdd) == 0 && !isUpdate {
+				b.ResourceUpdateAtInfoUpdated(db)
+			}
+			if (isUpdate || len(itemsToDelete) > 0 || len(itemsToAdd) > 0) && (b.resourceTypeName == RESOURCE_TYPE_CH_APP_LABEL || b.resourceTypeName == RESOURCE_TYPE_CH_TARGET_LABEL) {
+				return true
+			}
 		}
 	}
+
 	return false
 }
 
-func (b *UpdaterBase[MT, KT]) generateOldData() (map[KT]MT, bool) {
+func (b *UpdaterComponent[MT, KT]) generateOldData(db *metadb.DB) (map[KT]MT, bool) {
 	var items []MT
 	var err error
 	if b.resourceTypeName == RESOURCE_TYPE_CH_GPROCESS {
-		items, err = query.FindInBatchesObj[MT](mysql.Db.Unscoped())
+		items, err = query.FindInBatchesObj[MT](db.Unscoped())
 	} else {
-		err = mysql.Db.Unscoped().Find(&items).Error
+		err = db.Unscoped().Find(&items).Error
 	}
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(b.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(b.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 	idToItem := make(map[KT]MT)
 	for _, item := range items {
-		idToItem[b.dataGenerator.generateKey(item)] = item
+		idToItem[b.updaterDG.generateKey(item)] = item
 	}
 	return idToItem, true
 }
 
-func (b *UpdaterBase[MT, KT]) generateOneData() (map[KT]MT, bool) {
+func (b *UpdaterComponent[MT, KT]) generateOneData(db *metadb.DB) (map[KT]MT, bool) {
 	var items []MT
-	err := mysql.Db.Unscoped().First(&items).Error
+	err := db.Unscoped().First(&items).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(b.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(b.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 	idToItem := make(map[KT]MT)
 	for _, item := range items {
-		idToItem[b.dataGenerator.generateKey(item)] = item
+		idToItem[b.updaterDG.generateKey(item)] = item
 	}
 	return idToItem, true
 }
 
-func (b *UpdaterBase[MT, KT]) operateBatch(keys []KT, items []MT, operateFunc func([]KT, []MT)) {
-	count := len(items)
-	offset := b.cfg.MySQLBatchSize
-	var pages int
-	if count%offset == 0 {
-		pages = count / offset
-	} else {
-		pages = count/offset + 1
-	}
-	for i := 0; i < pages; i++ {
-		start := i * offset
-		end := (i + 1) * offset
-		if end > count {
-			end = count
-		}
-		operateFunc(keys[start:end], items[start:end])
-	}
-}
-
-func (b *UpdaterBase[MT, KT]) add(keys []KT, dbItems []MT) {
-	err := mysql.Db.Create(&dbItems).Error
-	if err != nil {
-		for i := range keys {
-			log.Errorf("add %s (key: %+v value: %+v) failed: %s", b.resourceTypeName, keys[i], dbItems[i], err.Error())
-		}
-		return
-	}
-	for i := range keys {
-		log.Infof("add %s (key: %+v value: %+v) success", b.resourceTypeName, keys[i], dbItems[i])
-	}
-}
-
-func (b *UpdaterBase[MT, KT]) update(oldDBItem MT, updateInfo map[string]interface{}, key KT) {
-	err := mysql.Db.Model(&oldDBItem).Updates(updateInfo).Error
-	if err != nil {
-		log.Errorf("update %s (key: %+v value: %+v) failed: %s", b.resourceTypeName, key, oldDBItem, err.Error())
-		return
-	}
-	log.Infof("update %s (key: %+v value: %+v, update info: %v) success", b.resourceTypeName, key, oldDBItem, updateInfo)
-}
-
-func (b *UpdaterBase[MT, KT]) delete(keys []KT, dbItems []MT) {
-	err := mysql.Db.Delete(&dbItems).Error
-	if err != nil {
-		for i := range keys {
-			log.Errorf("delete %s (key: %+v value: %+v) failed: %s", b.resourceTypeName, keys[i], dbItems[i], err.Error())
-		}
-		return
-	}
-	for i := range keys {
-		log.Infof("delete %s (key: %+v value: %+v) success", b.resourceTypeName, keys[i], dbItems[i])
+// Update updated_at when resource is deleted
+func (b *UpdaterComponent[MT, KT]) ResourceUpdateAtInfoUpdated(db *metadb.DB) {
+	var updateItems []MT
+	err := db.Unscoped().First(&updateItems).Error
+	if err == nil {
+		db.Save(updateItems)
 	}
 }

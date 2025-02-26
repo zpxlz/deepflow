@@ -18,7 +18,7 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 )
@@ -34,7 +34,7 @@ func NewPeerConnection(c *cache.Cache) *PeerConnection {
 	return listener
 }
 
-func (c *PeerConnection) OnUpdaterAdded(addedDBItems []*mysql.PeerConnection) {
+func (c *PeerConnection) OnUpdaterAdded(addedDBItems []*metadbmodel.PeerConnection) {
 	c.cache.AddPeerConnections(addedDBItems)
 }
 

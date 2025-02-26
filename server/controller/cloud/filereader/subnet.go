@@ -22,6 +22,7 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (f *FileReader) getSubnets(fileInfo *FileInfo) ([]model.Subnet, error) {
@@ -31,17 +32,17 @@ func (f *FileReader) getSubnets(fileInfo *FileInfo) ([]model.Subnet, error) {
 		networkLcuuid, ok := f.networkNameToLcuuid[subnet.Network]
 		if !ok {
 			err := errors.New(fmt.Sprintf("network (%s) not in file", subnet.Network))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(f.orgID))
 			return nil, err
 		}
 		vpcLcuuid, ok := f.networkLcuuidToVPCLcuuid[networkLcuuid]
 		if !ok {
 			err := errors.New(fmt.Sprintf("network (%s) not in file", subnet.Network))
-			log.Error(err)
+			log.Error(err, logger.NewORGPrefix(f.orgID))
 			return nil, err
 		}
 
-		lcuuid := common.GenerateUUID(f.UuidGenerate + "_subnet_" + subnet.Name)
+		lcuuid := common.GenerateUUIDByOrgID(f.orgID, f.UuidGenerate+"_subnet_"+subnet.Name)
 		f.subnetNameToNetworkLcuuid[subnet.Name] = networkLcuuid
 		f.subnetNameToLcuuid[subnet.Name] = lcuuid
 		retSubnets = append(retSubnets, model.Subnet{

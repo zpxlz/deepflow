@@ -23,24 +23,24 @@ import (
 
 	simplejson "github.com/bitly/go-simplejson"
 	mapset "github.com/deckarep/golang-set"
+	"gorm.io/gorm"
+
 	cloudcommon "github.com/deepflowio/deepflow/server/controller/cloud/common"
 	"github.com/deepflowio/deepflow/server/controller/cloud/config"
 	"github.com/deepflowio/deepflow/server/controller/cloud/kubernetes_gather/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
 	"github.com/deepflowio/deepflow/server/controller/statsd"
-	logging "github.com/op/go-logging"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-const (
-	K8S_VPC_NAME       = "kubernetes_vpc"
-	K8S_VERSION_PREFIX = "Kubernetes"
-)
-
-var log = logging.MustGetLogger("cloud.kubernetes_gather")
+var log = logger.MustGetLogger("cloud.kubernetes_gather")
 
 type KubernetesGather struct {
+	orgID                        int
+	TeamID                       int
 	Name                         string
 	Lcuuid                       string
 	UuidGenerate                 string
@@ -54,6 +54,7 @@ type KubernetesGather struct {
 	isSubDomain                  bool
 	azLcuuid                     string
 	podClusterLcuuid             string
+	db                           *gorm.DB
 	labelRegex                   *regexp.Regexp
 	envRegex                     *regexp.Regexp
 	annotationRegex              *regexp.Regexp
@@ -66,6 +67,8 @@ type KubernetesGather struct {
 	rsLcuuidToPodGroupLcuuid     map[string]string
 	serviceLcuuidToIngressLcuuid map[string]string
 	k8sInfo                      map[string][]string
+	pgLcuuidToPSLcuuids          map[string][]string
+	podLcuuidToPGInfo            map[string][2]string
 	nsLabelToGroupLcuuids        map[string]mapset.Set
 	pgLcuuidTopodTargetPorts     map[string]map[string]int
 	namespaceToExLabels          map[string]map[string]interface{}
@@ -79,7 +82,8 @@ type networkLcuuidCIDRs struct {
 	cidrs         []string
 }
 
-func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg config.CloudConfig, isSubDomain bool) *KubernetesGather {
+func NewKubernetesGather(db *metadb.DB, domain *metadbmodel.Domain, subDomain *metadbmodel.SubDomain, cfg config.CloudConfig, isSubDomain bool) *KubernetesGather {
+	var teamID int
 	var name string
 	var displayName string
 	var clusterID string
@@ -97,9 +101,10 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 	// 如果是K8s云平台，转换domain表的config
 	if isSubDomain {
 		if subDomain == nil {
-			log.Error("subdomain model is nil")
+			log.Error("subdomain model is nil", db.LogPrefixORGID)
 			return nil
 		}
+		teamID = subDomain.TeamID
 		name = subDomain.Name
 		lcuuid = subDomain.Lcuuid
 		displayName = subDomain.DisplayName
@@ -111,9 +116,10 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		}
 	} else {
 		if domain == nil {
-			log.Error("domain model is nil")
+			log.Error("domain model is nil", db.LogPrefixORGID)
 			return nil
 		}
+		teamID = domain.TeamID
 		name = domain.Name
 		lcuuid = domain.Lcuuid
 		displayName = domain.DisplayName
@@ -121,13 +127,13 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		configJson = domainConfigJson
 	}
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(db.ORGID))
 		return nil
 	}
 
 	_, err = regexp.Compile(portNameRegex)
 	if err != nil {
-		log.Errorf("port name regex compile error: (%s)", err.Error())
+		log.Errorf("port name regex compile error: (%s)", err.Error(), db.LogPrefixORGID)
 		return nil
 	}
 
@@ -147,7 +153,7 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 	}
 	labelR, err := regexp.Compile(labelRegString)
 	if err != nil {
-		log.Errorf("label regex compile error: (%s)", err.Error())
+		log.Errorf("label regex compile error: (%s)", err.Error(), db.LogPrefixORGID)
 		return nil
 	}
 	envRegString := configJson.Get("env_regex").MustString()
@@ -156,7 +162,7 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 	}
 	envR, err := regexp.Compile(envRegString)
 	if err != nil {
-		log.Errorf("env regex compile error: (%s)", err.Error())
+		log.Errorf("env regex compile error: (%s)", err.Error(), db.LogPrefixORGID)
 		return nil
 	}
 	annotationRegString := configJson.Get("annotation_regex").MustString()
@@ -165,7 +171,7 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 	}
 	annotationR, err := regexp.Compile(annotationRegString)
 	if err != nil {
-		log.Errorf("annotation regex compile error: (%s)", err.Error())
+		log.Errorf("annotation regex compile error: (%s)", err.Error(), db.LogPrefixORGID)
 		return nil
 	}
 
@@ -175,6 +181,9 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		Lcuuid:                lcuuid,
 		UuidGenerate:          displayName,
 		ClusterID:             clusterID,
+		TeamID:                teamID,
+		orgID:                 db.ORGID,
+		db:                    db.DB,
 		RegionUUID:            configJson.Get("region_uuid").MustString(),
 		VPCUUID:               configJson.Get("vpc_uuid").MustString(),
 		PodNetIPv4CIDRMaxMask: podNetIPv4CIDRMaxMask,
@@ -197,6 +206,8 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 		rsLcuuidToPodGroupLcuuid:     map[string]string{},
 		serviceLcuuidToIngressLcuuid: map[string]string{},
 		k8sInfo:                      map[string][]string{},
+		pgLcuuidToPSLcuuids:          map[string][]string{},
+		podLcuuidToPGInfo:            map[string][2]string{},
 		nsLabelToGroupLcuuids:        map[string]mapset.Set{},
 		pgLcuuidTopodTargetPorts:     map[string]map[string]int{},
 		namespaceToExLabels:          map[string]map[string]interface{}{},
@@ -206,7 +217,7 @@ func NewKubernetesGather(domain *mysql.Domain, subDomain *mysql.SubDomain, cfg c
 }
 
 func (k *KubernetesGather) getKubernetesInfo() (map[string][]string, error) {
-	kData, err := genesis.GenesisService.GetKubernetesResponse(k.ClusterID)
+	kData, err := genesis.GenesisService.GetKubernetesResponse(k.orgID, k.ClusterID)
 	if err != nil {
 		return map[string][]string{}, err
 	}
@@ -226,6 +237,8 @@ func (k *KubernetesGather) GetStatter() statsd.StatsdStatter {
 	}
 
 	return statsd.StatsdStatter{
+		OrgID:      k.orgID,
+		TeamID:     k.TeamID,
 		GlobalTags: globalTags,
 		Element:    statsd.GetCloudStatsd(k.cloudStatsd),
 	}
@@ -249,6 +262,8 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 	k.rsLcuuidToPodGroupLcuuid = map[string]string{}
 	k.serviceLcuuidToIngressLcuuid = map[string]string{}
 	k.nsLabelToGroupLcuuids = map[string]mapset.Set{}
+	k.pgLcuuidToPSLcuuids = map[string][]string{}
+	k.podLcuuidToPGInfo = map[string][2]string{}
 	k.pgLcuuidTopodTargetPorts = map[string]map[string]int{}
 	k.namespaceToExLabels = map[string]map[string]interface{}{}
 	k.nsServiceNameToService = map[string]map[string]map[string]int{}
@@ -271,21 +286,13 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 
 	k8sInfo, err := k.getKubernetesInfo()
 	if err != nil {
-		log.Warning(err.Error())
+		log.Warning(err.Error(), logger.NewORGPrefix(k.orgID))
 		return model.KubernetesGatherResource{
 			ErrorState:   common.RESOURCE_STATE_CODE_WARNING,
 			ErrorMessage: err.Error(),
 		}, err
 	}
 	k.k8sInfo = k8sInfo
-
-	prometheusTargets, err := k.getPrometheusTargets()
-	if err != nil {
-		return model.KubernetesGatherResource{
-			ErrorState:   common.RESOURCE_STATE_CODE_WARNING,
-			ErrorMessage: err.Error(),
-		}, err
-	}
 
 	podCluster, err := k.getPodCluster()
 	if err != nil {
@@ -374,10 +381,8 @@ func (k *KubernetesGather) GetKubernetesGatherData() (model.KubernetesGatherReso
 		PodReplicaSets:         replicaSets,
 		PodGroups:              podGroups,
 		Pods:                   pods,
-		PrometheusTargets:      prometheusTargets,
 	}
 
-	k.cloudStatsd.RefreshAPIMoniter("PrometheusTarget", len(prometheusTargets), time.Time{})
 	k.cloudStatsd.ResCount = statsd.GetResCount(resource)
 	statsd.MetaStatsd.RegisterStatsdTable(k)
 	return resource, nil

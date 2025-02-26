@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type RedisInstance struct {
-	UpdaterBase[cloudmodel.RedisInstance, mysql.RedisInstance, *diffbase.RedisInstance]
+	UpdaterBase[
+		cloudmodel.RedisInstance,
+		*diffbase.RedisInstance,
+		*metadbmodel.RedisInstance,
+		metadbmodel.RedisInstance,
+		*message.RedisInstanceAdd,
+		message.RedisInstanceAdd,
+		*message.RedisInstanceUpdate,
+		message.RedisInstanceUpdate,
+		*message.RedisInstanceFieldsUpdate,
+		message.RedisInstanceFieldsUpdate,
+		*message.RedisInstanceDelete,
+		message.RedisInstanceDelete]
 }
 
 func NewRedisInstance(wholeCache *cache.Cache, cloudData []cloudmodel.RedisInstance) *RedisInstance {
 	updater := &RedisInstance{
-		UpdaterBase[cloudmodel.RedisInstance, mysql.RedisInstance, *diffbase.RedisInstance]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewRedisInstance(),
-			diffBaseData: wholeCache.DiffBaseDataSet.RedisInstances,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.RedisInstance,
+			*diffbase.RedisInstance,
+			*metadbmodel.RedisInstance,
+			metadbmodel.RedisInstance,
+			*message.RedisInstanceAdd,
+			message.RedisInstanceAdd,
+			*message.RedisInstanceUpdate,
+			message.RedisInstanceUpdate,
+			*message.RedisInstanceFieldsUpdate,
+			message.RedisInstanceFieldsUpdate,
+			*message.RedisInstanceDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_REDIS_INSTANCE_EN,
+			wholeCache,
+			db.NewRedisInstance().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.RedisInstances,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,7 +73,7 @@ func (r *RedisInstance) getDiffBaseByCloudItem(cloudItem *cloudmodel.RedisInstan
 	return
 }
 
-func (r *RedisInstance) generateDBItemToAdd(cloudItem *cloudmodel.RedisInstance) (*mysql.RedisInstance, bool) {
+func (r *RedisInstance) generateDBItemToAdd(cloudItem *cloudmodel.RedisInstance) (*metadbmodel.RedisInstance, bool) {
 	vpcID, exists := r.cache.ToolDataSet.GetVPCIDByLcuuid(cloudItem.VPCLcuuid)
 	if !exists {
 		resourceAForResourceBNotFound(
@@ -57,7 +82,7 @@ func (r *RedisInstance) generateDBItemToAdd(cloudItem *cloudmodel.RedisInstance)
 		)
 		return nil, false
 	}
-	dbItem := &mysql.RedisInstance{
+	dbItem := &metadbmodel.RedisInstance{
 		Name:         cloudItem.Name,
 		Label:        cloudItem.Label,
 		UID:          cloudItem.Label,
@@ -65,7 +90,7 @@ func (r *RedisInstance) generateDBItemToAdd(cloudItem *cloudmodel.RedisInstance)
 		Version:      cloudItem.Version,
 		InternalHost: cloudItem.InternalHost,
 		PublicHost:   cloudItem.PublicHost,
-		Domain:       r.cache.DomainLcuuid,
+		Domain:       r.metadata.Domain.Lcuuid,
 		Region:       cloudItem.RegionLcuuid,
 		AZ:           cloudItem.AZLcuuid,
 		VPCID:        vpcID,
@@ -74,26 +99,29 @@ func (r *RedisInstance) generateDBItemToAdd(cloudItem *cloudmodel.RedisInstance)
 	return dbItem, true
 }
 
-func (r *RedisInstance) generateUpdateInfo(diffBase *diffbase.RedisInstance, cloudItem *cloudmodel.RedisInstance) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (r *RedisInstance) generateUpdateInfo(diffBase *diffbase.RedisInstance, cloudItem *cloudmodel.RedisInstance) (*message.RedisInstanceFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.RedisInstanceFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.State != cloudItem.State {
-		updateInfo["state"] = cloudItem.State
+		mapInfo["state"] = cloudItem.State
+		structInfo.State.Set(diffBase.State, cloudItem.State)
 	}
 	if diffBase.PublicHost != cloudItem.PublicHost {
-		updateInfo["public_host"] = cloudItem.PublicHost
+		mapInfo["public_host"] = cloudItem.PublicHost
+		structInfo.PublicHost.Set(diffBase.PublicHost, cloudItem.PublicHost)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
 	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		updateInfo["az"] = cloudItem.AZLcuuid
+		mapInfo["az"] = cloudItem.AZLcuuid
+		structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

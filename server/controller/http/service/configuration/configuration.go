@@ -19,5 +19,5 @@ package configuration
 
 import "github.com/gin-gonic/gin"
 
-// GetVTapGroupconfiguration will be replaced in enterprise edition
-func GetVTapGroupconfiguration(c *gin.Context) {}
+// GetAgentGroupconfiguration will be replaced in enterprise edition
+func GetAgentGroupConfig(c *gin.Context) {}

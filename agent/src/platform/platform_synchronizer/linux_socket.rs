@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#[cfg(target_os = "android")]
+use std::os::android::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::fs::MetadataExt;
+
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -29,13 +34,15 @@ use procfs::{
     ProcError,
 };
 
-use crate::{config::handler::OsProcScanConfig, policy::PolicyGetter};
-use public::{
-    bytes::read_u32_be,
-    proto::trident::{GpidSyncEntry, RoleType, ServiceProtocol},
+use crate::{
+    config::handler::OsProcScanConfig, platform::platform_synchronizer::ProcessData,
+    policy::PolicyGetter,
 };
 
-use super::{get_all_pid_process_map, get_os_app_tag_by_exec, sym_uptime, RegExpAction};
+use public::{
+    bytes::read_u32_be,
+    proto::agent::{GpidSyncEntry, RoleType, ServiceProtocol},
+};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -154,6 +161,7 @@ pub(super) fn get_all_socket(
     conf: &OsProcScanConfig,
     policy_getter: &mut PolicyGetter,
     epc_id: u32,
+    pids: Vec<u32>,
 ) -> Result<Vec<SockEntry>, ProcError> {
     // Hashmap<inode, (pid,fd)>
     let mut inode_pid_fd_map = HashMap::new();
@@ -167,9 +175,7 @@ pub(super) fn get_all_socket(
     let mut spec_addr_listen_sock = HashSet::new();
 
     let (
-        user,
-        cmd,
-        tagged_only,
+        _tagged_only,
         proc_root,
         min_sock_lifetime,
         now_sec,
@@ -177,8 +183,6 @@ pub(super) fn get_all_socket(
         mut udp_entries,
         mut sock_entries,
     ) = (
-        conf.os_app_tag_exec_user.as_str(),
-        conf.os_app_tag_exec.as_slice(),
         conf.os_proc_sync_tagged_only,
         conf.os_proc_root.as_str(),
         conf.os_proc_socket_min_lifetime as u64,
@@ -190,47 +194,28 @@ pub(super) fn get_all_socket(
         vec![],
         vec![],
     );
-
-    let tags_map = match get_os_app_tag_by_exec(user, cmd) {
-        Ok(tags) => tags,
-        Err(err) => {
-            error!(
-                "get process tags by execute cmd `{}` with user {} fail: {}",
-                cmd.join(" "),
-                user,
-                err
-            );
-            HashMap::new()
-        }
-    };
-
     // netns idx increase every time get the new netns id
     let mut netns_idx = 0u16;
 
-    let mut pid_proc_map = get_all_pid_process_map(conf.os_proc_root.as_str());
-
-    // get all process, and record the open fd and fetch listining socket info
-    // note that the /proc/pid/net/{tcp,tcp6,udp,udp6} include all the connection in the proc netns, not the process created connection.
-    for p in procfs::process::all_processes_with_root(proc_root)? {
-        let Ok(proc) = p else {
+    for pid in pids {
+        let process = Process::new(pid as i32);
+        if let Err(ref e) = process {
+            warn!("get process(pid: {}) failed: {:?}", pid, e);
+            continue;
+        }
+        let process = process.unwrap();
+        let Ok(process_data) = ProcessData::try_from(&process) else {
             continue;
         };
 
-        let mut proc_data = {
-            let Some(proc_data) = pid_proc_map.get_mut(&(proc.pid as u32)) else {
-                continue;
-            };
-            proc_data.clone()
-        };
-
-        let (fds, netns, pid) = match (proc.fd(), get_proc_netns(&proc)) {
-            (Ok(fds), Ok(netns)) => (fds, netns, proc.pid),
+        let (fds, netns, pid) = match (process.fd(), get_proc_netns(&process)) {
+            (Ok(fds), Ok(netns)) => (fds, netns, process.pid),
             _ => {
                 continue;
             }
         };
 
-        let Ok(up_sec) = proc_data.up_sec(now_sec) else {
+        let Ok(up_sec) = process_data.up_sec(now_sec) else {
             continue;
         };
 
@@ -239,76 +224,138 @@ pub(super) fn get_all_socket(
             continue;
         }
 
-        for i in conf.os_proc_regex.as_slice() {
-            if i.match_and_rewrite_proc(&mut proc_data, &pid_proc_map, &tags_map, true) {
-                if i.action() == RegExpAction::Drop {
-                    break;
-                }
-
-                if tags_map.get(&(proc.pid as u64)).is_none() && tagged_only {
-                    break;
-                }
-
-                // when match proc, will record the inode and (pid, fd) map, use for get the connection pid and fd in later.
-                for fd in fds {
-                    let Ok(f) = fd else {
-                        continue;
-                    };
-                    if let FDTarget::Socket(fd_inode) = f.target {
-                        inode_pid_fd_map.insert(fd_inode, (pid, f.fd));
-                    }
-                }
-
-                // break if the netns had been fetched
-                if netns_id_idx_map.contains_key(&netns) {
-                    break;
-                };
-
-                netns_id_idx_map.insert(netns, {
-                    if netns_idx == u16::MAX {
-                        warn!("netns_idx reach u16::Max, set to 0");
-                        0
-                    } else {
-                        netns_idx += 1;
-                        netns_idx
-                    }
-                });
-
-                // also recoed the listining socket info, use for determine client or server connection.
-                // note that proc.{tcp(), tcp6(), udp(), udp6()} include all connection in the proc netns
-                if let Err(err) = record_tcp_listening_ip_port(
-                    &proc,
-                    Some(netns),
-                    &mut all_iface_listen_sock,
-                    &mut spec_addr_listen_sock,
-                ) {
-                    error!("pid {} record_tcp_listening_ip_port fail: {}", pid, err);
-                    break;
-                }
-
-                // record the tcp and udp connection in current netns
-                // only support ipv4 now, ipv6 dual stack will extra ipv4 addr
-                match (proc.tcp(), proc.udp()) {
-                    (Ok(tcp), Ok(udp)) => {
-                        tcp_entries.push((tcp, netns));
-                        udp_entries.push((udp, netns));
-                    }
-                    _ => error!("pid {} get connection info fail", pid),
-                }
-
-                // old kernel have no tcp6/udp6
-                match (proc.tcp6(), proc.udp6()) {
-                    (Ok(tcp6), Ok(udp6)) => {
-                        tcp_entries.push((tcp6, netns));
-                        udp_entries.push((udp6, netns));
-                    }
-                    _ => {}
-                }
-
-                break;
+        // when match proc, will record the inode and (pid, fd) map, use for get the connection pid and fd in later.
+        for fd in fds {
+            let Ok(f) = fd else {
+                continue;
+            };
+            if let FDTarget::Socket(fd_inode) = f.target {
+                inode_pid_fd_map.insert(fd_inode, (pid, f.fd));
             }
         }
+
+        // break if the netns had been fetched
+        if netns_id_idx_map.contains_key(&netns) {
+            break;
+        };
+
+        netns_id_idx_map.insert(netns, {
+            if netns_idx == u16::MAX {
+                warn!("netns_idx reach u16::Max, set to 0");
+                0
+            } else {
+                netns_idx += 1;
+                netns_idx
+            }
+        });
+
+        // also recoed the listining socket info, use for determine client or server connection.
+        // note that proc.{tcp(), tcp6(), udp(), udp6()} include all connection in the proc netns
+        if let Err(err) = record_tcp_listening_ip_port(
+            &process,
+            Some(netns),
+            &mut all_iface_listen_sock,
+            &mut spec_addr_listen_sock,
+        ) {
+            error!("pid {} record_tcp_listening_ip_port fail: {}", pid, err);
+            break;
+        }
+
+        // record the tcp and udp connection in current netns
+        // only support ipv4 now, ipv6 dual stack will extra ipv4 addr
+        match (process.tcp(), process.udp()) {
+            (Ok(tcp), Ok(udp)) => {
+                tcp_entries.push((tcp, netns));
+                udp_entries.push((udp, netns));
+            }
+            _ => error!("pid {} get connection info fail", pid),
+        }
+
+        // old kernel have no tcp6/udp6
+        match (process.tcp6(), process.udp6()) {
+            (Ok(tcp6), Ok(udp6)) => {
+                tcp_entries.push((tcp6, netns));
+                udp_entries.push((udp6, netns));
+            }
+            _ => {}
+        }
     }
+
+    // let mut pid_proc_map = get_all_pid_process_map(conf.os_proc_root.as_str());
+
+    // // get all process, and record the open fd and fetch listining socket info
+    // // note that the /proc/pid/net/{tcp,tcp6,udp,udp6} include all the connection in the proc netns, not the process created connection.
+    // for p in procfs::process::all_processes_with_root(proc_root)? {
+    //     for i in conf.os_proc_regex.as_slice() {
+    //         if i.match_and_rewrite_proc(&mut proc_data, &pid_proc_map, &tags_map, true) {
+    //             if i.action() == RegExpAction::Drop {
+    //                 break;
+    //             }
+
+    //             if tags_map.get(&(proc.pid as u64)).is_none() && tagged_only {
+    //                 break;
+    //             }
+
+    //             // when match proc, will record the inode and (pid, fd) map, use for get the connection pid and fd in later.
+    //             for fd in fds {
+    //                 let Ok(f) = fd else {
+    //                     continue;
+    //                 };
+    //                 if let FDTarget::Socket(fd_inode) = f.target {
+    //                     inode_pid_fd_map.insert(fd_inode, (pid, f.fd));
+    //                 }
+    //             }
+
+    //             // break if the netns had been fetched
+    //             if netns_id_idx_map.contains_key(&netns) {
+    //                 break;
+    //             };
+
+    //             netns_id_idx_map.insert(netns, {
+    //                 if netns_idx == u16::MAX {
+    //                     warn!("netns_idx reach u16::Max, set to 0");
+    //                     0
+    //                 } else {
+    //                     netns_idx += 1;
+    //                     netns_idx
+    //                 }
+    //             });
+
+    //             // also recoed the listining socket info, use for determine client or server connection.
+    //             // note that proc.{tcp(), tcp6(), udp(), udp6()} include all connection in the proc netns
+    //             if let Err(err) = record_tcp_listening_ip_port(
+    //                 &proc,
+    //                 Some(netns),
+    //                 &mut all_iface_listen_sock,
+    //                 &mut spec_addr_listen_sock,
+    //             ) {
+    //                 error!("pid {} record_tcp_listening_ip_port fail: {}", pid, err);
+    //                 break;
+    //             }
+
+    //             // record the tcp and udp connection in current netns
+    //             // only support ipv4 now, ipv6 dual stack will extra ipv4 addr
+    //             match (proc.tcp(), proc.udp()) {
+    //                 (Ok(tcp), Ok(udp)) => {
+    //                     tcp_entries.push((tcp, netns));
+    //                     udp_entries.push((udp, netns));
+    //                 }
+    //                 _ => error!("pid {} get connection info fail", pid),
+    //             }
+
+    //             // old kernel have no tcp6/udp6
+    //             match (proc.tcp6(), proc.udp6()) {
+    //                 (Ok(tcp6), Ok(udp6)) => {
+    //                     tcp_entries.push((tcp6, netns));
+    //                     udp_entries.push((udp6, netns));
+    //                 }
+    //                 _ => {}
+    //             }
+
+    //             break;
+    //         }
+    //     }
+    // }
 
     divide_tcp_entry(
         epc_id,
@@ -653,5 +700,18 @@ fn convert_addr_to_v4(addr: SocketAddr) -> Option<SocketAddr> {
                 ))
             }
         }
+    }
+}
+
+// return the (now_sec - sym_change_time) second
+pub(super) fn sym_uptime(now_sec: u64, path: &PathBuf) -> Result<u64, &'static str> {
+    // linux default not record the file birth time, use the change time instead of the birth time.
+    let s = std::fs::symlink_metadata(path)
+        .map_err(|_| "get symlink metadate fail")?
+        .st_ctime() as u64;
+    if now_sec >= s {
+        Ok(now_sec - s)
+    } else {
+        Err("sym up time after current")
     }
 }

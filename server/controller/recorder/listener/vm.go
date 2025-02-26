@@ -18,38 +18,31 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/event"
-	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type VM struct {
-	cache         *cache.Cache
-	eventProducer *event.VM
+	cache *cache.Cache
 }
 
-func NewVM(c *cache.Cache, eq *queue.OverwriteQueue) *VM {
+func NewVM(c *cache.Cache) *VM {
 	listener := &VM{
-		cache:         c,
-		eventProducer: event.NewVM(c.ToolDataSet, eq),
+		cache: c,
 	}
 	return listener
 }
 
-func (vm *VM) OnUpdaterAdded(addedDBItems []*mysql.VM) {
-	vm.eventProducer.ProduceByAdd(addedDBItems)
+func (vm *VM) OnUpdaterAdded(addedDBItems []*metadbmodel.VM) {
 	vm.cache.AddVMs(addedDBItems)
 }
 
 func (vm *VM) OnUpdaterUpdated(cloudItem *cloudmodel.VM, diffBase *diffbase.VM) {
-	vm.eventProducer.ProduceByUpdate(cloudItem, diffBase)
-	diffBase.Update(cloudItem)
+	diffBase.Update(cloudItem, vm.cache.ToolDataSet)
 	vm.cache.UpdateVM(cloudItem)
 }
 
 func (vm *VM) OnUpdaterDeleted(lcuuids []string) {
-	vm.eventProducer.ProduceByDelete(lcuuids)
 	vm.cache.DeleteVMs(lcuuids)
 }

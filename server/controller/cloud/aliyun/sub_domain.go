@@ -22,17 +22,18 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/cs"
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (a *Aliyun) getSubDomains(region model.Region) ([]model.SubDomain, error) {
+func (a *Aliyun) getSubDomains(region model.Region) []model.SubDomain {
 	var retSubDomains []model.SubDomain
 
-	log.Debug("get sub_domains starting")
+	log.Debug("get sub_domains starting", logger.NewORGPrefix(a.orgID))
 	request := cs.CreateDescribeClustersV1Request()
 	response, err := a.getSubDomainResponse(region.Label, request)
 	if err != nil {
-		log.Error(err)
-		return retSubDomains, err
+		log.Warning(err, logger.NewORGPrefix(a.orgID))
+		return []model.SubDomain{}
 	}
 
 	for _, retArry := range response {
@@ -42,12 +43,12 @@ func (a *Aliyun) getSubDomains(region model.Region) ([]model.SubDomain, error) {
 			vpcID := cluster.Get("vpc_id").MustString()
 			vpcLcuuid, ok := a.vpcIDToLcuuids[vpcID]
 			if vpcID == "" || !ok {
-				log.Debugf("cluster (%s) vpc (%s) not found", clusterID, vpcID)
+				log.Debugf("cluster (%s) vpc (%s) not found", clusterID, vpcID, logger.NewORGPrefix(a.orgID))
 				continue
 			}
 			config := map[string]interface{}{
 				"cluster_id":                 clusterID,
-				"region_uuid":                a.getRegionLcuuid(region.Lcuuid),
+				"region_uuid":                a.regionLcuuid,
 				"vpc_uuid":                   vpcLcuuid,
 				"port_name_regex":            common.DEFAULT_PORT_NAME_REGEX,
 				"pod_net_ipv4_cidr_max_mask": common.K8S_POD_IPV4_NETMASK,
@@ -55,7 +56,8 @@ func (a *Aliyun) getSubDomains(region model.Region) ([]model.SubDomain, error) {
 			}
 			configJson, _ := json.Marshal(config)
 			retSubDomains = append(retSubDomains, model.SubDomain{
-				Lcuuid:      common.GenerateUUID(clusterID),
+				TeamID:      a.teamID,
+				Lcuuid:      common.GenerateUUIDByOrgID(a.orgID, clusterID),
 				Name:        cluster.Get("name").MustString(),
 				DisplayName: clusterID,
 				ClusterID:   clusterID,
@@ -64,6 +66,6 @@ func (a *Aliyun) getSubDomains(region model.Region) ([]model.SubDomain, error) {
 			})
 		}
 	}
-	log.Debug("get sub_domains complete")
-	return retSubDomains, nil
+	log.Debug("get sub_domains complete", logger.NewORGPrefix(a.orgID))
+	return retSubDomains
 }

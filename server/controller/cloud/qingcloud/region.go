@@ -20,10 +20,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/deckarep/golang-set"
+	mapset "github.com/deckarep/golang-set"
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 func (q *QingCloud) getRegionAndAZs() ([]model.Region, []model.AZ, error) {
@@ -32,12 +33,12 @@ func (q *QingCloud) getRegionAndAZs() ([]model.Region, []model.AZ, error) {
 	var regionIdToLcuuid map[string]string
 	var zoneNames []string
 
-	log.Info("get region and azs starting")
+	log.Info("get region and azs starting", logger.NewORGPrefix(q.orgID))
 
 	kwargs := []*Param{{"status.1", "active"}}
 	response, err := q.GetResponse("DescribeZones", "zone_set", kwargs)
 	if err != nil {
-		log.Error(err)
+		log.Error(err, logger.NewORGPrefix(q.orgID))
 		return nil, nil, err
 	}
 
@@ -57,9 +58,9 @@ func (q *QingCloud) getRegionAndAZs() ([]model.Region, []model.AZ, error) {
 			if strings.HasPrefix(regionId, "ap") {
 				regionId = zoneId
 			}
-			regionLcuuid := common.GenerateUUID(q.UuidGenerate + "_" + regionId)
+			regionLcuuid := common.GenerateUUIDByOrgID(q.orgID, q.UuidGenerate+"_"+regionId)
 			retAZs = append(retAZs, model.AZ{
-				Lcuuid:       common.GenerateUUID(q.UuidGenerate + "_" + zoneId),
+				Lcuuid:       common.GenerateUUIDByOrgID(q.orgID, q.UuidGenerate+"_"+zoneId),
 				Name:         zoneId,
 				Label:        zoneId,
 				RegionLcuuid: q.GetRegionLcuuid(regionLcuuid),
@@ -84,11 +85,11 @@ func (q *QingCloud) getRegionAndAZs() ([]model.Region, []model.AZ, error) {
 	for _, regionId := range regionIds.ToSlice() {
 		regionIdStr := regionId.(string)
 		retRegions = append(retRegions, model.Region{
-			Lcuuid: common.GenerateUUID(q.UuidGenerate + "_" + regionIdStr),
+			Lcuuid: common.GenerateUUIDByOrgID(q.orgID, q.UuidGenerate+"_"+regionIdStr),
 			Name:   strings.ToUpper(regionIdStr),
 		})
 	}
 
-	log.Info("get region and azs complete")
+	log.Info("get region and azs complete", logger.NewORGPrefix(q.orgID))
 	return retRegions, retAZs, nil
 }

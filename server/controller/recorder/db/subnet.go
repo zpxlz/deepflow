@@ -18,20 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type Subnet struct {
-	OperatorBase[mysql.Subnet]
+	OperatorBase[*metadbmodel.Subnet, metadbmodel.Subnet]
 }
 
 func NewSubnet() *Subnet {
 	o := &Subnet{
-		OperatorBase[mysql.Subnet]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_SUBNET_EN,
-			softDelete:       false,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.Subnet](
+			ctrlrcommon.RESOURCE_TYPE_SUBNET_EN,
+			false,
+			false,
+		),
 	}
 	o.setFieldsNeededAfterCreate([]string{"id", "lcuuid", "name", "label", "sub_domain"})
 	return o

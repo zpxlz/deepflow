@@ -24,20 +24,24 @@ ARCH ?= $(shell uname -m)
 CC ?= gcc
 CFLAGS ?= -std=gnu99 --static -g -O2 -ffunction-sections -fdata-sections -fPIC -fno-omit-frame-pointer -Wall -Wno-sign-compare -Wno-unused-parameter -Wno-missing-field-initializers
 
-EXECS := test_symbol test_offset test_insns_cnt test_bihash test_vec test_fetch_container_id test_parse_range test_set_ports_bitmap
+EXECS := test_symbol test_offset test_insns_cnt test_bihash test_vec test_fetch_container_id test_parse_range test_set_ports_bitmap test_pid_check test_match_pids
 ifeq ($(ARCH), x86_64)
 #-lbcc -lstdc++
-        LDLIBS += ../libtrace.a -ljattach -lbcc_bpf -lGoReSym -lbddisasm -ldwarf -lelf -lz -lpthread -lbcc -lstdc++ -ldl
+        LDLIBS += ../libtrace.a ./libtrace_utils.a -ljattach -lbcc_bpf -lGoReSym -lbddisasm -ldwarf -lelf -lz -lpthread -lbcc -lstdc++ -ldl
 else ifeq ($(ARCH), aarch64)
-        LDLIBS += ../libtrace.a -ljattach -lGoReSym -lbcc_bpf -ldwarf -lelf -lz -lpthread -lbcc -lstdc++ -ldl
+        LDLIBS += ../libtrace.a ./libtrace_utils.a -ljattach -lGoReSym -lbcc_bpf -ldwarf -lelf -lz -lpthread -lbcc -lstdc++ -ldl
 endif
 
-all: $(EXECS) 
+all: $(EXECS) libtrace_utils.a
 
-% : %.c
+% : %.c libtrace_utils.a
 	$(call msg,TEST,$@)
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 	$(Q)./$@
+
+libtrace_utils.a:
+	$(Q)cargo rustc -p trace-utils --crate-type=staticlib
+	$(Q)cp ../../../target/debug/libtrace_utils.a .
 
 clean:
 	$(Q)rm -rf $(EXECS)

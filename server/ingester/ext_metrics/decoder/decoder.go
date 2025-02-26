@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"time"
 
 	"github.com/influxdata/influxdb/models"
 	logging "github.com/op/go-logging"
@@ -28,15 +27,16 @@ import (
 	"github.com/deepflowio/deepflow/server/ingester/common"
 	"github.com/deepflowio/deepflow/server/ingester/ext_metrics/config"
 	"github.com/deepflowio/deepflow/server/ingester/ext_metrics/dbwriter"
+	"github.com/deepflowio/deepflow/server/libs/ckdb"
 	"github.com/deepflowio/deepflow/server/libs/codec"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/receiver"
 	"github.com/deepflowio/deepflow/server/libs/stats"
 	"github.com/deepflowio/deepflow/server/libs/stats/pb"
 	"github.com/deepflowio/deepflow/server/libs/utils"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 )
 
 var log = logging.MustGetLogger("ext_metrics.decoder")
@@ -56,19 +56,21 @@ type Counter struct {
 }
 
 type Decoder struct {
-	index            int
-	msgType          datatype.MessageType
-	platformData     *grpc.PlatformInfoTable
-	inQueue          queue.QueueReader
-	extMetricsWriter *dbwriter.ExtMetricsWriter
-	debugEnabled     bool
-	config           *config.Config
+	index             int
+	msgType           datatype.MessageType
+	platformData      *grpc.PlatformInfoTable
+	inQueue           queue.QueueReader
+	extMetricsWriters [dbwriter.MAX_DB_ID]*dbwriter.ExtMetricsWriter
+	debugEnabled      bool
+	config            *config.Config
 
 	// universal tag cache
-	podNameToUniversalTag    map[string]*zerodoc.UniversalTag
-	instanceIPToUniversalTag map[string]*zerodoc.UniversalTag
-	vtapIDToUniversalTag     map[uint16]*zerodoc.UniversalTag
-	platformDataVersion      uint64
+	podNameToUniversalTag    [grpc.MAX_ORG_COUNT]map[string]*flow_metrics.UniversalTag
+	instanceIPToUniversalTag [grpc.MAX_ORG_COUNT]map[string]*flow_metrics.UniversalTag
+	vtapIDToUniversalTag     [grpc.MAX_ORG_COUNT]map[uint16]*flow_metrics.UniversalTag
+	platformDataVersion      [grpc.MAX_ORG_COUNT]uint64
+
+	orgId, teamId uint16
 
 	counter *Counter
 	utils.Closable
@@ -78,22 +80,25 @@ func NewDecoder(
 	index int, msgType datatype.MessageType,
 	platformData *grpc.PlatformInfoTable,
 	inQueue queue.QueueReader,
-	extMetricsWriter *dbwriter.ExtMetricsWriter,
+	extMetricsWriters [dbwriter.MAX_DB_ID]*dbwriter.ExtMetricsWriter,
 	config *config.Config,
 ) *Decoder {
-	return &Decoder{
-		index:                    index,
-		msgType:                  msgType,
-		platformData:             platformData,
-		inQueue:                  inQueue,
-		debugEnabled:             log.IsEnabledFor(logging.DEBUG),
-		extMetricsWriter:         extMetricsWriter,
-		config:                   config,
-		podNameToUniversalTag:    make(map[string]*zerodoc.UniversalTag),
-		instanceIPToUniversalTag: make(map[string]*zerodoc.UniversalTag),
-		vtapIDToUniversalTag:     make(map[uint16]*zerodoc.UniversalTag),
-		counter:                  &Counter{},
+	d := &Decoder{
+		index:             index,
+		msgType:           msgType,
+		platformData:      platformData,
+		inQueue:           inQueue,
+		debugEnabled:      log.IsEnabledFor(logging.DEBUG),
+		extMetricsWriters: extMetricsWriters,
+		config:            config,
+		counter:           &Counter{},
 	}
+	for i := 0; i < grpc.MAX_ORG_COUNT; i++ {
+		d.podNameToUniversalTag[i] = make(map[string]*flow_metrics.UniversalTag)
+		d.instanceIPToUniversalTag[i] = make(map[string]*flow_metrics.UniversalTag)
+		d.vtapIDToUniversalTag[i] = make(map[uint16]*flow_metrics.UniversalTag)
+	}
+	return d
 }
 
 func (d *Decoder) GetCounter() interface{} {
@@ -108,7 +113,6 @@ func (d *Decoder) Run() {
 		"thread":   strconv.Itoa(d.index),
 		"msg_type": d.msgType.String()})
 
-	d.initMetricsTable()
 	buffer := make([]interface{}, BUFFER_SIZE)
 	decoder := &codec.SimpleDecoder{}
 	for {
@@ -124,29 +128,14 @@ func (d *Decoder) Run() {
 				continue
 			}
 			decoder.Init(recvBytes.Buffer[recvBytes.Begin:recvBytes.End])
+			d.orgId, d.teamId = uint16(recvBytes.OrgID), uint16(recvBytes.TeamID)
 			if d.msgType == datatype.MESSAGE_TYPE_TELEGRAF {
 				d.handleTelegraf(recvBytes.VtapID, decoder)
-			} else if d.msgType == datatype.MESSAGE_TYPE_DFSTATS {
+			} else if d.msgType == datatype.MESSAGE_TYPE_DFSTATS || d.msgType == datatype.MESSAGE_TYPE_SERVER_DFSTATS {
 				d.handleDeepflowStats(recvBytes.VtapID, decoder)
 			}
 			receiver.ReleaseRecvBuffer(recvBytes)
 		}
-	}
-}
-
-func (d *Decoder) initMetricsTable() {
-	if d.msgType == datatype.MESSAGE_TYPE_TELEGRAF && d.extMetricsWriter != nil {
-		// send empty metrics, trigger the creation of ext_metrics.metrics table
-		m := dbwriter.AcquireExtMetrics()
-		m.Timestamp = uint32(time.Now().Unix())
-		d.extMetricsWriter.Write(m)
-	}
-	if d.msgType == datatype.MESSAGE_TYPE_DFSTATS && d.extMetricsWriter != nil {
-		// send empty df stats, trigger the creation of deepflow_system.deepflow_system table
-		m := dbwriter.AcquireExtMetrics()
-		m.Timestamp = uint32(time.Now().Unix())
-		m.MsgType = datatype.MESSAGE_TYPE_DFSTATS
-		d.extMetricsWriter.Write(m)
 	}
 }
 
@@ -179,14 +168,14 @@ func (d *Decoder) sendTelegraf(vtapID uint16, point models.Point) {
 		log.Debugf("decoder %d vtap %d recv telegraf point: %v", d.index, vtapID, point)
 	}
 	extMetrics, err := d.PointToExtMetrics(vtapID, point)
-	if err != nil {
+	if err != nil || !extMetrics.IsValid() {
 		if d.counter.ErrMetrics == 0 {
 			log.Warning(err)
 		}
 		d.counter.ErrMetrics++
 		return
 	}
-	d.extMetricsWriter.Write(extMetrics)
+	d.extMetricsWriters[int(dbwriter.EXT_METRICS_DB_ID)].Write(extMetrics)
 	d.counter.OutCount++
 }
 
@@ -212,43 +201,67 @@ func (d *Decoder) handleDeepflowStats(vtapID uint16, decoder *codec.SimpleDecode
 		if d.debugEnabled {
 			log.Debugf("decoder %d vtap %d recv deepflow stats: %v", d.index, vtapID, pbStats)
 		}
-		d.extMetricsWriter.Write(StatsToExtMetrics(vtapID, pbStats))
+		metrics, dbId := d.StatsToExtMetrics(vtapID, pbStats)
+		if !metrics.IsValid() {
+			if d.counter.ErrMetrics == 0 {
+				log.Warningf("ext metrics is invalid. %+v", metrics)
+			}
+			d.counter.ErrMetrics++
+			continue
+		}
+		d.extMetricsWriters[dbId].Write(metrics)
 		d.counter.OutCount++
 	}
 }
 
-func StatsToExtMetrics(vtapID uint16, s *pb.Stats) *dbwriter.ExtMetrics {
+func (d *Decoder) StatsToExtMetrics(vtapID uint16, s *pb.Stats) (*dbwriter.ExtMetrics, dbwriter.WriterDBID) {
 	m := dbwriter.AcquireExtMetrics()
 	m.Timestamp = uint32(s.Timestamp)
 	m.UniversalTag.VTAPID = vtapID
-	m.MsgType = datatype.MESSAGE_TYPE_DFSTATS
+	m.MsgType = d.msgType
 	m.VTableName = s.Name
 	m.TagNames = s.TagNames
 	m.TagValues = s.TagValues
 	m.MetricsFloatNames = s.MetricsFloatNames
 	m.MetricsFloatValues = s.MetricsFloatValues
-	return m
+	m.RawOrgId = uint16(s.OrgId)
+	var writerDBID dbwriter.WriterDBID
+	// if OrgId is set, the set OrgId will be used first.
+	if s.OrgId != 0 {
+		m.OrgId, m.TeamID = uint16(s.OrgId), uint16(s.TeamId)
+		writerDBID = dbwriter.DEEPFLOW_TENANT_DB_ID
+	} else { // OrgId not set
+		// from deepflow_server, OrgId set default
+		if m.MsgType == datatype.MESSAGE_TYPE_SERVER_DFSTATS {
+			m.OrgId, m.TeamID = ckdb.DEFAULT_ORG_ID, ckdb.DEFAULT_TEAM_ID
+			writerDBID = dbwriter.DEEPFLOW_ADMIN_DB_ID
+		} else { // from deepflow_agent, OrgId Get from header first, then from vtapID
+			m.OrgId, m.TeamID = d.orgId, d.teamId
+			writerDBID = dbwriter.DEEPFLOW_TENANT_DB_ID
+		}
+	}
+	return m, writerDBID
 }
 
 func (d *Decoder) fillExtMetricsBase(m *dbwriter.ExtMetrics, vtapID uint16, podName string, fillWithVtapId bool) {
-	var universalTag *zerodoc.UniversalTag
+	var universalTag *flow_metrics.UniversalTag
 
 	// fast path
-	platformDataVersion := d.platformData.Version()
-	if platformDataVersion != d.platformDataVersion {
-		if d.platformDataVersion != 0 {
+	platformDataVersion := d.platformData.Version(m.OrgId)
+	if platformDataVersion != d.platformDataVersion[m.OrgId] {
+		if d.platformDataVersion[m.OrgId] != 0 {
 			log.Infof("platform data version in ext-metrics-decoder %s-#%d changed from %d to %d",
 				d.msgType, d.index, d.platformDataVersion, platformDataVersion)
 		}
-		d.platformDataVersion = platformDataVersion
-		d.podNameToUniversalTag = make(map[string]*zerodoc.UniversalTag)
-		d.instanceIPToUniversalTag = make(map[string]*zerodoc.UniversalTag)
-		d.vtapIDToUniversalTag = make(map[uint16]*zerodoc.UniversalTag)
+		d.platformDataVersion[m.OrgId] = platformDataVersion
+		d.podNameToUniversalTag[m.OrgId] = make(map[string]*flow_metrics.UniversalTag)
+		d.instanceIPToUniversalTag[m.OrgId] = make(map[string]*flow_metrics.UniversalTag)
+		d.vtapIDToUniversalTag[m.OrgId] = make(map[uint16]*flow_metrics.UniversalTag)
 	} else {
 		if podName != "" {
-			universalTag, _ = d.podNameToUniversalTag[podName]
+			universalTag, _ = d.podNameToUniversalTag[m.OrgId][podName]
 		} else if fillWithVtapId {
-			universalTag, _ = d.vtapIDToUniversalTag[vtapID]
+			universalTag, _ = d.vtapIDToUniversalTag[m.OrgId][vtapID]
 		}
 		if universalTag != nil {
 			m.UniversalTag = *universalTag
@@ -260,12 +273,12 @@ func (d *Decoder) fillExtMetricsBase(m *dbwriter.ExtMetrics, vtapID uint16, podN
 	d.fillExtMetricsBaseSlow(m, vtapID, podName, fillWithVtapId)
 
 	// update fast path
-	universalTag = &zerodoc.UniversalTag{} // Since the cache dictionary will be cleaned up by GC, no need to use a pool here.
+	universalTag = &flow_metrics.UniversalTag{} // Since the cache dictionary will be cleaned up by GC, no need to use a pool here.
 	*universalTag = m.UniversalTag
 	if podName != "" {
-		d.podNameToUniversalTag[podName] = universalTag
+		d.podNameToUniversalTag[m.OrgId][podName] = universalTag
 	} else if fillWithVtapId {
-		d.vtapIDToUniversalTag[vtapID] = universalTag
+		d.vtapIDToUniversalTag[m.OrgId][vtapID] = universalTag
 	}
 }
 
@@ -275,7 +288,7 @@ func (d *Decoder) fillExtMetricsBaseSlow(m *dbwriter.ExtMetrics, vtapID uint16, 
 	t.L3EpcID = datatype.EPC_FROM_INTERNET
 	var ip net.IP
 	if podName != "" {
-		podInfo := d.platformData.QueryPodInfo(uint32(vtapID), podName)
+		podInfo := d.platformData.QueryPodInfo(m.OrgId, vtapID, podName)
 		if podInfo != nil {
 			t.PodClusterID = uint16(podInfo.PodClusterId)
 			t.PodID = podInfo.PodId
@@ -283,8 +296,8 @@ func (d *Decoder) fillExtMetricsBaseSlow(m *dbwriter.ExtMetrics, vtapID uint16, 
 			ip = net.ParseIP(podInfo.Ip)
 		}
 	} else if fillWithVtapId {
-		t.L3EpcID = d.platformData.QueryVtapEpc0(uint32(vtapID))
-		vtapInfo := d.platformData.QueryVtapInfo(uint32(vtapID))
+		t.L3EpcID = d.platformData.QueryVtapEpc0(m.OrgId, vtapID)
+		vtapInfo := d.platformData.QueryVtapInfo(m.OrgId, vtapID)
 		if vtapInfo != nil {
 			ip = net.ParseIP(vtapInfo.Ip)
 			t.PodClusterID = uint16(vtapInfo.PodClusterId)
@@ -305,9 +318,9 @@ func (d *Decoder) fillExtMetricsBaseSlow(m *dbwriter.ExtMetrics, vtapID uint16, 
 
 	var info *grpc.Info
 	if t.IsIPv6 == 1 {
-		info = d.platformData.QueryIPV6Infos(t.L3EpcID, t.IP6)
+		info = d.platformData.QueryIPV6Infos(m.OrgId, t.L3EpcID, t.IP6)
 	} else {
-		info = d.platformData.QueryIPV4Infos(t.L3EpcID, t.IP)
+		info = d.platformData.QueryIPV4Infos(m.OrgId, t.L3EpcID, t.IP)
 	}
 	if info != nil {
 		t.RegionID = uint16(info.RegionID)
@@ -319,7 +332,7 @@ func (d *Decoder) fillExtMetricsBaseSlow(m *dbwriter.ExtMetrics, vtapID uint16, 
 		t.PodNodeID = info.PodNodeID
 		t.SubnetID = uint16(info.SubnetID)
 		t.L3DeviceID = info.DeviceID
-		t.L3DeviceType = zerodoc.DeviceType(info.DeviceType)
+		t.L3DeviceType = flow_metrics.DeviceType(info.DeviceType)
 		if t.PodClusterID == 0 {
 			t.PodClusterID = uint16(info.PodClusterID)
 		}
@@ -328,10 +341,11 @@ func (d *Decoder) fillExtMetricsBaseSlow(m *dbwriter.ExtMetrics, vtapID uint16, 
 		}
 
 		if common.IsPodServiceIP(t.L3DeviceType, t.PodID, t.PodNodeID) {
-			t.ServiceID = d.platformData.QueryService(t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, 0, 0)
+			t.ServiceID = d.platformData.QueryPodService(m.OrgId, t.PodID, t.PodNodeID, uint32(t.PodClusterID), t.PodGroupID, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, 0, 0)
 		}
-		t.AutoInstanceID, t.AutoInstanceType = common.GetAutoInstance(t.PodID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), t.L3EpcID)
-		t.AutoServiceID, t.AutoServiceType = common.GetAutoService(t.ServiceID, t.PodGroupID, t.GPID, t.PodNodeID, t.L3DeviceID, uint8(t.L3DeviceType), podGroupType, t.L3EpcID)
+		t.AutoInstanceID, t.AutoInstanceType = common.GetAutoInstance(t.PodID, t.GPID, t.PodNodeID, t.L3DeviceID, uint32(t.SubnetID), uint8(t.L3DeviceType), t.L3EpcID)
+		customServiceID := d.platformData.QueryCustomService(m.OrgId, t.L3EpcID, t.IsIPv6 == 1, t.IP, t.IP6, 0)
+		t.AutoServiceID, t.AutoServiceType = common.GetAutoService(customServiceID, t.ServiceID, t.PodGroupID, t.GPID, uint32(t.PodClusterID), t.L3DeviceID, uint32(t.SubnetID), uint8(t.L3DeviceType), podGroupType, t.L3EpcID)
 	}
 }
 
@@ -341,6 +355,7 @@ func (d *Decoder) PointToExtMetrics(vtapID uint16, point models.Point) (*dbwrite
 	m.MsgType = datatype.MESSAGE_TYPE_TELEGRAF
 	tableName := string(point.Name())
 	m.VTableName = VTABLE_PREFIX_TELEGRAF + tableName
+	m.OrgId, m.TeamID = d.orgId, d.teamId
 	podName := ""
 	for _, tag := range point.Tags() {
 		tagName := string(tag.Key)

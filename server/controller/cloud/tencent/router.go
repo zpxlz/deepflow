@@ -21,11 +21,11 @@ import (
 
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getRouterAndTables(region tencentRegion) ([]model.VRouter, []model.RoutingTable, error) {
-	log.Debug("get routers and tables starting")
+func (t *Tencent) getRouterAndTables(region string) ([]model.VRouter, []model.RoutingTable, error) {
+	log.Debug("get routers and tables starting", logger.NewORGPrefix(t.orgID))
 	var routers []model.VRouter
 	var routerTables []model.RoutingTable
 	gwTypeToDesc := map[string]string{
@@ -42,9 +42,9 @@ func (t *Tencent) getRouterAndTables(region tencentRegion) ([]model.VRouter, []m
 
 	rAttrs := []string{"RouteTableId", "RouteTableName", "VpcId"}
 	rtAttrs := []string{"RouteId", "DestinationCidrBlock", "GatewayType", "GatewayId"}
-	rResp, err := t.getResponse("vpc", "2017-03-12", "DescribeRouteTables", region.name, "RouteTableSet", true, map[string]interface{}{})
+	rResp, err := t.getResponse("vpc", "2017-03-12", "DescribeRouteTables", region, "RouteTableSet", true, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("router request tencent api error: (%s)", err.Error())
+		log.Errorf("router request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.VRouter{}, []model.RoutingTable{}, err
 	}
 	for _, rData := range rResp {
@@ -52,13 +52,13 @@ func (t *Tencent) getRouterAndTables(region tencentRegion) ([]model.VRouter, []m
 			continue
 		}
 		rID := rData.Get("RouteTableId").MustString()
-		rLcuuid := common.GetUUID(rID, uuid.Nil)
+		rLcuuid := common.GetUUIDByOrgID(t.orgID, rID)
 		vpcID := rData.Get("VpcId").MustString()
 		routers = append(routers, model.VRouter{
 			Lcuuid:       rLcuuid,
 			Name:         rData.Get("RouteTableName").MustString(),
-			VPCLcuuid:    common.GetUUID(vpcID, uuid.Nil),
-			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),
+			VPCLcuuid:    common.GetUUIDByOrgID(t.orgID, vpcID),
+			RegionLcuuid: t.regionLcuuid,
 		})
 
 		routes := rData.Get("RouteSet")
@@ -89,7 +89,7 @@ func (t *Tencent) getRouterAndTables(region tencentRegion) ([]model.VRouter, []m
 
 			key := rLcuuid + strconv.Itoa(routeID)
 			routerTables = append(routerTables, model.RoutingTable{
-				Lcuuid:        common.GetUUID(key, uuid.Nil),
+				Lcuuid:        common.GetUUIDByOrgID(t.orgID, key),
 				VRouterLcuuid: rLcuuid,
 				Destination:   destination4 + destination6,
 				Nexthop:       gwID,
@@ -97,6 +97,6 @@ func (t *Tencent) getRouterAndTables(region tencentRegion) ([]model.VRouter, []m
 			})
 		}
 	}
-	log.Debug("get routers and tables complete")
+	log.Debug("get routers and tables complete", logger.NewORGPrefix(t.orgID))
 	return routers, routerTables, nil
 }

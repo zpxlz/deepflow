@@ -19,17 +19,17 @@ package tencent
 import (
 	"github.com/deepflowio/deepflow/server/controller/cloud/model"
 	"github.com/deepflowio/deepflow/server/controller/common"
-	uuid "github.com/satori/go.uuid"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-func (t *Tencent) getVPCs(region tencentRegion) ([]model.VPC, error) {
-	log.Debug("get vpcs starting")
+func (t *Tencent) getVPCs(region string) ([]model.VPC, error) {
+	log.Debug("get vpcs starting", logger.NewORGPrefix(t.orgID))
 	var vpcs []model.VPC
 
 	attrs := []string{"VpcId", "VpcName", "CidrBlock"}
-	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeVpcs", region.name, "VpcSet", true, map[string]interface{}{})
+	resp, err := t.getResponse("vpc", "2017-03-12", "DescribeVpcs", region, "VpcSet", true, map[string]interface{}{})
 	if err != nil {
-		log.Errorf("vpc request tencent api error: (%s)", err.Error())
+		log.Errorf("vpc request tencent api error: (%s)", err.Error(), logger.NewORGPrefix(t.orgID))
 		return []model.VPC{}, err
 	}
 	for _, vData := range resp {
@@ -38,14 +38,13 @@ func (t *Tencent) getVPCs(region tencentRegion) ([]model.VPC, error) {
 		}
 		vpcID := vData.Get("VpcId").MustString()
 		vpcs = append(vpcs, model.VPC{
-			Lcuuid:       common.GetUUID(vpcID, uuid.Nil),
+			Lcuuid:       common.GetUUIDByOrgID(t.orgID, vpcID),
 			Name:         vData.Get("VpcName").MustString(),
 			CIDR:         vData.Get("CidrBlock").MustString(),
 			Label:        vpcID,
-			RegionLcuuid: t.getRegionLcuuid(region.lcuuid),
+			RegionLcuuid: t.regionLcuuid,
 		})
-		t.vpcIDToRegionLcuuid[vpcID] = t.getRegionLcuuid(region.lcuuid)
 	}
-	log.Debug("get vpcs complete")
+	log.Debug("get vpcs complete", logger.NewORGPrefix(t.orgID))
 	return vpcs, nil
 }

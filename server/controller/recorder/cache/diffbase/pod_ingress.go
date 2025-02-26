@@ -19,10 +19,10 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func (b *DataSet) AddPodIngress(dbItem *mysql.PodIngress, seq int) {
+func (b *DataSet) AddPodIngress(dbItem *metadbmodel.PodIngress, seq int) {
 	b.PodIngresses[dbItem.Lcuuid] = &PodIngress{
 		DiffBase: DiffBase{
 			Sequence: seq,
@@ -33,12 +33,12 @@ func (b *DataSet) AddPodIngress(dbItem *mysql.PodIngress, seq int) {
 		AZLcuuid:        dbItem.AZ,
 		SubDomainLcuuid: dbItem.SubDomain,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, b.PodIngresses[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, b.PodIngresses[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeletePodIngress(lcuuid string) {
 	delete(b.PodIngresses, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_POD_INGRESS_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type PodIngress struct {

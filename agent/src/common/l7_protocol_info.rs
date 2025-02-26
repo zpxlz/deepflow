@@ -16,7 +16,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{flow::PacketDirection, l7_protocol_log::KafkaInfoCache};
+use super::flow::PacketDirection;
 use enum_dispatch::enum_dispatch;
 use log::{debug, error, warn};
 use serde::Serialize;
@@ -25,9 +25,10 @@ use crate::{
     common::l7_protocol_log::LogCache,
     flow_generator::{
         protocol_logs::{
-            fastcgi::FastCGIInfo, pb_adapter::L7ProtocolSendLog, DnsInfo, DubboInfo, HttpInfo,
-            KafkaInfo, MongoDBInfo, MqttInfo, MysqlInfo, OracleInfo, PostgreInfo, RedisInfo,
-            SofaRpcInfo, TlsInfo,
+            fastcgi::FastCGIInfo, pb_adapter::L7ProtocolSendLog, AmqpInfo, BrpcInfo, DnsInfo,
+            DubboInfo, HttpInfo, KafkaInfo, MemcachedInfo, MongoDBInfo, MqttInfo, MysqlInfo,
+            NatsInfo, OpenWireInfo, PingInfo, PostgreInfo, PulsarInfo, RedisInfo, RocketmqInfo,
+            SofaRpcInfo, TarsInfo, ZmtpInfo,
         },
         AppProtoHead, LogMessageType, Result,
     },
@@ -37,7 +38,7 @@ use crate::{
 use super::{ebpf::EbpfType, l7_protocol_log::ParseParam};
 
 macro_rules! all_protocol_info {
-    ($($name:ident($info_struct:ident)),+$(,)?) => {
+    ($($name:ident($info_struct:ty)),+$(,)?) => {
 
         #[derive(Serialize, Debug, Clone)]
         #[enum_dispatch]
@@ -60,23 +61,64 @@ macro_rules! all_protocol_info {
     };
 }
 
-all_protocol_info!(
-    DnsInfo(DnsInfo),
-    HttpInfo(HttpInfo),
-    MysqlInfo(MysqlInfo),
-    RedisInfo(RedisInfo),
-    MongoDBInfo(MongoDBInfo),
-    DubboInfo(DubboInfo),
-    FastCGIInfo(FastCGIInfo),
-    KafkaInfo(KafkaInfo),
-    MqttInfo(MqttInfo),
-    PostgreInfo(PostgreInfo),
-    OracleInfo(OracleInfo),
-    SofaRpcInfo(SofaRpcInfo),
-    TlsInfo(TlsInfo),
-    CustomInfo(CustomInfo),
-    // add new protocol info below
-);
+cfg_if::cfg_if! {
+    if #[cfg(not(feature = "enterprise"))] {
+        all_protocol_info!(
+            DnsInfo(DnsInfo),
+            HttpInfo(HttpInfo),
+            MysqlInfo(MysqlInfo),
+            RedisInfo(RedisInfo),
+            MongoDBInfo(MongoDBInfo),
+            MemcachedInfo(MemcachedInfo),
+            DubboInfo(DubboInfo),
+            FastCGIInfo(FastCGIInfo),
+            BrpcInfo(BrpcInfo),
+            TarsInfo(TarsInfo),
+            KafkaInfo(KafkaInfo),
+            MqttInfo(MqttInfo),
+            AmqpInfo(AmqpInfo),
+            NatsInfo(NatsInfo),
+            PulsarInfo(PulsarInfo),
+            ZmtpInfo(ZmtpInfo),
+            RocketmqInfo(RocketmqInfo),
+            PostgreInfo(PostgreInfo),
+            OpenWireInfo(OpenWireInfo),
+            SofaRpcInfo(SofaRpcInfo),
+            PingInfo(PingInfo),
+            CustomInfo(CustomInfo),
+            // add new protocol info below
+        );
+    } else {
+        all_protocol_info!(
+            DnsInfo(DnsInfo),
+            HttpInfo(HttpInfo),
+            MysqlInfo(MysqlInfo),
+            RedisInfo(RedisInfo),
+            MongoDBInfo(MongoDBInfo),
+            MemcachedInfo(MemcachedInfo),
+            DubboInfo(DubboInfo),
+            FastCGIInfo(FastCGIInfo),
+            BrpcInfo(BrpcInfo),
+            TarsInfo(TarsInfo),
+            KafkaInfo(KafkaInfo),
+            MqttInfo(MqttInfo),
+            AmqpInfo(AmqpInfo),
+            NatsInfo(NatsInfo),
+            PulsarInfo(PulsarInfo),
+            ZmtpInfo(ZmtpInfo),
+            RocketmqInfo(RocketmqInfo),
+            PostgreInfo(PostgreInfo),
+            OpenWireInfo(OpenWireInfo),
+            OracleInfo(crate::flow_generator::protocol_logs::sql::OracleInfo),
+            SofaRpcInfo(SofaRpcInfo),
+            TlsInfo(crate::flow_generator::protocol_logs::tls::TlsInfo),
+            SomeIpInfo(crate::flow_generator::protocol_logs::rpc::SomeIpInfo),
+            PingInfo(PingInfo),
+            CustomInfo(CustomInfo),
+            // add new protocol info below
+        );
+    }
+}
 
 #[enum_dispatch(L7ProtocolInfo)]
 pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
@@ -96,6 +138,10 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     fn get_endpoint(&self) -> Option<String> {
         None
+    }
+
+    fn get_biz_type(&self) -> u8 {
+        0
     }
 
     fn skip_send(&self) -> bool {
@@ -128,10 +174,17 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
             None => {
                 ((param.flow_id as u128) << 64)
                     | (if param.ebpf_type != EbpfType::None {
+                        // NOTE:
+                        //   In the request-log session aggregation process, for eBPF data, we require that requests and
+                        // responses have consecutive cap_seq to ensure the correctness of session aggregation. However,
+                        // when SR (Segmentation-Reassembly) is enabled, we combine multiple eBPF socket event events
+                        // before parsing the protocol. Therefore, in order to ensure that session aggregation can still
+                        // be performed correctly, we need to retain the cap_seq of the last request and the cap_seq of
+                        // the first response, so that the cap_seq of the request and response can still be consecutive.
                         if param.direction == PacketDirection::ClientToServer {
-                            param.packet_seq + 1
+                            param.packet_end_seq + 1
                         } else {
-                            param.packet_seq
+                            param.packet_start_seq
                         }
                     } else {
                         0
@@ -152,7 +205,7 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
         if have no previous log cache, cache the current log rrt
     */
-    fn cal_rrt(&self, param: &ParseParam, kafka_info: Option<KafkaInfoCache>) -> Option<u64> {
+    fn cal_rrt(&self, param: &ParseParam) -> Option<u64> {
         let mut perf_cache = param.l7_perf_cache.borrow_mut();
         let cache_key = self.cal_cache_key(param);
         let previous_log_info = perf_cache.rrt_cache.pop(&cache_key);
@@ -175,7 +228,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                     LogCache {
                         msg_type: param.direction.into(),
                         time: param.time,
-                        kafka_info,
                         multi_merge_info: None,
                     },
                 );
@@ -209,7 +261,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                         LogCache {
                             msg_type: param.direction.into(),
                             time: param.time,
-                            kafka_info,
                             multi_merge_info: None,
                         },
                     );
@@ -262,7 +313,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                         LogCache {
                             msg_type: param.direction.into(),
                             time: param.time,
-                            kafka_info,
                             multi_merge_info: None,
                         },
                     );
@@ -321,7 +371,6 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
                 LogCache {
                     msg_type: param.direction.into(),
                     time: param.time,
-                    kafka_info: None,
                     multi_merge_info: Some((req_end, resp_end, false)),
                 },
             );
@@ -405,6 +454,18 @@ pub trait L7ProtocolInfoInterface: Into<L7ProtocolSendLog> {
 
     fn tcp_seq_offset(&self) -> u32 {
         return 0;
+    }
+
+    fn get_request_domain(&self) -> String {
+        String::default()
+    }
+
+    fn get_request_resource_length(&self) -> usize {
+        0
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        false
     }
 }
 

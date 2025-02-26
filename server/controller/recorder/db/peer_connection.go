@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type PeerConnection struct {
-	OperatorBase[mysql.PeerConnection]
+	OperatorBase[*metadbmodel.PeerConnection, metadbmodel.PeerConnection]
 }
 
 func NewPeerConnection() *PeerConnection {
 	operater := &PeerConnection{
-		OperatorBase[mysql.PeerConnection]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN,
-			softDelete:       true,
-			allocateID:       false,
-		},
+		newOperatorBase[*metadbmodel.PeerConnection](
+			ctrlrcommon.RESOURCE_TYPE_PEER_CONNECTION_EN,
+			true,
+			false,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *PeerConnection) setDBItemID(dbItem *mysql.PeerConnection, id int) {
-	dbItem.ID = id
 }

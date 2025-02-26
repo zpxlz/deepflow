@@ -15,19 +15,21 @@
  */
 
 extern crate libc;
+extern crate trace_utils;
 
 pub use libc::c_char;
 pub use libc::c_int;
 pub use libc::c_uchar; // u8
 pub use libc::c_uint; // u32
 pub use libc::c_ulonglong;
+pub use libc::c_void;
 use log::info;
 pub use std::ffi::CStr;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 // 最大长度
-pub const CAP_LEN_MAX: usize = 8192;
+pub const CAP_LEN_MAX: usize = 16384;
 
 // process_kname is up to 16 bytes, if the length of process_kname exceeds 15, the ending char is '\0'
 pub const PACKET_KNAME_MAX_PADDING: usize = 15;
@@ -59,6 +61,12 @@ pub const SOCK_DATA_SOFARPC: u16 = 43;
 #[allow(dead_code)]
 pub const SOCK_DATA_FASTCGI: u16 = 44;
 #[allow(dead_code)]
+pub const SOCK_DATA_BRPC: u16 = 45;
+#[allow(dead_code)]
+pub const SOCK_DATA_TARS: u16 = 46;
+#[allow(dead_code)]
+pub const SOCK_DATA_SOME_IP: u16 = 47;
+#[allow(dead_code)]
 pub const SOCK_DATA_MYSQL: u16 = 60;
 #[allow(dead_code)]
 pub const SOCK_DATA_POSTGRESQL: u16 = 61;
@@ -69,21 +77,47 @@ pub const SOCK_DATA_REDIS: u16 = 80;
 #[allow(dead_code)]
 pub const SOCK_DATA_MONGO: u16 = 81;
 #[allow(dead_code)]
+pub const SOCK_DATA_MEMCACHED: u16 = 82;
+#[allow(dead_code)]
 pub const SOCK_DATA_KAFKA: u16 = 100;
 #[allow(dead_code)]
 pub const SOCK_DATA_MQTT: u16 = 101;
 #[allow(dead_code)]
+pub const SOCK_DATA_AMQP: u16 = 102;
+#[allow(dead_code)]
+pub const SOCK_DATA_OPENWIRE: u16 = 103;
+#[allow(dead_code)]
+pub const SOCK_DATA_NATS: u16 = 104;
+#[allow(dead_code)]
+pub const SOCK_DATA_PULSAR: u16 = 105;
+#[allow(dead_code)]
+pub const SOCK_DATA_ZMTP: u16 = 106;
+#[allow(dead_code)]
+pub const SOCK_DATA_ROCKETMQ: u16 = 107;
+#[allow(dead_code)]
 pub const SOCK_DATA_DNS: u16 = 120;
 #[allow(dead_code)]
 pub const SOCK_DATA_TLS: u16 = 121;
+#[allow(dead_code)]
+pub const SOCK_DATA_CUSTOM: u16 = 127;
 
 // Feature
 #[allow(dead_code)]
-pub const FEATURE_UPROBE_GOLANG_SYMBOL: c_int = 0;
+pub const FEATURE_UPROBE_GOLANG_SYMBOL: c_int = 1;
 #[allow(dead_code)]
-pub const FEATURE_UPROBE_OPENSSL: c_int = 1;
+pub const FEATURE_UPROBE_OPENSSL: c_int = 2;
 #[allow(dead_code)]
-pub const FEATURE_UPROBE_GOLANG: c_int = 2;
+pub const FEATURE_UPROBE_GOLANG: c_int = 3;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_ONCPU: c_int = 4;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_OFFCPU: c_int = 5;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_MEMORY: c_int = 6;
+#[allow(dead_code)]
+pub const FEATURE_SOCKET_TRACER: c_int = 7;
+#[allow(dead_code)]
+pub const FEATURE_DWARF_UNWINDING: c_int = 8;
 
 //L7层协议是否需要重新核实
 #[allow(dead_code)]
@@ -118,10 +152,25 @@ pub const DATA_SOURCE_GO_HTTP2_UPROBE: u8 = 2;
 pub const DATA_SOURCE_OPENSSL_UPROBE: u8 = 3;
 #[allow(dead_code)]
 pub const DATA_SOURCE_IO_EVENT: u8 = 4;
+#[allow(dead_code)]
+pub const DATA_SOURCE_GO_HTTP2_DATAFRAME_UPROBE: u8 = 5;
+#[allow(dead_code)]
+pub const DATA_SOURCE_CLOSE: u8 = 6;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "extended_observability")] {
+        #[allow(dead_code)]
+        pub const DATA_SOURCE_DPDK: u8 = 7;
+        #[allow(dead_code)]
+        pub const DPDK_HOOK_TYPE_RECV: u8 = 0;
+        #[allow(dead_code)]
+        pub const DPDK_HOOK_TYPE_XMIT: u8 = 1;
+    }
+}
 
-// 消息类型
-// 目前除了 source=EBPF_TYPE_GO_HTTP2_UPROBE 以外,都不能保证这个方向的正确性.
-// go http2 uprobe 目前 只用了MSG_RESPONSE_END, 用于判断流结束.
+// Message types
+// Currently, except for source=EBPF_TYPE_GO_HTTP2_UPROBE,
+// the correctness of this direction cannot be guaranteed.
+// The go http2 uprobe currently only uses MSG_RESPONSE_END to determine the end of the stream.
 #[allow(dead_code)]
 pub const MSG_REQUEST: u8 = 1;
 #[allow(dead_code)]
@@ -130,12 +179,41 @@ pub const MSG_RESPONSE: u8 = 2;
 pub const MSG_REQUEST_END: u8 = 3;
 #[allow(dead_code)]
 pub const MSG_RESPONSE_END: u8 = 4;
+// The start of data reassembly.
+#[allow(dead_code)]
+pub const MSG_REASM_START: u8 = 5;
+// The segment of data reassembly.
+#[allow(dead_code)]
+pub const MSG_REASM_SEG: u8 = 6;
+// When the message type obtained by eBPF cannot accurately
+// indicate a request or response, it should be uniformly
+// set to 'MSG_COMMON'.
+#[allow(dead_code)]
+pub const MSG_COMMON: u8 = 7;
 
 //Register event types
 #[allow(dead_code)]
-pub const EVENT_TYPE_PROC_EXEC: u32 = 1 << 5;
+pub const EVENT_TYPE_PROC_EXEC: u32 = 1 << 9;
 #[allow(dead_code)]
-pub const EVENT_TYPE_PROC_EXIT: u32 = 1 << 6;
+pub const EVENT_TYPE_PROC_EXIT: u32 = 1 << 10;
+
+// Profiler types
+#[allow(dead_code)]
+pub const PROFILER_TYPE_UNKNOWN: u8 = 0;
+#[allow(dead_code)]
+pub const PROFILER_TYPE_ONCPU: u8 = 1;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "extended_observability")] {
+        #[allow(dead_code)]
+        pub const PROFILER_TYPE_OFFCPU: u8 = 2;
+        #[allow(dead_code)]
+        pub const PROFILER_TYPE_MEMORY: u8 = 3;
+    }
+}
+
+#[cfg(feature = "extended_observability")]
+pub const PROFILER_CTX_MEMORY_IDX: usize = 2;
+pub const PROFILER_CTX_NUM: usize = 3;
 
 //Process exec/exit events
 #[repr(C)]
@@ -211,15 +289,13 @@ pub struct SK_BPF_DATA {
     pub syscall_trace_id_call: u64,
 
     /* data info */
-    pub timestamp: u64, // cap_data获取的时间戳（从1970.1.1开始到数据捕获时的时间间隔，精度为微妙）
+    pub timestamp: u64, // cap_data获取的时间戳（从1970.1.1开始到数据捕获时的时间间隔，精度为纳秒）
     pub direction: u8,  // 数据的收发方向，值是 SOCK_DIR_SND/SOCK_DIR_RCV
 
     /*
      * 说明：
      *
-     * 当syscall读写数据过大时，eBPF并不会读取所有数据而是有一个最大读取数据大小的限制，
-     * 这个长度限制是512字节。
-     *
+     * 当syscall读写数据过大时，eBPF并不会读取所有数据而是有一个最大读取数据大小的限制
      */
     pub syscall_len: u64,      // 本次系统调用读、写数据的总长度
     pub cap_len: u32,          // 返回的cap_data长度
@@ -258,13 +334,7 @@ impl fmt::Display for SK_BPF_DATA {
             (self.tuple.rport, self.tuple.lport)
         };
         unsafe {
-            #[cfg(target_arch = "aarch64")]
-            let process_kname = CStr::from_ptr(self.process_kname.as_ptr() as *const u8)
-                .to_str()
-                .unwrap();
-
-            #[cfg(target_arch = "x86_64")]
-            let process_kname = CStr::from_ptr(self.process_kname.as_ptr() as *const i8)
+            let process_kname = CStr::from_ptr(self.process_kname.as_ptr() as *const c_char)
                 .to_str()
                 .unwrap();
 
@@ -348,13 +418,34 @@ pub struct SK_TRACE_STATS {
     pub probes_count: u32,
     // Maximum length limit of eBPF data transmission
     pub data_limit_max: u32,
+
+    /*
+     * When the periodic push event detects that the buffer is being modified by
+     * another eBPF program, a conflict will occur. This is used to record the
+     * number of conflicts.
+     */
+    pub period_push_conflict_count: u64,
+    pub period_push_max_delay: u64, // The maximum latency time for periodic push events, in microseconds.
+    pub period_push_avg_delay: u64, // The average latency time for periodic push events, in microseconds.
+    pub proc_exec_event_count: u64, // The number of events for process execute.
+    pub proc_exit_event_count: u64, // The number of events for process exits.
+
+    // Captured packet statistics
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub dropped_packets: u64,
+    pub kern_missed_packets: u64,
+    pub invalid_packets: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct stack_profile_data {
-    pub timestamp: u64, // Timestamp of the stack trace data(unit: nanoseconds).
-    pub pid: u32,       // User-space process-ID.
+    pub profiler_type: u8, // Profiler type, such as 1(PROFILER_TYPE_ONCPU).
+    pub timestamp: u64,    // Timestamp of the stack trace data(unit: nanoseconds).
+    pub pid: u32,          // User-space process-ID.
     /*
      * Identified within the eBPF program in kernel space.
      * If the current is a process and not a thread this field(tid) is filled
@@ -367,11 +458,18 @@ pub struct stack_profile_data {
     pub k_stack_id: u32, // Kernel space stackID.
     pub cpu: u32,        // The captured stack trace data is generated on which CPU?
     /*
-     * The profiler captures the number of occurrences of the same
+     * If profiler_type is PROFILER_TYPE_MEMORY, this is allocated or free'd address.
+     * Or 0 for java processes
+     */
+    pub mem_addr: u64,
+    /*
+     * The profiler captures the sum of durations of occurrences of the same
      * data by querying with the quadruple
      * "<pid + stime + u_stack_id + k_stack_id + tid + cpu>" as the key.
+     * In microseconds as the unit of time.
+     * If profiler_type is PROFILER_TYPE_MEMORY, this is allocated byte count value, or 0 for frees
      */
-    pub count: u32,
+    pub count: u64,
     /*
      * comm in task_struct(linux kernel), always 16 bytes
      * If the capture is a process, fill in the process name here.
@@ -396,7 +494,7 @@ pub struct stack_profile_data {
 
 extern "C" {
     /*
-     * Set maximum amount of data passed to the agent by eBPF programe.
+     * Set maximum amount of data passed to the agent by eBPF program.
      * @limit_size : The maximum length of data. If @limit_size exceeds 8192,
      *               it will automatically adjust to 8192 bytes.
      *               If limit_size is 0, use the default values 4096.
@@ -410,7 +508,18 @@ extern "C" {
     pub fn set_allow_port_bitmap(bitmap: *const c_uchar) -> c_int;
     pub fn set_bypass_port_bitmap(bitmap: *const c_uchar) -> c_int;
     pub fn enable_ebpf_protocol(protocol: c_int) -> c_int;
+    pub fn enable_ebpf_seg_reasm_protocol(protocol: c_int) -> c_int;
     pub fn set_feature_regex(idx: c_int, pattern: *const c_char) -> c_int;
+    /*
+     * @brief Add regex-matched process list for feature.
+     *
+     * @param feature Refers to a specific feature module, value: FEATURE_*
+     * @param pids Address of the process list
+     * @param num Number of elements in the process list
+     * @return 0 on success, non-zero on error
+     */
+    pub fn set_feature_pids(feature: c_int, pids: *const c_int, num: c_int) -> c_int;
+
     /*
      * Configuring application layer protocol ports
      *
@@ -448,13 +557,13 @@ extern "C" {
     //   is_stdout 日志是否输出到标准输出，true 写到标准输出，false 不写到标准输出。
     // 返回值：
     //   成功返回0，否则返回非0
-    #[cfg(target_arch = "x86_64")]
-    pub fn bpf_tracer_init(log_file: *const i8, is_stdout: bool) -> c_int;
-    #[cfg(target_arch = "aarch64")]
-    pub fn bpf_tracer_init(log_file: *const u8, is_stdout: bool) -> c_int;
+    pub fn bpf_tracer_init(log_file: *const c_char, is_stdout: bool) -> c_int;
 
     // 所有tracer启动完毕后，最后显示调用bpf_tracer_finish()来通知主程序
     pub fn bpf_tracer_finish();
+
+    pub fn set_uprobe_golang_enabled(enabled: bool) -> c_void;
+    pub fn set_uprobe_openssl_enabled(enabled: bool) -> c_void;
 
     // 获取socket_tracer的这种统计数据的接口
     pub fn socket_tracer_stats() -> SK_TRACE_STATS;
@@ -468,6 +577,11 @@ extern "C" {
         callback: extern "C" fn(data: *mut PROCESS_EVENT),
     ) -> c_int;
 
+    // Set whether to pre-allocate memory when creating a map?
+    // @enabled : true Pre-allocate memory when defining a BPF hash map
+    //            false Define a map without preallocated memory
+    pub fn set_bpf_map_prealloc(enabled: bool) -> c_void;
+
     // 参数说明：
     // callback: 回调接口 rust -> C
     // thread_nr: 工作线程数，是指用户态有多少线程参与数据处理。
@@ -478,7 +592,7 @@ extern "C" {
     // socket_map_max_reclaim: socket map表项进行清理的最大阈值，当前map的表项数量超过这个值进行map清理操作。
     // 返回值：成功返回0，否则返回非0
     pub fn running_socket_tracer(
-        callback: extern "C" fn(sd: *mut SK_BPF_DATA),
+        callback: extern "C" fn(_: *mut c_void, sd: *mut SK_BPF_DATA),
         thread_nr: c_int,
         perf_pages_cnt: c_uint,
         ring_size: c_uint,
@@ -501,69 +615,33 @@ extern "C" {
     /*
      * start continuous profiler
      * @freq sample frequency, Hertz. (e.g. 99 profile stack traces at 99 Hertz)
-     * @java_syms_space_limit The maximum space occupied by the Java symbol files
-     *   in the '/' directory of the target POD container.The recommended range for
-     *   values is [2, 100], which means it falls within the interval of 2Mi to 100Mi.
-     *   If the configuration value is outside this range, the default value of
-     *   10(10Mi), will be used.
      * @java_syms_update_delay To allow Java to run for an extended period and gather
      *   more symbol information, we delay symbol retrieval when encountering unknown
      *   symbols. The unit of measurement used is seconds.
      *   The recommended range for values is [5, 3600], default valuse is 60.
      * @callback Profile data processing callback interface
+     * @callback_ctx Contexts to pass into callback function from different profiler readers.
+     *               Accesses to each context is single threaded.
      * @returns 0 on success, < 0 on error
      */
     pub fn start_continuous_profiler(
         freq: c_int,
-        java_syms_space_limit: c_int,
         java_syms_update_delay: c_int,
-        callback: extern "C" fn(_data: *mut stack_profile_data),
+        callback: extern "C" fn(ctx: *mut c_void, _data: *mut stack_profile_data),
+        callback_ctx: *const [*mut c_void; PROFILER_CTX_NUM],
     ) -> c_int;
 
     /*
      * stop continuous profiler
+     * @callback_ctx Return the contexts provided from `start_continuous_profiler` for memory releasing.
      * @returns 0 on success, < 0 on error
      */
-    pub fn stop_continuous_profiler() -> c_int;
+    pub fn stop_continuous_profiler(callback_ctx: *mut [*mut c_void; PROFILER_CTX_NUM]) -> c_int;
 
     /*
-     * To set the regex matching for the profiler.
-     *
-     * Perform regular expression matching on process names.
-     * Processes that successfully match the regular expression are
-     * aggregated using the key:
-     *     `{pid + stime + u_stack_id + k_stack_id + tid + cpu}`.
-     *
-     * For processes that do not match, they are aggregated using the
-     * key:
-     *     `<process name + u_stack_id + k_stack_id + cpu>`.
-     *
-     * Using regular expressions, we match process names to establish
-     * symbol table caching for specific processes, rather than enabling
-     * symbol caching for all processes. This approach aims to reduce
-     * memory usage.
-     *
-     * For example:
-     *
-     *  "^(java|nginx|profiler|telegraf|mysqld|socket_tracer|.*deepflow.*)$"
-     *
-     * This regex pattern matches the process names: "java", "nginx", "profiler",
-     * "telegraf", "mysqld", "socket_tracer", and any process containing the
-     * substring "deepflow".
-     *
-     * By using this interface, you can customize the regular expression to
-     * match specific process names that you want to establish symbol table
-     * caching for, providing flexibility and control over which processes will
-     * have symbol caching enabled. This allows you to finetune the memory usage
-     * and profiling behavior of the profiler according to your requirements.
-     *
-     * The default expression is empty (''), indicating that no profile data will
-     * be generated.
-     *
-     * @pattern : Regular expression pattern. e.g. "^(java|nginx|.*ser.*)$"
-     * @returns 0 on success, < 0 on error
+     * Continuous profiler running state
      */
-    pub fn set_profiler_regex(pattern: *const c_char) -> c_int;
+    pub fn continuous_profiler_running() -> bool;
 
     /*
      * This interface is used to set whether CPUID should be included in the
@@ -633,10 +711,131 @@ extern "C" {
         timeout: c_int,
         callback: extern "C" fn(data: *mut c_char, len: c_int),
     ) -> c_int;
+
+    pub fn enable_oncpu_profiler() -> c_int;
+    pub fn disable_oncpu_profiler() -> c_int;
+    pub fn show_collect_pool();
+    pub fn disable_syscall_trace_id() -> c_int;
+
+    pub fn dwarf_available() -> bool;
+    /*
+     * DWARF unwinding related settings.
+     * Be advised that these settings are only effective before
+     * calling `start_continuous_profiler` except for `set_dwarf_regex`.
+     */
+    pub fn get_dwarf_enabled() -> bool;
+    pub fn set_dwarf_enabled(enabled: bool) -> c_void;
+    pub fn set_dwarf_regex(pattern: *const c_char) -> c_int;
+    pub fn get_dwarf_process_map_size() -> c_int;
+    pub fn set_dwarf_process_map_size(size: c_int) -> c_void;
+    pub fn get_dwarf_shard_map_size() -> c_int;
+    pub fn set_dwarf_shard_map_size(size: c_int) -> c_void;
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "extended_observability")] {
+            pub fn enable_offcpu_profiler() -> c_int;
+
+            pub fn disable_offcpu_profiler() -> c_int;
+
+            pub fn set_offcpu_cpuid_aggregation(flag: c_int) -> c_int;
+
+            pub fn set_offcpu_minblock_time(
+                block_time: c_uint,
+            ) -> c_int;
+
+            pub fn enable_memory_profiler() -> c_int;
+
+            pub fn disable_memory_profiler() -> c_int;
+
+            /**
+             * @brief **set_dpdk_trace_enabled()** DPDK tracing feature enable switch.
+             *
+             * Note: The call must be executed before `running_socket_tracer()` because
+             * `set_dpdk_trace_enabled()` may need to adjust the eBPF maps before loading
+             * the eBPF program. The eBPF program loading process is implemented within
+             * `running_socket_tracer()`.
+             *
+             * @param enabled Used to control whether to enable this feature.
+             *   'true': enbaled; 'false': disabled
+             * @return 0 on success, non-zero on error
+             */
+            pub fn set_dpdk_trace_enabled(enabled: bool) -> c_int;
+
+            /**
+             * @brief **set_dpdk_cmd_name()** Set the command line name of the DPDK application.
+             *
+             * Note: The call must be executed before `dpdk_trace_start()`
+             *
+             * @param name Command name. For example, in the command line '/usr/bin/mydpdk',
+             *   the name selected is the part after the last '/', i.e., 'mydpdk'.
+             *
+             * @return 0 on success, non-zero on error
+             */
+             pub fn set_dpdk_cmd_name(name: *const c_char) -> c_int;
+
+             /**
+              * @brief **set_dpdk_hooks()** Set all DPDK hook points tracked by eBPF.
+              *
+              * Note: The call must be executed before `dpdk_trace_start()`
+              *
+              * @param fucs The list of tracked interfaces,
+              *   for example: i40e_recv_pkts,i40e_xmit_pkts,ixgbe_recv_pkts,ixgbe_xmit_pkts
+              * @param type Is DPDK_HOOK_TYPE_RECV or DPDK_HOOK_TYPE_XMIT, Indicates whether
+              *   it is receiving or transmitting packets.
+              *
+              * @return 0 on success, non-zero on error
+              */
+             pub fn set_dpdk_hooks(func_type: c_int, funcs: *const c_char) -> c_int;
+
+             /**
+              * @brief **dpdk_trace_start()** Start the DPDK tracing module.
+              *
+              * @return 0 on success, non-zero on error
+              */
+             pub fn dpdk_trace_start() -> c_int;
+
+             /**
+              * @brief **dpdk_trace_stop()** Stop the DPDK tracing module.
+              *
+              * @return 0 on success, non-zero on error
+              */
+              pub fn dpdk_trace_stop() -> c_int;
+
+              /**
+               * @brief Sets the eBPF program for the fanout group of a PACKET socket.
+               *
+               * In the af_packet fanout mode, multiple sockets share the same fanout_group_id.
+               * Correspondingly, multiple `struct packet_sock` in the kernel point to the same
+               * `struct packet_fanout`. The `packet_fanout` structure contains the address of
+               * the eBPF program. This means that by setting the eBPF program for one of the raw
+               * sockets in the fanout group, we don't need to set the program for all the sockets.
+               *
+               * When closing a PACKET socket, `packet_release()` will call `fanout_release(sk)`.
+               *
+               * @note The `group_id` parameter is considered for future use when extending to
+               *       support multiple groups using different eBPF programs.
+               *
+               * @param socket The file descriptor of the socket to which the eBPF program will be set.
+               * @param group_id The fanout group ID, used for managing multiple groups in the future.
+               *
+               * @return 0 on success, -1 on failure.
+               */
+               pub fn set_socket_fanout_ebpf(socket: c_int, group_id: c_int) -> c_int;
+        }
+    }
 }
 
 #[no_mangle]
 extern "C" fn rust_info_wrapper(msg: *const libc::c_char) {
-    let msg_str: &str = unsafe { std::ffi::CStr::from_ptr(msg).to_str().unwrap() };
-    info!("{}", msg_str);
+    unsafe {
+        let cstr = std::ffi::CStr::from_ptr(msg);
+        match cstr.to_str() {
+            Ok(s) => info!("{}", s),
+            Err(e) => {
+                let bs = cstr.to_bytes();
+                let (valid, after_valid) = (&bs[..e.valid_up_to()], &bs[e.valid_up_to()..]);
+                info!("{} {:?}", std::str::from_utf8_unchecked(valid), after_valid);
+            }
+        }
+    }
 }

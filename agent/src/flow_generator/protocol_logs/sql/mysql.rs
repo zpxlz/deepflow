@@ -16,6 +16,9 @@
 
 mod comment_parser;
 
+use std::str;
+
+use log::{debug, trace};
 use serde::Serialize;
 
 use super::super::{consts::*, value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType};
@@ -23,25 +26,30 @@ use super::sql_check::{is_mysql, is_valid_sql, trim_head_comment_and_get_first_w
 use super::sql_obfuscate::attempt_obfuscation;
 use super::ObfuscateCache;
 
-use crate::common::flow::L7PerfStats;
-use crate::common::l7_protocol_log::L7ParseResult;
-use crate::flow_generator::protocol_logs::pb_adapter::TraceInfo;
+use crate::flow_generator::protocol_logs::set_captured_byte;
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::L7Protocol,
-        flow::PacketDirection,
+        flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
         meta_packet::EbpfFlags,
     },
+    config::handler::{L7LogDynamicConfig, LogParserConfig},
     flow_generator::{
         error::{Error, Result},
-        protocol_logs::pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
+        protocol_logs::pb_adapter::{
+            ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+        },
     },
     utils::bytes,
 };
 use public::bytes::read_u32_le;
+use public::l7_protocol::L7ProtocolChecker;
+
+const SERVER_STATUS_CODE_MIN: u16 = 1000;
+const CLIENT_STATUS_CODE_MIN: u16 = 2000;
+const CLIENT_STATUS_CODE_MAX: u16 = 2999;
 
 #[derive(Serialize, Debug, Default, Clone)]
 pub struct MysqlInfo {
@@ -81,7 +89,14 @@ pub struct MysqlInfo {
     // 2. COM_STMT_EXECUTE request message
     statement_id: u32,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     trace_id: Option<String>,
+    span_id: Option<String>,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
 }
 
 impl L7ProtocolInfoInterface for MysqlInfo {
@@ -107,6 +122,14 @@ impl L7ProtocolInfoInterface for MysqlInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.context.len()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 impl MysqlInfo {
@@ -114,10 +137,14 @@ impl MysqlInfo {
         if self.protocol_version == 0 {
             self.protocol_version = other.protocol_version
         }
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
         match other.msg_type {
             LogMessageType::Request => {
                 self.command = other.command;
                 std::mem::swap(&mut self.context, &mut other.context);
+                self.captured_request_byte = other.captured_request_byte;
             }
             LogMessageType::Response => {
                 self.response_code = other.response_code;
@@ -132,6 +159,7 @@ impl MysqlInfo {
                 } else {
                     self.statement_id = 0;
                 }
+                self.captured_response_byte = other.captured_response_byte;
             }
             _ => {}
         }
@@ -180,27 +208,81 @@ impl MysqlInfo {
 
     fn request_string(
         &mut self,
+        config: Option<&LogParserConfig>,
         payload: &[u8],
         obfuscate_cache: &Option<ObfuscateCache>,
-        trace_id: Option<&str>,
     ) -> Result<()> {
         let payload = mysql_string(payload);
         if (self.command == COM_QUERY || self.command == COM_STMT_PREPARE) && !is_mysql(payload) {
             return Err(Error::MysqlLogParseFailed);
         };
-        self.context = attempt_obfuscation(obfuscate_cache, payload)
-            .map_or(String::from_utf8_lossy(payload).to_string(), |m| {
-                String::from_utf8_lossy(&m).to_string()
-            });
-        if let Some(t) = trace_id {
-            self.trace_id = extra_sql_trace_id(self.context.as_str(), t);
+        if let Some(c) = config {
+            self.extract_trace_and_span_id(&c.l7_log_dynamic, str::from_utf8(payload)?);
         }
+        let context = match attempt_obfuscation(obfuscate_cache, payload) {
+            Some(mut m) => {
+                let valid_len = match str::from_utf8(&m) {
+                    Ok(_) => m.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                m.truncate(valid_len);
+                unsafe {
+                    // SAFTY: str in m is checked to be valid utf8 up to `valid_len`
+                    String::from_utf8_unchecked(m)
+                }
+            }
+            _ => String::from_utf8_lossy(payload).to_string(),
+        };
+        self.context = context;
         Ok(())
+    }
+
+    // extra trace id from comment like # TraceID: xxxxxxxxxxxxxxx
+    fn extract_trace_and_span_id(&mut self, config: &L7LogDynamicConfig, sql: &str) {
+        if config.trace_types.is_empty() && config.span_types.is_empty() {
+            return;
+        }
+        debug!("extract id from sql {sql}");
+        'outer: for comment in comment_parser::MysqlCommentParserIter::new(sql) {
+            trace!("comment={comment}");
+            for (key, value) in KvExtractor::new(comment) {
+                trace!("key={key} value={value}");
+                for tt in config.trace_types.iter() {
+                    if tt.check(key) {
+                        self.trace_id = tt.decode_trace_id(value).map(|s| s.to_string());
+                        break;
+                    }
+                }
+                for st in config.span_types.iter() {
+                    if st.check(key) {
+                        self.span_id = st.decode_span_id(value).map(|s| s.to_string());
+                        break;
+                    }
+                }
+                if self.trace_id.is_some() && config.span_types.is_empty()
+                    || self.span_id.is_some() && config.trace_types.is_empty()
+                    || self.trace_id.is_some() && self.span_id.is_some()
+                {
+                    break 'outer;
+                }
+            }
+        }
+        debug!(
+            "extracted trace_id={:?} span_id={:?}",
+            self.trace_id, self.span_id
+        );
     }
 
     fn statement_id(&mut self, payload: &[u8]) {
         if payload.len() >= STATEMENT_ID_LEN {
             self.statement_id = read_u32_le(payload)
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::MySQL) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.context)
+                || t.request_type.is_on_blacklist(self.get_command_str());
         }
     }
 }
@@ -213,6 +295,8 @@ impl From<MysqlInfo> for L7ProtocolSendLog {
             EbpfFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             version: if f.protocol_version == 0 {
                 None
             } else {
@@ -247,9 +331,10 @@ impl From<MysqlInfo> for L7ProtocolSendLog {
                 request_id: f.statement_id.into(),
                 ..Default::default()
             }),
-            trace_info: if f.trace_id.is_some() {
+            trace_info: if f.trace_id.is_some() || f.span_id.is_some() {
                 Some(TraceInfo {
                     trace_id: f.trace_id,
+                    span_id: f.span_id,
                     ..Default::default()
                 })
             } else {
@@ -267,6 +352,12 @@ pub struct MysqlLog {
     pub protocol_version: u8,
     perf_stats: Option<L7PerfStats>,
     obfuscate_cache: Option<ObfuscateCache>,
+
+    // This field is extracted in the COM_STMT_PREPARE request and calculate based on SQL statements
+    parameter_counter: u32,
+    has_request: bool,
+
+    last_is_on_blacklist: bool,
 }
 
 impl L7ProtocolParserInterface for MysqlLog {
@@ -285,27 +376,49 @@ impl L7ProtocolParserInterface for MysqlLog {
             self.perf_stats = Some(L7PerfStats::default())
         };
         if self.parse(
+            param.parse_config,
             payload,
             param.l4_protocol,
             param.direction,
-            param.parse_config.and_then(|c| {
-                for i in c.l7_log_dynamic.trace_types.iter() {
-                    match i {
-                        crate::config::handler::TraceType::Customize(c) => return Some(c.as_str()),
-                        _ => continue,
-                    }
-                }
-                None
-            }),
             &mut info,
         )? {
             // ignore greeting
             return Ok(L7ParseResult::None);
         }
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+        if !info.is_on_blacklist && !self.last_is_on_blacklist {
+            match param.direction {
+                PacketDirection::ClientToServer => {
+                    self.perf_stats.as_mut().map(|p| p.inc_req());
+                }
+                PacketDirection::ServerToClient => {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+                }
+            }
+            match info.status {
+                L7ResponseStatus::ClientError => {
+                    self.perf_stats
+                        .as_mut()
+                        .map(|p: &mut L7PerfStats| p.inc_req_err());
+                }
+                L7ResponseStatus::ServerError => {
+                    self.perf_stats
+                        .as_mut()
+                        .map(|p: &mut L7PerfStats| p.inc_resp_err());
+                }
+                _ => {}
+            }
+            if info.msg_type != LogMessageType::Session {
+                info.cal_rrt(param).map(|rrt| {
+                    info.rrt = rrt;
+                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
+                });
+            }
+        }
+        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::MysqlInfo(info)))
         } else {
@@ -340,7 +453,133 @@ fn mysql_string(payload: &[u8]) -> &[u8] {
     }
 }
 
+#[derive(PartialEq)]
+enum SqlState {
+    None,
+    Equal,
+    Less,
+    Greater,
+    In1,
+    In2,
+    In3,
+    Values1,
+    Values2,
+    Values3,
+    Values4,
+    Values5,
+    Values6,
+    Values7,
+    Like1,
+    Like2,
+    Like3,
+    Like4,
+    ValuesPause,
+}
+
 impl MysqlLog {
+    fn reset_parameter_counter(&mut self) {
+        self.parameter_counter = 0;
+    }
+
+    fn set_parameter_counter(&mut self, sql: &[u8]) {
+        let mut counter = 0;
+        let mut state = SqlState::None;
+        for byte in sql.iter() {
+            match *byte {
+                b'=' => state = SqlState::Equal,
+                b'?' if state == SqlState::Equal => {
+                    counter += 1;
+                    state = SqlState::None;
+                }
+                b'>' if state == SqlState::None => state = SqlState::Greater,
+                b'?' if state == SqlState::Greater => {
+                    counter += 1;
+                    state = SqlState::None;
+                }
+                _ if state == SqlState::Greater => state = SqlState::None,
+                b'<' if state == SqlState::None => state = SqlState::Less,
+                b'>' if state == SqlState::Less => state = SqlState::Greater,
+                b'?' if state == SqlState::Less => {
+                    counter += 1;
+                    state = SqlState::None;
+                }
+                _ if state == SqlState::Less => state = SqlState::None,
+                b'I' if state == SqlState::None => state = SqlState::In1,
+                b'N' if state == SqlState::In1 => state = SqlState::In2,
+                b'(' if state == SqlState::In2 => state = SqlState::In3,
+                b',' if state == SqlState::In3 => {}
+                b'?' if state == SqlState::In3 => counter += 1,
+                b')' if state == SqlState::In3 => state = SqlState::None,
+                b'V' if state == SqlState::None => state = SqlState::Values1,
+                b'A' if state == SqlState::Values1 => state = SqlState::Values2,
+                b'L' if state == SqlState::Values2 => state = SqlState::Values3,
+                b'U' if state == SqlState::Values3 => state = SqlState::Values4,
+                b'E' if state == SqlState::Values4 => state = SqlState::Values5,
+                b'S' if state == SqlState::Values5 => state = SqlState::Values6,
+                b' ' | b',' if state == SqlState::Values6 => {}
+                b'(' if state == SqlState::Values6 => state = SqlState::Values7,
+                b'?' if state == SqlState::Values7 => {
+                    counter += 1;
+                    state = SqlState::ValuesPause;
+                }
+                _ if state == SqlState::Values7 => {}
+                b')' if state == SqlState::ValuesPause => state = SqlState::Values6,
+                b'?' if state == SqlState::ValuesPause => {}
+                b',' if state == SqlState::ValuesPause => state = SqlState::Values7,
+                b'L' if state == SqlState::None => state = SqlState::Like1,
+                b'I' if state == SqlState::Like1 => state = SqlState::Like2,
+                b'K' if state == SqlState::Like2 => state = SqlState::Like3,
+                b'E' if state == SqlState::Like3 => state = SqlState::Like4,
+                b'?' if state == SqlState::Like4 => {
+                    counter += 1;
+                    state = SqlState::None;
+                }
+                b' ' => {}
+                _ => state = SqlState::None,
+            }
+        }
+
+        self.parameter_counter = counter;
+    }
+
+    fn get_parameters(&mut self, payload: &[u8], info: &mut MysqlInfo) {
+        if self.parameter_counter == 0 {
+            return;
+        }
+        let mut params = vec![];
+        let mut offset = 0;
+        // TODO: Only support first call or rebound.
+        for byte in payload {
+            offset += 1;
+            if *byte == 0x01 {
+                break;
+            }
+        }
+        for _ in 0..self.parameter_counter as usize {
+            if offset + PARAMETER_TYPE_LEN > payload.len() {
+                return;
+            }
+            params.push((FieldType::from(payload[offset]), payload[offset + 1]));
+            offset += PARAMETER_TYPE_LEN;
+        }
+
+        let mut context = String::new();
+        for (i, (field_type, _)) in params.iter().enumerate() {
+            if offset > payload.len() {
+                break;
+            }
+
+            if let Some(length) = field_type.decode(&payload[offset..], &mut context) {
+                if i != params.len() - 1 {
+                    context.push_str(" , ");
+                }
+                offset += length;
+            }
+        }
+
+        info.context = context;
+    }
+
     fn greeting(&mut self, payload: &[u8]) -> Result<()> {
         let mut remain = payload.len();
         if remain < PROTOCOL_VERSION_LEN {
@@ -364,31 +603,51 @@ impl MysqlLog {
 
     fn request(
         &mut self,
+        config: Option<&LogParserConfig>,
         payload: &[u8],
-        trace_id: Option<&str>,
         info: &mut MysqlInfo,
-    ) -> Result<()> {
+    ) -> Result<LogMessageType> {
         if payload.len() < COMMAND_LEN {
             return Err(Error::MysqlLogParseFailed);
         }
         info.command = payload[COMMAND_OFFSET];
+        let mut msg_type = LogMessageType::Request;
         match info.command {
-            COM_QUIT | COM_FIELD_LIST | COM_STMT_CLOSE | COM_STMT_FETCH => (),
-            COM_INIT_DB | COM_QUERY | COM_STMT_PREPARE => {
+            COM_QUIT | COM_STMT_CLOSE => msg_type = LogMessageType::Session,
+            COM_FIELD_LIST | COM_STMT_FETCH => (),
+            COM_INIT_DB | COM_QUERY => {
                 info.request_string(
+                    config,
                     &payload[COMMAND_OFFSET + COMMAND_LEN..],
                     &self.obfuscate_cache,
-                    trace_id,
                 )?;
+            }
+            COM_STMT_PREPARE => {
+                info.request_string(
+                    config,
+                    &payload[COMMAND_OFFSET + COMMAND_LEN..],
+                    &self.obfuscate_cache,
+                )?;
+                if let Some(config) = config {
+                    if config
+                        .obfuscate_enabled_protocols
+                        .is_disabled(L7Protocol::MySQL)
+                    {
+                        self.set_parameter_counter(info.context.as_bytes());
+                    }
+                }
             }
             COM_STMT_EXECUTE => {
                 info.statement_id(&payload[STATEMENT_ID_OFFSET..]);
+                if payload.len() > EXECUTE_STATEMENT_PARAMS_OFFSET {
+                    self.get_parameters(&payload[EXECUTE_STATEMENT_PARAMS_OFFSET..], info);
+                }
+                self.reset_parameter_counter();
             }
             COM_PING => {}
             _ => return Err(Error::MysqlLogParseFailed),
         }
-        self.perf_stats.as_mut().map(|p| p.inc_req());
-        Ok(())
+        Ok(msg_type)
     }
 
     fn decode_compress_int(payload: &[u8]) -> u64 {
@@ -414,7 +673,7 @@ impl MysqlLog {
 
     fn set_status(&mut self, status_code: u16, info: &mut MysqlInfo) {
         if status_code != 0 {
-            if status_code >= 2000 && status_code <= 2999 {
+            if status_code >= CLIENT_STATUS_CODE_MIN && status_code <= CLIENT_STATUS_CODE_MAX {
                 info.status = L7ResponseStatus::ClientError;
             } else {
                 info.status = L7ResponseStatus::ServerError;
@@ -435,6 +694,9 @@ impl MysqlLog {
             MYSQL_RESPONSE_CODE_ERR => {
                 if remain > ERROR_CODE_LEN {
                     let code = bytes::read_u16_le(&payload[ERROR_CODE_OFFSET..]);
+                    if code < SERVER_STATUS_CODE_MIN || code > CLIENT_STATUS_CODE_MAX {
+                        return Err(Error::MysqlLogParseFailed);
+                    }
                     info.error_code = Some(code as i32);
                     self.set_status(code, info);
                     remain -= ERROR_CODE_LEN;
@@ -446,10 +708,12 @@ impl MysqlLog {
                         SQL_STATE_OFFSET
                     };
                 if error_message_offset < payload.len() {
-                    info.error_message =
-                        String::from_utf8_lossy(&payload[error_message_offset..]).into_owned();
+                    let context = mysql_string(&payload[error_message_offset..]);
+                    if !context.is_ascii() {
+                        return Err(Error::MysqlLogParseFailed);
+                    }
+                    info.error_message = String::from_utf8_lossy(context).into_owned();
                 }
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
             }
             MYSQL_RESPONSE_CODE_OK => {
                 info.status = L7ResponseStatus::Ok;
@@ -459,7 +723,55 @@ impl MysqlLog {
             }
             _ => (),
         }
-        self.perf_stats.as_mut().map(|p| p.inc_resp());
+        Ok(())
+    }
+
+    fn string_null(payload: &[u8]) -> Option<&str> {
+        let mut n = 0;
+        for b in payload {
+            if !b.is_ascii() {
+                return None;
+            }
+            if *b == 0 {
+                break;
+            }
+            n += 1;
+        }
+
+        if n == 0 {
+            return None;
+        }
+
+        str::from_utf8(&payload[..n]).ok()
+    }
+
+    fn login(&mut self, payload: &[u8], info: &mut MysqlInfo) -> Result<()> {
+        if payload.len() < LOGIN_USERNAME_OFFSET {
+            return Err(Error::MysqlLogParseFailed);
+        }
+        let client_capabilities_flags =
+            bytes::read_u16_le(&payload[CLIENT_CAPABILITIES_FLAGS_OFFSET..]);
+        if client_capabilities_flags & CLIENT_PROTOCOL_41 != CLIENT_PROTOCOL_41 {
+            return Err(Error::MysqlLogParseFailed);
+        }
+        if !payload[FILTER_OFFSET..FILTER_OFFSET + FILTER_SIZE]
+            .iter()
+            .all(|b| *b == 0)
+        {
+            return Err(Error::MysqlLogParseFailed);
+        }
+
+        let Some(context) = Self::string_null(&payload[LOGIN_USERNAME_OFFSET..]) else {
+            return Err(Error::MysqlLogParseFailed);
+        };
+
+        if !context.is_ascii() {
+            return Err(Error::MysqlLogParseFailed);
+        }
+
+        info.context = format!("Login username: {}", context);
+        info.status = L7ResponseStatus::Ok;
+
         Ok(())
     }
 
@@ -469,34 +781,36 @@ impl MysqlLog {
         }
 
         let mut header = MysqlHeader::default();
-        let offset = header.decode(payload);
-        if offset < 0 {
+        let Some(offset) = header.decode(payload, true) else {
             return false;
-        }
-        let offset = offset as usize;
+        };
 
-        if header.number != 0 || offset + header.length as usize > payload.len() {
+        if offset + header.length as usize > payload.len() {
             return false;
         }
 
         let protocol_version_or_query_type = payload[offset];
         match protocol_version_or_query_type {
-            COM_QUERY | COM_STMT_PREPARE => {
+            COM_QUERY | COM_STMT_PREPARE if header.number == 0 => {
                 let context = mysql_string(&payload[offset + 1..]);
                 return context.is_ascii() && is_mysql(context);
             }
-            _ => {}
+            _ if header.number != 0 => {
+                let mut mysql = MysqlLog::default();
+                let mut log_info = MysqlInfo::default();
+                mysql.login(&payload[offset..], &mut log_info).is_ok()
+            }
+            _ => false,
         }
-        false
     }
 
     // return is_greeting?
     fn parse(
         &mut self,
+        config: Option<&LogParserConfig>,
         payload: &[u8],
         proto: IpProtocol,
         direction: PacketDirection,
-        trace_id: Option<&str>,
         info: &mut MysqlInfo,
     ) -> Result<bool> {
         if proto != IpProtocol::TCP {
@@ -504,18 +818,28 @@ impl MysqlLog {
         }
 
         let mut header = MysqlHeader::default();
-        let offset = header.decode(payload);
-        if offset < 0 {
+        let Some(offset) = header.decode(payload, direction == PacketDirection::ClientToServer)
+        else {
             return Err(Error::MysqlLogParseFailed);
-        }
-        let offset = offset as usize;
-        let msg_type = header
+        };
+        let mut msg_type = header
             .check(direction, offset, payload)
             .ok_or(Error::MysqlLogParseFailed)?;
 
         match msg_type {
-            LogMessageType::Request => self.request(&payload[offset..], trace_id, info)?,
-            LogMessageType::Response => self.response(&payload[offset..], info)?,
+            LogMessageType::Request => {
+                msg_type = self.request(config, &payload[offset..], info)?;
+                if msg_type == LogMessageType::Request {
+                    self.has_request = true;
+                }
+            }
+            LogMessageType::Session if direction == PacketDirection::ClientToServer => {
+                self.login(&payload[offset..], info)?;
+            }
+            LogMessageType::Response if self.has_request => {
+                self.response(&payload[offset..], info)?;
+                self.has_request = false;
+            }
             LogMessageType::Other => {
                 self.greeting(&payload[offset..])?;
                 return Ok(true);
@@ -535,26 +859,44 @@ pub struct MysqlHeader {
 }
 
 impl MysqlHeader {
-    pub fn decode(&mut self, payload: &[u8]) -> isize {
-        if payload.len() < 5 {
-            return -1;
+    pub fn decode(&mut self, payload: &[u8], is_not_response: bool) -> Option<usize> {
+        let mut offset: usize = 0;
+        while offset < payload.len() {
+            if payload[offset..].len() < HEADER_LEN {
+                return None;
+            }
+
+            if payload[offset..].len() > COMPRESS_HEADER_LEN + HEADER_LEN {
+                let compressed_len = bytes::read_u32_le(&payload[offset..]) & 0xffffff;
+                let uncompressed_len =
+                    bytes::read_u32_le(&payload[offset + COMPRESS_HEADER_UNCOMPRESS_OFFSET..])
+                        & 0xffffff;
+                let packet_len =
+                    bytes::read_u32_le(&payload[offset + COMPRESS_HEADER_LEN..]) & 0xffffff;
+                if uncompressed_len == 0 && compressed_len == packet_len + 4 {
+                    offset += COMPRESS_HEADER_LEN;
+                }
+            }
+
+            let len = bytes::read_u32_le(&payload[offset..]) & 0xffffff;
+            if offset + HEADER_LEN + RESPONSE_CODE_OFFSET >= payload.len() {
+                return None;
+            }
+
+            let response_code = payload[offset + HEADER_LEN + RESPONSE_CODE_OFFSET];
+            if response_code == MYSQL_RESPONSE_CODE_OK
+                || response_code == MYSQL_RESPONSE_CODE_ERR
+                || response_code == MYSQL_RESPONSE_CODE_EOF
+                || payload[offset + NUMBER_OFFSET] == 0
+                || is_not_response
+            {
+                self.length = len;
+                self.number = payload[offset + NUMBER_OFFSET];
+                return Some(offset + HEADER_LEN);
+            }
+            offset += HEADER_LEN + len as usize;
         }
-        let len = bytes::read_u32_le(payload) & 0xffffff;
-        if payload[HEADER_LEN + RESPONSE_CODE_OFFSET] == MYSQL_RESPONSE_CODE_OK
-            || payload[HEADER_LEN + RESPONSE_CODE_OFFSET] == MYSQL_RESPONSE_CODE_ERR
-            || payload[HEADER_LEN + RESPONSE_CODE_OFFSET] == MYSQL_RESPONSE_CODE_EOF
-            || payload[NUMBER_OFFSET] == 0
-        {
-            self.length = len;
-            self.number = payload[NUMBER_OFFSET];
-            return HEADER_LEN as isize;
-        }
-        let offset = len as usize + HEADER_LEN;
-        if offset >= payload.len() {
-            return 0;
-        }
-        let offset = offset as isize;
-        offset + self.decode(&payload[offset as usize..])
+        None
     }
 
     pub fn check(
@@ -586,25 +928,102 @@ impl MysqlHeader {
             }
             PacketDirection::ServerToClient => Some(LogMessageType::Response),
             PacketDirection::ClientToServer if self.number == 0 => Some(LogMessageType::Request),
+            PacketDirection::ClientToServer if self.number == 1 => Some(LogMessageType::Session),
             _ => None,
         }
     }
 }
 
-// extra trace id from comment like # TraceID: xxxxxxxxxxxxxxx
-fn extra_sql_trace_id(sql: &str, trace_id: &str) -> Option<String> {
-    for i in comment_parser::MysqlCommentParserIter::new(sql) {
-        let s = i.trim();
-        let Some(idx) = s.find(trace_id) else {
-            continue;
-        };
+#[derive(PartialEq)]
+enum Token {
+    Key,
+    Separator,
+    Value,
+}
 
-        let start = idx + trace_id.len() + 1;
-        if start < s.len() {
-            return Some((&s[start..].trim()).to_string());
+pub struct KvExtractor<'a> {
+    split: Box<dyn Iterator<Item = &'a str> + 'a>,
+    last_segment: Option<&'a str>,
+}
+
+impl<'a> KvExtractor<'a> {
+    pub fn new(s: &'a str) -> Self {
+        Self {
+            split: Box::new(
+                s.split_inclusive(|c: char| {
+                    c.is_ascii_whitespace() || c == ':' || c == '=' || c == ','
+                })
+                .into_iter(),
+            ),
+            last_segment: None,
         }
     }
-    None
+}
+
+impl<'a> Iterator for KvExtractor<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut next_token = Token::Key;
+        let mut last_key = None;
+        loop {
+            let Some(seg) = self
+                .last_segment
+                .take()
+                .or_else(|| self.split.as_mut().next())
+            else {
+                return None;
+            };
+
+            let Some((last, sep_char)) = seg.char_indices().last() else {
+                continue;
+            };
+            let (mut exp, sep) = seg.split_at(last);
+            match sep {
+                "," => {
+                    if !exp.is_empty() && next_token == Token::Value {
+                        return Some((last_key.unwrap(), exp.trim()));
+                    }
+                    next_token = Token::Key; // resets
+                }
+                ":" | "=" => {
+                    if !exp.is_empty() {
+                        if next_token == Token::Value {
+                            self.last_segment.replace(seg);
+                            return Some((last_key.unwrap(), exp.trim()));
+                        }
+                        // discard previous parsed key if any
+                        last_key = Some(exp.trim());
+                        next_token = Token::Value;
+                    } else if next_token == Token::Separator {
+                        assert!(last_key.is_some());
+                        next_token = Token::Value;
+                    } else {
+                        // invalid separator
+                        next_token = Token::Key;
+                    }
+                }
+                _ => {
+                    if exp.is_empty() {
+                        continue;
+                    }
+                    if !sep_char.is_ascii_whitespace() {
+                        exp = seg;
+                    }
+                    match next_token {
+                        Token::Key | Token::Separator => {
+                            last_key = Some(exp.trim());
+                            next_token = Token::Separator;
+                        }
+                        Token::Value => {
+                            self.last_segment.replace(seg);
+                            return Some((last_key.unwrap(), exp.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // test log parse
@@ -618,6 +1037,7 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
+        config::{handler::TraceType, ExtraLogFields},
         flow_generator::L7_RRT_CACHE_CAPACITY,
         utils::test::Capture,
     };
@@ -637,6 +1057,7 @@ mod tests {
         let mut output: String = String::new();
         let first_dst_port = packets[0].lookup_key.dst_port;
         let mut previous_command = 0u8;
+        let log_config = LogParserConfig::default();
         for packet in packets.iter_mut() {
             packet.lookup_key.direction = if packet.lookup_key.dst_port == first_dst_port {
                 PacketDirection::ClientToServer
@@ -649,19 +1070,36 @@ mod tests {
             };
             let is_mysql = mysql.check_payload(
                 payload,
-                &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true),
+                &ParseParam::new(
+                    packet as &MetaPacket,
+                    log_cache.clone(),
+                    Default::default(),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    Default::default(),
+                    true,
+                    true,
+                ),
             );
 
-            let info = mysql.parse_payload(
-                payload,
-                &ParseParam::new(&*packet, log_cache.clone(), true, true),
+            let mut param = ParseParam::new(
+                &*packet,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
             );
+            param.parse_config = Some(&log_config);
+            param.set_captured_byte(payload.len());
+
+            let info = mysql.parse_payload(payload, &param);
 
             if let Ok(info) = info {
                 if info.is_none() {
                     let mut i = MysqlInfo::default();
                     i.protocol_version = mysql.protocol_version;
-                    output.push_str(&format!("{:?} is_mysql: {}\r\n", i, is_mysql));
+                    output.push_str(&format!("{:?} is_mysql: {}\n", i, is_mysql));
                     previous_command = 0;
                     continue;
                 }
@@ -677,14 +1115,14 @@ mod tests {
                         }
 
                         i.rrt = 0;
-                        output.push_str(&format!("{:?} is_mysql: {}\r\n", i, is_mysql));
+                        output.push_str(&format!("{:?} is_mysql: {}\n", i, is_mysql));
                     }
                     _ => unreachable!(),
                 }
             } else {
                 let mut i = MysqlInfo::default();
                 i.protocol_version = mysql.protocol_version;
-                output.push_str(&format!("{:?} is_mysql: {}\r\n", i, is_mysql));
+                output.push_str(&format!("{:?} is_mysql: {}\n", i, is_mysql));
             }
         }
         output
@@ -693,6 +1131,8 @@ mod tests {
     #[test]
     fn check() {
         let files = vec![
+            ("mysql-use.pcap", "mysql-use.result"),
+            ("mysql-exec.pcap", "mysql-exec.result"),
             ("mysql-statement-id.pcap", "mysql-statement-id.result"),
             ("mysql-statement.pcap", "mysql-statement.result"),
             ("mysql.pcap", "mysql.result"),
@@ -731,8 +1171,8 @@ mod tests {
             (
                 "mysql.pcap",
                 L7PerfStats {
-                    request_count: 6,
-                    response_count: 7,
+                    request_count: 7,
+                    response_count: 5,
                     err_client_count: 0,
                     err_server_count: 0,
                     err_timeout: 0,
@@ -745,8 +1185,8 @@ mod tests {
             (
                 "mysql-error.pcap",
                 L7PerfStats {
-                    request_count: 4,
-                    response_count: 4,
+                    request_count: 5,
+                    response_count: 3,
                     err_client_count: 0,
                     err_server_count: 1,
                     err_timeout: 0,
@@ -792,10 +1232,233 @@ mod tests {
                 packet.lookup_key.direction = PacketDirection::ServerToClient;
             }
             if packet.get_l4_payload().is_some() {
-                let param = &ParseParam::new(&*packet, rrt_cache.clone(), true, true);
+                let param = &ParseParam::new(
+                    &*packet,
+                    rrt_cache.clone(),
+                    Default::default(),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    Default::default(),
+                    true,
+                    true,
+                );
                 let _ = mysql.parse_payload(packet.get_l4_payload().unwrap(), param);
             }
         }
         mysql.perf_stats.unwrap()
+    }
+
+    #[test]
+    fn comment_extractor() {
+        flexi_logger::Logger::try_with_env()
+            .unwrap()
+            .start()
+            .unwrap();
+        let testcases = vec![
+            (
+                "/* traceparent: 00-trace_id-span_id-01 */ SELECT * FROM table",
+                Some("trace_id"),
+                Some("span_id"),
+            ),
+            (
+                "/* traceparent: traceparent   \t : 00-trace_id-span_id-01 */ SELECT * FROM table",
+                Some("trace_id"),
+                Some("span_id"),
+            ),
+            (
+                " SELECT * FROM table # traceparent: traceparent   \ttRaCeId \t: 00-trace_id-span_id-01: traceparent",
+                Some("00-trace_id-span_id-01"),
+                None,
+            ),
+            (
+                "/* trcod=VCCMOYF2,svccod=VCCMOF2,jrnno=W557426527, reqseq=124748979092341,chanl=MB,userId=12094710GSOE */ SELECT * FROM table",
+                Some("W557426527"),
+                None,
+            ),
+        ];
+        let mut info = MysqlInfo::default();
+        let config = L7LogDynamicConfig::new(
+            vec![],
+            vec![],
+            vec![
+                TraceType::TraceParent,
+                TraceType::Customize("TraceID".to_owned()),
+                TraceType::Customize("jrnno".to_owned()),
+            ],
+            vec![TraceType::TraceParent],
+            ExtraLogFields::default(),
+        );
+        for (input, tid, sid) in testcases {
+            info.trace_id = None;
+            info.span_id = None;
+            info.extract_trace_and_span_id(&config, input);
+            assert_eq!(info.trace_id.as_ref().map(|s| s.as_str()), tid);
+            assert_eq!(info.span_id.as_ref().map(|s| s.as_str()), sid);
+        }
+    }
+
+    #[test]
+    fn test_set_parameter_counter() {
+        let cases =
+            vec![
+            ("=?", 1),
+            ("= ?", 1),
+            ("<> ?", 0),
+            ("<>?", 1),
+            ("< ?", 0),
+            (">?", 1),
+            ("<?", 1),
+            ("IN (?) ?", 1),
+            ("IN (?,?,?)", 3),
+            ("VALUES (?,?,?,?,?,??),(?,?,?,?,?,?,?)", 13),
+            ("VALUES (?,?,?,?,?,?,?)", 7),
+            ("VALUES (?,?,?,DEFAULT,?,?,?,?)", 7),
+            ("VALUES (?,?,?),(DEFAULT,?,?,?,?)", 7),
+            (
+                "SELECT * FROM ` ? ` WHERE ` ? `=? ? BY ` ? `.` ? ` LIMIT ?",
+                1,
+            ),
+            (
+                "SELECT ` ? `,` ? `,` ? ` FROM ` ? ` WHERE (namespace =?) AND (` ? ` LIKE ?)",
+                2,
+            ),
+            ("SELECT ` ? ` FROM ` ? ` WHERE domain =? AND content <> ?  BY ` ? `.` ? ` LIMIT ?", 1),
+        ];
+        for case in cases {
+            let mut log = MysqlLog::default();
+            log.set_parameter_counter(case.0.as_bytes());
+            assert_eq!(
+                log.parameter_counter, case.1,
+                "Cases {:?} error, actual is {}",
+                case, log.parameter_counter
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_parameter() {
+        fn parse_parameter(field_type: FieldType, payload: Vec<u8>) -> String {
+            let mut output = String::new();
+            field_type.decode(&payload, &mut output);
+            output
+        }
+
+        let mut cases = vec![
+            (FieldType::Long, vec![1, 0, 0, 0], "Long(1)"),
+            (FieldType::Int24, vec![1, 0, 0, 0], "Int24(1)"),
+            (FieldType::Short, vec![1, 0], "Short(1)"),
+            (FieldType::Year, vec![1, 0], "Years(1)"),
+            (FieldType::Tiny, vec![1], "Tiny(1)"),
+            (
+                FieldType::Double,
+                vec![0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x24, 0x40],
+                "Double(10.2)",
+            ),
+            (
+                FieldType::Float,
+                vec![0x33, 0x33, 0x23, 0x41],
+                "Float(10.2)",
+            ),
+            (
+                FieldType::Date,
+                vec![
+                    0x0b, 0xda, 0x07, 0x0a, 0x11, 0x13, 0x1b, 0x1e, 0x01, 00, 00, 00,
+                ],
+                "datetime 2010-10-17 19:27:30.000001",
+            ),
+            (
+                FieldType::Datetime,
+                vec![0x04, 0xda, 0x07, 0x0a, 0x11],
+                "datetime 2010-10-17",
+            ),
+            (
+                FieldType::Timestamp,
+                vec![
+                    0x0b, 0xda, 0x07, 0x0a, 0x11, 0x13, 0x1b, 0x1e, 0x01, 00, 00, 00,
+                ],
+                "datetime 2010-10-17 19:27:30.000001",
+            ),
+            (
+                FieldType::Time,
+                vec![
+                    0x0c, 0x01, 0x78, 0x00, 0x00, 0x00, 0x13, 0x1b, 0x1e, 0x01, 0x00, 0x00, 0x00,
+                ],
+                "time -120d 19:27:30.000001",
+            ),
+            (
+                FieldType::Time,
+                vec![0x08, 0x01, 0x78, 0x00, 0x00, 0x00, 0x13, 0x1b, 0x1e],
+                "time -120d 19:27:30",
+            ),
+            (FieldType::Time, vec![0x1], "time 0d 00:00:00.000000"),
+        ];
+
+        for (i, (field_type, payload, except)) in cases.drain(..).enumerate() {
+            let actual = parse_parameter(field_type, payload);
+            assert_eq!(
+                actual,
+                except.to_string(),
+                "Cases {:3} field type {:?} error: except: {} but actual: {}.",
+                i + 1,
+                field_type,
+                except,
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_kv_extractor() {
+        let cases = vec![
+            ("safwa: asfew saefa:weaiow dff=ea,dsas=sad , asda=2,: ,a23 =zsda fawa:1,ara :af::, 2e=c:g,",
+            vec![
+                ("safwa", "asfew"),
+                ("saefa", "weaiow"),
+                ("dff", "ea"),
+                ("dsas", "sad"),
+                ("asda", "2"),
+                ("a23", "zsda"),
+                ("fawa", "1"),
+                ("ara", "af"),
+                ("2e", "c"),
+                ("c", "g"),
+            ]),
+            (
+                "traceparent: 00-trace_id-span_id-01",
+                vec![("traceparent", "00-trace_id-span_id-01")]
+                ),
+            (
+                "traceparent: traceparent   \t : 00-trace_id-span_id-01",
+                vec![
+                ("traceparent", "traceparent"),
+                ("traceparent", "00-trace_id-span_id-01"),
+                ]
+            ),
+            (
+                " traceparent: traceparent   \ttRaCeId \t: 00-trace_id-span_id-01: traceparent",
+                vec![
+                ("traceparent", "traceparent"),
+                ("tRaCeId", "00-trace_id-span_id-01"),
+                ("00-trace_id-span_id-01", "traceparent"),
+                ]
+            ),
+            (
+                " trcod=VCCMOYF2,svccod=VCCMOF2,jrnno=W557426527, reqseq=124748979092341,chanl=MB,userId=12094710GSOE",
+                vec![
+                ("trcod", "VCCMOYF2"),
+                ("svccod", "VCCMOF2"),
+                ("jrnno", "W557426527"),
+                ("reqseq", "124748979092341"),
+                ("chanl", "MB"),
+                ("userId", "12094710GSOE"),
+                ]
+            ),
+        ];
+        for (input, output) in cases {
+            assert_eq!(
+                output,
+                KvExtractor::new(input).collect::<Vec<_>>(),
+                "failed in case {input}",
+            );
+        }
     }
 }

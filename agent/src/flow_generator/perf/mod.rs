@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use enum_dispatch::enum_dispatch;
 use public::bitmap::Bitmap;
-use public::l7_protocol::L7ProtocolEnum;
+use public::l7_protocol::{L7ProtocolChecker as L7ProtocolCheckerBitmap, L7ProtocolEnum};
 
 use super::protocol_logs::sql::ObfuscateCache;
 use super::{
@@ -124,6 +124,7 @@ pub type L7ProtocolTuple = (L7Protocol, Option<Bitmap>);
 pub struct L7ProtocolChecker {
     tcp: Vec<L7ProtocolTuple>,
     udp: Vec<L7ProtocolTuple>,
+    other: Vec<L7ProtocolTuple>,
 }
 
 impl L7ProtocolChecker {
@@ -133,9 +134,14 @@ impl L7ProtocolChecker {
     ) -> Self {
         let mut tcp = vec![];
         let mut udp = vec![];
+        let mut other = vec![];
         for parser in get_all_protocol() {
             let protocol = parser.protocol();
             if !protocol_bitmap.is_enabled(protocol) {
+                continue;
+            }
+            if parser.parsable_on_other() {
+                other.push((protocol, port_bitmap.get(&protocol).map(|m| m.clone())));
                 continue;
             }
             if parser.parsable_on_tcp() {
@@ -146,7 +152,7 @@ impl L7ProtocolChecker {
             }
         }
 
-        L7ProtocolChecker { tcp, udp }
+        L7ProtocolChecker { tcp, udp, other }
     }
 
     pub fn possible_protocols(
@@ -158,7 +164,7 @@ impl L7ProtocolChecker {
             iter: match l4_protocol {
                 L4Protocol::Tcp => self.tcp.iter(),
                 L4Protocol::Udp => self.udp.iter(),
-                _ => [].iter(),
+                _ => self.other.iter(),
             },
             port,
         }
@@ -190,7 +196,7 @@ pub struct FlowLog {
     l7_protocol_log_parser: Option<Box<L7ProtocolParser>>,
     // use for cache previous log info, use for calculate rrt
     perf_cache: Rc<RefCell<L7PerfCache>>,
-    l7_protocol_enum: L7ProtocolEnum,
+    pub l7_protocol_enum: L7ProtocolEnum,
 
     // Only for eBPF data, the server_port will be set in l7_check() method, it checks the first
     // request packet's payload, and then set self.server_port = packet.lookup_key.dst_port,
@@ -235,11 +241,29 @@ impl FlowLog {
         log_parser_config: &LogParserConfig,
         packet: &mut MetaPacket,
         app_table: &mut AppTable,
-        parse_param: &ParseParam,
+        is_parse_perf: bool,
+        is_parse_log: bool,
         local_epc: i32,
         remote_epc: i32,
     ) -> Result<L7ParseResult> {
-        if let Some(payload) = packet.get_l4_payload() {
+        if let Some(payload) = packet.get_l7() {
+            let mut parse_param = ParseParam::new(
+                &*packet,
+                self.perf_cache.clone(),
+                Rc::clone(&self.wasm_vm),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Rc::clone(&self.so_plugin),
+                is_parse_perf,
+                is_parse_log,
+            );
+            parse_param.set_log_parse_config(log_parser_config);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            parse_param.set_counter(self.stats_counter.clone());
+            parse_param.set_rrt_timeout(self.rrt_timeout);
+            parse_param.set_buf_size(flow_config.l7_log_packet_size as usize);
+            parse_param.set_captured_byte(packet.get_captured_byte());
+            parse_param.set_oracle_conf(flow_config.oracle_parse_conf);
+
             let parser = self.l7_protocol_log_parser.as_mut().unwrap();
 
             if log_parser_config
@@ -258,7 +282,7 @@ impl FlowLog {
                         &payload[..pkt_size]
                     }
                 },
-                parse_param,
+                &parse_param,
             );
 
             let mut cache_proto = |proto: L7ProtocolEnum| match packet.signal_source {
@@ -308,7 +332,7 @@ impl FlowLog {
         remote_epc: i32,
         checker: &L7ProtocolChecker,
     ) -> Result<L7ParseResult> {
-        if let Some(payload) = packet.get_l4_payload() {
+        if let Some(payload) = packet.get_l7() {
             let pkt_size = flow_config.l7_log_packet_size as usize;
 
             let cut_payload = if pkt_size > payload.len() {
@@ -320,6 +344,9 @@ impl FlowLog {
             let mut param = ParseParam::new(
                 &*packet,
                 self.perf_cache.clone(),
+                Rc::clone(&self.wasm_vm),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Rc::clone(&self.so_plugin),
                 is_parse_perf,
                 is_parse_log,
             );
@@ -328,9 +355,7 @@ impl FlowLog {
             param.set_counter(self.stats_counter.clone());
             param.set_rrt_timeout(self.rrt_timeout);
             param.set_buf_size(pkt_size);
-            param.set_wasm_vm(Rc::clone(&self.wasm_vm));
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            param.set_so_func(Rc::clone(&self.so_plugin));
+            param.set_captured_byte(payload.len());
             param.set_oracle_conf(flow_config.oracle_parse_conf);
 
             for protocol in checker.possible_protocols(
@@ -364,11 +389,16 @@ impl FlowLog {
                         } else {
                             packet.lookup_key.direction = PacketDirection::ClientToServer;
                         }
-                    } else {
+                    } else if packet.signal_source != SignalSource::EBPF || self.server_port == 0 {
+                        /*
+                            1. non-eBPF: Set the first packet's `dst_port` as `server_port` and
+                                its direction as c2s.
+                            2. eBPF: If the `server_port` can not be determined in `FlowMap::init_flow`,
+                                use the first packet's `dst_port` as `server_port`.
+                        */
                         self.server_port = packet.lookup_key.dst_port;
                         packet.lookup_key.direction = PacketDirection::ClientToServer;
                     }
-                    param.direction = packet.lookup_key.direction;
 
                     self.l7_protocol_log_parser = Some(Box::new(parser));
                     return self.l7_parse_log(
@@ -376,7 +406,8 @@ impl FlowLog {
                         log_parser_config,
                         packet,
                         app_table,
-                        &param,
+                        is_parse_perf,
+                        is_parse_log,
                         local_epc,
                         remote_epc,
                     );
@@ -429,33 +460,23 @@ impl FlowLog {
         }
 
         if self.l7_protocol_log_parser.is_some() {
-            let param = &mut ParseParam::new(
-                &*packet,
-                self.perf_cache.clone(),
-                is_parse_perf,
-                is_parse_log,
-            );
-            param.set_log_parse_config(log_parser_config);
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            param.set_counter(self.stats_counter.clone());
-            param.set_rrt_timeout(self.rrt_timeout);
-            param.set_buf_size(flow_config.l7_log_packet_size as usize);
-            param.set_oracle_conf(flow_config.oracle_parse_conf);
-            param.set_wasm_vm(Rc::clone(&self.wasm_vm));
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            param.set_so_func(Rc::clone(&self.so_plugin));
             return self.l7_parse_log(
                 flow_config,
                 log_parser_config,
                 packet,
                 app_table,
-                param,
+                is_parse_perf,
+                is_parse_log,
                 local_epc,
                 remote_epc,
             );
         }
 
-        if packet.l4_payload_len() < 2 {
+        let Some(payload) = packet.get_l7() else {
+            return Err(Error::L7ProtocolUnknown);
+        };
+
+        if payload.len() < 2 {
             return Err(Error::L7ProtocolUnknown);
         }
 
@@ -573,11 +594,42 @@ impl FlowLog {
         Ok(L7ParseResult::None)
     }
 
-    pub fn parse_l3(&mut self, packet: &mut MetaPacket) -> Result<()> {
+    pub fn parse_l3(
+        &mut self,
+        flow_config: &FlowConfig,
+        log_parser_config: &LogParserConfig,
+        packet: &mut MetaPacket,
+        l7_performance_enabled: bool,
+        l7_log_parse_enabled: bool,
+        app_table: &mut AppTable,
+        local_epc: i32,
+        remote_epc: i32,
+        checker: &L7ProtocolChecker,
+    ) -> Result<L7ParseResult> {
         if let Some(l4) = self.l4.as_mut() {
             l4.parse(packet, false)?;
         }
-        Ok(())
+
+        if packet.signal_source == SignalSource::EBPF {
+            return Ok(L7ParseResult::None);
+        }
+
+        if l7_performance_enabled || l7_log_parse_enabled {
+            // 抛出错误由flowMap.FlowPerfCounter处理
+            return self.l7_parse(
+                flow_config,
+                log_parser_config,
+                packet,
+                app_table,
+                l7_performance_enabled,
+                l7_log_parse_enabled,
+                local_epc,
+                remote_epc,
+                checker,
+            );
+        }
+
+        Ok(L7ParseResult::None)
     }
 
     pub fn copy_and_reset_l4_perf_data(&mut self, flow_reversed: bool, flow: &mut Flow) {

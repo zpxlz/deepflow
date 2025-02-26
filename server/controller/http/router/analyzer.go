@@ -17,10 +17,14 @@
 package router
 
 import (
+	"fmt"
+
+	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/election"
 	httpcommon "github.com/deepflowio/deepflow/server/controller/http/common"
-	. "github.com/deepflowio/deepflow/server/controller/http/router/common"
+	"github.com/deepflowio/deepflow/server/controller/http/common/response"
+	routercommon "github.com/deepflowio/deepflow/server/controller/http/router/common"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/controller/monitor"
@@ -39,17 +43,24 @@ func NewAnalyzer(cfg *config.ControllerConfig, ac *monitor.AnalyzerCheck) *Analy
 }
 
 func (a *Analyzer) RegisterTo(e *gin.Engine) {
-	e.GET("/v1/analyzers/:lcuuid/", getAnalyzer)
-	e.GET("/v1/analyzers/", getAnalyzers)
-	e.PATCH("/v1/analyzers/:lcuuid/", updateAnalyzer(a.ac, a.cfg))
-	e.DELETE("/v1/analyzers/:lcuuid/", deleteAnalyzer(a.ac, a.cfg))
+	adminRoutes := e.Group("/v1/analyzers")
+	adminRoutes.Use(AdminPermissionVerificationMiddleware())
+
+	adminRoutes.GET("/:lcuuid/", getAnalyzer)
+	adminRoutes.GET("/", getAnalyzers)
+	adminRoutes.PATCH("/:lcuuid/", updateAnalyzer(a.ac, a.cfg))
+	adminRoutes.DELETE("/:lcuuid/", deleteAnalyzer(a.ac, a.cfg))
 }
 
 func getAnalyzer(c *gin.Context) {
 	args := make(map[string]interface{})
 	args["lcuuid"] = c.Param("lcuuid")
-	data, err := service.GetAnalyzers(args)
-	JsonResponse(c, data, err)
+	orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+	data, err := service.GetAnalyzers(orgID.(int), args)
+	if err != nil {
+		err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+	}
+	response.JSON(c, response.SetData(data), response.SetError(err))
 }
 
 func getAnalyzers(c *gin.Context) {
@@ -66,8 +77,13 @@ func getAnalyzers(c *gin.Context) {
 	if value, ok := c.GetQuery("region"); ok {
 		args["region"] = value
 	}
-	data, err := service.GetAnalyzers(args)
-	JsonResponse(c, data, err)
+
+	orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+	data, err := service.GetAnalyzers(orgID.(int), args)
+	if err != nil {
+		err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+	}
+	response.JSON(c, response.SetData(data), response.SetError(err))
 }
 
 func updateAnalyzer(m *monitor.AnalyzerCheck, cfg *config.ControllerConfig) gin.HandlerFunc {
@@ -78,14 +94,14 @@ func updateAnalyzer(m *monitor.AnalyzerCheck, cfg *config.ControllerConfig) gin.
 		// 如果不是masterController，将请求转发至是masterController
 		isMasterController, masterControllerIP, _ := election.IsMasterControllerAndReturnIP()
 		if !isMasterController {
-			ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
+			routercommon.ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
 			return
 		}
 
 		// 参数校验
 		err = c.ShouldBindBodyWith(&analyzerUpdate, binding.JSON)
 		if err != nil {
-			BadRequestResponse(c, httpcommon.INVALID_PARAMETERS, err.Error())
+			response.JSON(c, response.SetOptStatus(httpcommon.INVALID_PARAMETERS), response.SetError(err))
 			return
 		}
 
@@ -95,8 +111,12 @@ func updateAnalyzer(m *monitor.AnalyzerCheck, cfg *config.ControllerConfig) gin.
 		c.ShouldBindBodyWith(&patchMap, binding.JSON)
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.UpdateAnalyzer(lcuuid, patchMap, m, cfg)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.UpdateAnalyzer(orgID.(int), lcuuid, patchMap, m, cfg)
+		if err != nil {
+			err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+		}
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }
 
@@ -105,12 +125,16 @@ func deleteAnalyzer(m *monitor.AnalyzerCheck, cfg *config.ControllerConfig) gin.
 		// if not master controller，should forward to master controller
 		isMasterController, masterControllerIP, _ := election.IsMasterControllerAndReturnIP()
 		if !isMasterController {
-			ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
+			routercommon.ForwardMasterController(c, masterControllerIP, cfg.ListenPort)
 			return
 		}
 
 		lcuuid := c.Param("lcuuid")
-		data, err := service.DeleteAnalyzer(lcuuid, m)
-		JsonResponse(c, data, err)
+		orgID, _ := c.Get(common.HEADER_KEY_X_ORG_ID)
+		data, err := service.DeleteAnalyzer(orgID.(int), lcuuid, m)
+		if err != nil {
+			err = fmt.Errorf("org id(%d), %s", orgID.(int), err.Error())
+		}
+		response.JSON(c, response.SetData(data), response.SetError(err))
 	})
 }

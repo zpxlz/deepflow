@@ -20,14 +20,15 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"net/url"
 	"sync"
 
 	"github.com/deepflowio/deepflow/message/trident"
 	"github.com/deepflowio/deepflow/server/libs/datatype"
+	flow_metrics "github.com/deepflowio/deepflow/server/libs/flow-metrics"
 	"github.com/deepflowio/deepflow/server/libs/grpc"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 	"github.com/deepflowio/deepflow/server/libs/stats"
-	"github.com/deepflowio/deepflow/server/libs/zerodoc"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	logging "github.com/op/go-logging"
@@ -48,10 +49,11 @@ func (s DBs) Exec(query string, args ...any) (sql.Result, error) {
 	for _, conn := range s {
 		log.Infof("Begin exec SQL: %s", query)
 		result, err = conn.Exec(query, args...)
-		log.Infof("End exec SQL: %s, err: %v", query, err)
 		if err != nil {
+			log.Infof("End exec SQL: %s, err: %v", query, err)
 			return result, err
 		}
+		log.Infof("End exec SQL: %s", query)
 	}
 	return result, nil
 }
@@ -77,20 +79,23 @@ func (s DBs) ExecParallel(query string, args ...any) (sql.Result, error) {
 	return result, err
 }
 
-func (s DBs) Query(query string, args ...any) (*sql.Rows, error) {
-	var result *sql.Rows
-	var err error
+func (s DBs) Query(query string, args ...any) ([]*sql.Rows, error) {
+	var results []*sql.Rows
 	for _, conn := range s {
-		result, err = conn.Query(query, args...)
+		result, err := conn.Query(query, args...)
+		results = append(results, result)
 		if err != nil {
-			return result, err
+			return results, err
 		}
 	}
-	return result, nil
+	return results, nil
 }
 
 func (s DBs) Close() error {
 	for _, conn := range s {
+		if conn == nil {
+			continue
+		}
 		if err := conn.Close(); err != nil {
 			return err
 		}
@@ -111,15 +116,15 @@ func NewCKConnections(addrs []string, username, password string) (DBs, error) {
 }
 
 func NewCKConnection(addr, username, password string) (*sql.DB, error) {
-	connect, err := sql.Open("clickhouse", fmt.Sprintf("//%s:%s@%s", username, password, addr))
+	connect, err := sql.Open("clickhouse", fmt.Sprintf("//%s@%s?dial_timeout=10s&max_execution_time=120", url.UserPassword(username, password), addr))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("new ck connection to %s failed: %s", addr, err)
 	}
 	if err := connect.Ping(); err != nil {
 		if exception, ok := err.(*clickhouse.Exception); ok {
 			log.Warningf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
 		}
-		return nil, err
+		return nil, fmt.Errorf("ck connection ping (%s) failed: %s", addr, err)
 	}
 	return connect, nil
 }
@@ -129,11 +134,11 @@ func RegisterCountableForIngester(name string, countable stats.Countable, opts .
 }
 
 // 如果通过MAC匹配平台信息失败，则需要通过IP再获取, 解决工单122/126问题
-func RegetInfoFromIP(isIPv6 bool, ip6 net.IP, ip4 uint32, epcID int32, platformData *grpc.PlatformInfoTable) *grpc.Info {
+func RegetInfoFromIP(orgId uint16, isIPv6 bool, ip6 net.IP, ip4 uint32, epcID int32, platformData *grpc.PlatformInfoTable) *grpc.Info {
 	if isIPv6 {
-		return platformData.QueryIPV6Infos(epcID, ip6)
+		return platformData.QueryIPV6Infos(orgId, epcID, ip6)
 	} else {
-		return platformData.QueryIPV4Infos(epcID, ip4)
+		return platformData.QueryIPV4Infos(orgId, epcID, ip4)
 	}
 }
 
@@ -141,15 +146,18 @@ const (
 	IpType         = 255
 	InternetIpType = 0
 
-	PodType     = 10
-	PodNodeType = 14
+	PodType     = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD)      // 10
+	PodNodeType = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_NODE) // 14
 
-	ServiceType = 102
+	PodServiceType    = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_SERVICE)    // 12
+	PodClusterType    = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_POD_CLUSTER)    // 103
+	CustomServiceType = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_CUSTOM_SERVICE) // 104
 
-	ProcessType = 120
+	ProcessType = uint8(trident.AutoServiceType_AUTO_SERVICE_TYPE_PROCESS) // 120
+
 )
 
-func GetAutoInstance(podID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType uint8, l3EpcID int32) (uint32, uint8) {
+func GetAutoInstance(podID, gpID, podNodeID, l3DeviceID, subnetID uint32, l3DeviceType uint8, l3EpcID int32) (uint32, uint8) {
 	if podID > 0 {
 		return podID, PodType
 	} else if gpID > 0 {
@@ -162,27 +170,29 @@ func GetAutoInstance(podID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType uin
 		return 0, InternetIpType
 	}
 
-	return 0, IpType
+	return subnetID, IpType
 }
 
-func GetAutoService(serviceID, podGroupID, gpID, podNodeID, l3DeviceID uint32, l3DeviceType, podGroupType uint8, l3EpcID int32) (uint32, uint8) {
-	if serviceID > 0 {
-		return serviceID, ServiceType
+func GetAutoService(customServiceID, podServiceID, podGroupID, gpID, podClusterID, l3DeviceID, subnetID uint32, l3DeviceType, podGroupType uint8, l3EpcID int32) (uint32, uint8) {
+	if customServiceID > 0 {
+		return customServiceID, CustomServiceType
+	} else if podServiceID > 0 {
+		return podServiceID, PodServiceType
 	} else if podGroupID > 0 {
 		return podGroupID, podGroupType
 	} else if gpID > 0 {
 		return gpID, ProcessType
-	} else if podNodeID > 0 {
-		return podNodeID, PodNodeType
+	} else if podClusterID > 0 {
+		return podClusterID, PodClusterType
 	} else if l3DeviceID > 0 {
 		return l3DeviceID, l3DeviceType
 	} else if l3EpcID == datatype.EPC_FROM_INTERNET {
 		return 0, InternetIpType
 	}
-	return 0, IpType
+	return subnetID, IpType
 }
 
-func IsPodServiceIP(deviceType zerodoc.DeviceType, podId, podNodeId uint32) bool {
+func IsPodServiceIP(deviceType flow_metrics.DeviceType, podId, podNodeId uint32) bool {
 	// 如果是NodeIP,clusterIP或后端podIP需要匹配service_id
-	return deviceType == zerodoc.DeviceType(trident.DeviceType_DEVICE_TYPE_POD_SERVICE) || podId != 0 || podNodeId != 0
+	return deviceType == flow_metrics.DeviceType(trident.DeviceType_DEVICE_TYPE_POD_SERVICE) || podId != 0 || podNodeId != 0
 }

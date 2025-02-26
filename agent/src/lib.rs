@@ -22,11 +22,11 @@ mod config;
 pub mod debug;
 pub mod dispatcher;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod ebpf;
+pub mod ebpf;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod ebpf_dispatcher;
 mod error;
-mod exception;
+pub mod exception;
 mod flow_generator;
 mod handler;
 mod integration_collector;
@@ -35,7 +35,7 @@ mod monitor;
 mod platform;
 mod plugin;
 mod policy;
-mod rpc;
+pub mod rpc;
 mod sender;
 pub mod trident;
 pub mod utils;

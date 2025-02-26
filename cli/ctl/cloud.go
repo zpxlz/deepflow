@@ -32,7 +32,7 @@ func RegisterCloudCommand() *cobra.Command {
 		Use:   "cloud",
 		Short: "debug cloud data commands",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("please run with 'info'.\n")
+			fmt.Printf("please run with 'info | task | trigger'.\n")
 		},
 	}
 
@@ -68,6 +68,16 @@ func RegisterCloudCommand() *cobra.Command {
 	}
 	cloud.AddCommand(task)
 
+	trigger := &cobra.Command{
+		Use:     "trigger domain-lcuuid",
+		Short:   "trigger domain",
+		Example: "deepflow-ctl cloud trigger domain-lcuuid",
+		Run: func(cmd *cobra.Command, args []string) {
+			triggerDomain(cmd, args)
+		},
+	}
+	cloud.AddCommand(trigger)
+
 	return cloud
 }
 
@@ -81,7 +91,7 @@ func getInfo(cmd *cobra.Command, domainLcuuid, domainName, resource string) {
 	lcuuid := domainLcuuid
 	if lcuuid == "" {
 		url := fmt.Sprintf("http://%s:%d/v2/domains/?name=%s", server.IP, server.Port, domainName)
-		resp, err := common.CURLResponseRawJson("GET", url, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+		resp, err := common.CURLResponseRawJson("GET", url, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd)), common.WithORGID(common.GetORGID(cmd))}...)
 		if err != nil {
 			fmt.Println("get domain info by name failed.")
 			fmt.Fprintln(os.Stderr, err)
@@ -144,4 +154,19 @@ func getTask(cmd *cobra.Command, args []string) {
 		return
 	}
 	common.PrettyPrint(resp.Get("DATA"))
+}
+
+func triggerDomain(cmd *cobra.Command, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "must specify domain-lcuuid.")
+		return
+	}
+	server := common.GetServerInfo(cmd)
+	url := fmt.Sprintf("http://%s:%d/v1/trigger-domain/%s/", server.IP, server.Port, args[0])
+	resp, err := common.CURLResponseRawJson("GET", url, []common.HTTPOption{common.WithTimeout(common.GetTimeout(cmd))}...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	common.PrettyPrint(resp)
 }

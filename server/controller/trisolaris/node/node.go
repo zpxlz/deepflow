@@ -17,100 +17,127 @@
 package node
 
 import (
+	"context"
 	"errors"
+	"hash/fnv"
+	"math/rand"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	"github.com/op/go-logging"
 	"gorm.io/gorm"
 
 	"github.com/deepflowio/deepflow/message/trident"
 	. "github.com/deepflowio/deepflow/server/controller/common"
-	models "github.com/deepflowio/deepflow/server/controller/db/mysql"
+	models "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/controller/http/common"
 	"github.com/deepflowio/deepflow/server/controller/http/service"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/config"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/metadata"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/pushmanager"
+	. "github.com/deepflowio/deepflow/server/controller/trisolaris/utils"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
-var log = logging.MustGetLogger("trisolaris/node")
+var log = logger.MustGetLogger("trisolaris.node")
 
 type NodeInfo struct {
-	tsdbCaches              *TSDBCacheMap // 数据节点缓存
-	tsdbRegion              map[string]uint32
-	tsdbToNATIP             map[string]string
-	tsdbToPodIP             map[string]string
-	tsdbToID                map[string]uint32
-	controllerToNATIP       map[string]string
-	controllerToPodIP       map[string]string
-	localServers            *atomic.Value // []*trident.DeepFlowServerInstanceInfo
-	platformData            *atomic.Value // *metaData.PlatformData
-	localRegion             *string
-	localAZs                []string
-	sysConfigurationToValue map[string]string
-	pcapDataRetention       uint32
-	metaData                *metadata.MetaData
-	tsdbRegister            *TSDBDiscovery
-	controllerRegister      *ControllerDiscovery
-	chRegister              chan struct{} // 数据节点注册通知channel
-	config                  *config.Config
-	chNodeInfo              chan struct{} // node变化通知channel
-	db                      *gorm.DB
+	tsdbCaches                *TSDBCacheMap // 数据节点缓存
+	tsdbRegion                map[string]uint32
+	tsdbToNATIP               map[string]string
+	tsdbToPodIP               map[string]string
+	tsdbToID                  map[string]uint32
+	controllerToNATIP         map[string]string
+	controllerToPodIP         map[string]string
+	localServers              *atomic.Value // []*trident.DeepFlowServerInstanceInfo
+	platformData              *atomic.Value // *metaData.PlatformData
+	localRegion               *string
+	localAZs                  []string
+	sysConfigurationToValue   map[string]string
+	pcapDataRetention         uint32
+	metaData                  *metadata.MetaData
+	tsdbRegister              *TSDBDiscovery
+	controllerRegister        *ControllerDiscovery
+	chRegister                chan struct{} // 数据节点注册通知channel
+	config                    *config.Config
+	chNodeInfo                chan struct{} // node变化通知channel
+	chBasePlatformDataChanged chan struct{}
+	platformDataVersion       uint64
+
+	universalTagNames  *trident.UniversalTagNameMapsResponse
+	tagNameMapsVersion uint32
+	tagNameMapsHash    uint64
+
+	db     *gorm.DB
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	ORGID
 }
 
-func NewNodeInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config) *NodeInfo {
+func NewNodeInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config, orgID int, pctx context.Context) *NodeInfo {
+	ctx, cancel := context.WithCancel(pctx)
 	localServers := &atomic.Value{}
 	localServers.Store([]*trident.DeepFlowServerInstanceInfo{})
 	platformData := &atomic.Value{}
 	platformData.Store(metadata.NewPlatformData("", "", 0, 0))
-	return &NodeInfo{
-		tsdbCaches:              newTSDBCacheMap(),
-		tsdbRegion:              make(map[string]uint32),
-		tsdbToNATIP:             make(map[string]string),
-		tsdbToPodIP:             make(map[string]string),
-		tsdbToID:                make(map[string]uint32),
-		controllerToNATIP:       make(map[string]string),
-		controllerToPodIP:       make(map[string]string),
-		localServers:            localServers,
-		platformData:            platformData,
-		sysConfigurationToValue: make(map[string]string),
-		metaData:                metaData,
-		tsdbRegister:            newTSDBDiscovery(),
-		controllerRegister:      newControllerDiscovery(cfg.NodeIP, cfg.NodeType, cfg.RegionDomainPrefix),
-		chRegister:              make(chan struct{}, 1),
-		config:                  cfg,
-		chNodeInfo:              make(chan struct{}, 1),
-		db:                      db,
+	nodeInfo := &NodeInfo{
+		tsdbCaches:                newTSDBCacheMap(),
+		tsdbRegion:                make(map[string]uint32),
+		tsdbToNATIP:               make(map[string]string),
+		tsdbToPodIP:               make(map[string]string),
+		tsdbToID:                  make(map[string]uint32),
+		controllerToNATIP:         make(map[string]string),
+		controllerToPodIP:         make(map[string]string),
+		localServers:              localServers,
+		platformData:              platformData,
+		sysConfigurationToValue:   make(map[string]string),
+		metaData:                  metaData,
+		tsdbRegister:              newTSDBDiscovery(),
+		controllerRegister:        newControllerDiscovery(cfg.NodeIP, cfg.NodeType, cfg.RegionDomainPrefix, metaData.ORGID),
+		chRegister:                make(chan struct{}, 1),
+		config:                    cfg,
+		chNodeInfo:                make(chan struct{}, 1),
+		chBasePlatformDataChanged: make(chan struct{}, 1),
+		universalTagNames:         &trident.UniversalTagNameMapsResponse{},
+		tagNameMapsVersion:        uint32(time.Now().Unix()) + uint32(rand.Intn(10000)),
+		tagNameMapsHash:           0,
+		db:                        db,
+		ctx:                       ctx,
+		cancel:                    cancel,
+		ORGID:                     ORGID(orgID),
+	}
+	return nodeInfo
+}
+
+func (n *NodeInfo) NotifyBasePlatformDataChanged() {
+	if n == nil {
+		return
+	}
+	select {
+	case n.chBasePlatformDataChanged <- struct{}{}:
+	default:
 	}
 }
 
 func (n *NodeInfo) GetTSDBCache(key string) *TSDBCache {
+	if n == nil {
+		return nil
+	}
 	return n.tsdbCaches.Get(key)
 }
 
-func (n *NodeInfo) GetPlatformDataVersion() uint64 {
-	return n.getPlatformData().GetPlatformDataVersion()
-}
-
-func (n *NodeInfo) GetPlatformDataStr() []byte {
-	return n.getPlatformData().GetPlatformDataStr()
-}
-
-func (n *NodeInfo) GetPodIPs() []*trident.PodIp {
-	return n.metaData.GetPlatformDataOP().GetPodIPs()
-}
-
 func (n *NodeInfo) updateTSDBSyncedToDB() {
-	log.Info("update tsdb info to db")
+	log.Info(n.Log("update tsdb info to db"))
 	dbTSDBs, err := dbmgr.DBMgr[models.Analyzer](n.db).Gets()
 	if err != nil || len(dbTSDBs) == 0 {
-		log.Error(err)
+		log.Error(n.Logf("get analyzer(count=%d) failed  err:%v", len(dbTSDBs), err))
 		return
 	}
 	keytoDB := make(map[string]*models.Analyzer)
@@ -183,14 +210,15 @@ func (n *NodeInfo) updateTSDBSyncedToDB() {
 		if filter == true {
 			updateTSDB = append(updateTSDB, dbTSDB)
 		}
+
 		cacheTSDB.unsetSyncFlag()
 	}
 
 	if len(updateTSDB) > 0 {
 		mgr := dbmgr.DBMgr[models.Analyzer](n.db)
-		err := mgr.UpdateBulk(updateTSDB)
+		err := mgr.AnalyzerUpdateBulk(updateTSDB)
 		if err != nil {
-			log.Error(err)
+			log.Error(n.Log(err.Error()))
 		}
 	}
 }
@@ -199,11 +227,11 @@ func (n *NodeInfo) AddTSDBCache(tsdb *models.Analyzer) {
 	tsdbCache := newTSDBCache(tsdb)
 	n.tsdbCaches.Add(tsdbCache)
 
-	log.Infof("add tsdb cache %s", tsdb.IP)
+	log.Infof(n.Logf("add tsdb cache %s", tsdb.IP))
 }
 
 func (n *NodeInfo) DeleteTSDBCache(key string) {
-	log.Info("delete tsdb cache", key)
+	log.Info(n.Logf("delete tsdb cache %s", key))
 	n.tsdbCaches.Delete(key)
 }
 
@@ -229,7 +257,7 @@ func (n *NodeInfo) getLocalAZs() []string {
 func (n *NodeInfo) generateControllerInfo() {
 	dbControllers, err := dbmgr.DBMgr[models.Controller](n.db).Gets()
 	if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 		return
 	}
 	if len(dbControllers) == 0 {
@@ -238,7 +266,7 @@ func (n *NodeInfo) generateControllerInfo() {
 	localIPs := make(map[string]struct{})
 	localConn, err := dbmgr.DBMgr[models.AZControllerConnection](n.db).GetFromControllerIP(n.config.NodeIP)
 	if err != nil {
-		log.Errorf("find local controller(%s) region failed, err:%s", n.config.NodeIP, err)
+		log.Errorf(n.Logf("find local controller(%s) region failed, err:%s", n.config.NodeIP, err))
 	} else {
 		n.updateLocalRegion(localConn.Region)
 		azControllerconns, err := dbmgr.DBMgr[models.AZControllerConnection](n.db).GetBatchFromRegion(localConn.Region)
@@ -249,7 +277,7 @@ func (n *NodeInfo) generateControllerInfo() {
 				}
 			}
 		} else {
-			log.Error(err)
+			log.Error(n.Log(err.Error()))
 		}
 	}
 
@@ -283,7 +311,7 @@ func (n *NodeInfo) generateControllerInfo() {
 		}
 		n.updateLocalAZs(localAZs)
 	} else {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 	}
 }
 
@@ -301,7 +329,7 @@ func (n *NodeInfo) initTSDBInfo() {
 	n.correctTSDBPodIP()
 	dbTSDBs, err := dbmgr.DBMgr[models.Analyzer](n.db).Gets()
 	if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 		return
 	}
 	if len(dbTSDBs) == 0 {
@@ -325,8 +353,16 @@ func (n *NodeInfo) initTSDBInfo() {
 }
 
 func (n *NodeInfo) generateTSDBRegion() {
-	dbAZTSDBConns, _ := dbmgr.DBMgr[models.AZAnalyzerConnection](n.db).Gets()
-	dbRegions, _ := dbmgr.DBMgr[models.Region](n.db).Gets()
+	dbAZTSDBConns, err := dbmgr.DBMgr[models.AZAnalyzerConnection](n.db).Gets()
+	if err != nil {
+		log.Error(n.Log(err.Error()))
+		return
+	}
+	dbRegions, err := dbmgr.DBMgr[models.Region](n.db).Gets()
+	if err != nil {
+		log.Error(n.Log(err.Error()))
+		return
+	}
 	lcuuidToRegionID := make(map[string]int)
 	ipToRegionID := make(map[string]uint32)
 	for _, region := range dbRegions {
@@ -341,7 +377,11 @@ func (n *NodeInfo) generateTSDBRegion() {
 }
 
 func (n *NodeInfo) generatesysConfiguration() {
-	dbSysConfigurations, _ := dbmgr.DBMgr[models.SysConfiguration](n.db).Gets()
+	dbSysConfigurations, err := dbmgr.DBMgr[models.SysConfiguration](n.db).Gets()
+	if err != nil {
+		log.Error(n.Log(err.Error()))
+		return
+	}
 	sysConfigurationToValue := make(map[string]string)
 	if dbSysConfigurations != nil {
 		for _, sysConfig := range dbSysConfigurations {
@@ -360,10 +400,16 @@ func (n *NodeInfo) generatesysConfiguration() {
 }
 
 func (n *NodeInfo) GetPcapDataRetention() uint32 {
+	if n == nil {
+		return 0
+	}
 	return n.pcapDataRetention
 }
 
 func (n *NodeInfo) GetRegionIDByTSDBIP(tsdbIP string) uint32 {
+	if n == nil {
+		return 0
+	}
 	return n.tsdbRegion[tsdbIP]
 }
 
@@ -385,10 +431,16 @@ func (n *NodeInfo) updateTSDBToID(data map[string]uint32) {
 }
 
 func (n *NodeInfo) GetTSDBID(ip string) uint32 {
+	if n == nil {
+		return 0
+	}
 	return n.tsdbToID[ip]
 }
 
 func (n *NodeInfo) GetTSDBNatIP(ip string) string {
+	if n == nil {
+		return ""
+	}
 	return n.tsdbToNATIP[ip]
 }
 
@@ -397,14 +449,23 @@ func (n *NodeInfo) updateTSDBPodIP(data map[string]string) {
 }
 
 func (n *NodeInfo) GetTSDBPodIP(ip string) string {
+	if n == nil {
+		return ""
+	}
 	return n.tsdbToPodIP[ip]
 }
 
 func (n *NodeInfo) GetControllerNatIP(ip string) string {
+	if n == nil {
+		return ""
+	}
 	return n.controllerToNATIP[ip]
 }
 
 func (n *NodeInfo) GetControllerPodIP(ip string) string {
+	if n == nil {
+		return ""
+	}
 	return n.controllerToPodIP[ip]
 }
 
@@ -413,13 +474,20 @@ func (n *NodeInfo) updateLocalServers(servers []*trident.DeepFlowServerInstanceI
 }
 
 func (n *NodeInfo) GetLocalControllers() []*trident.DeepFlowServerInstanceInfo {
+	if n == nil {
+		return nil
+	}
 	return n.localServers.Load().([]*trident.DeepFlowServerInstanceInfo)
 }
 
 func (n *NodeInfo) updateTSDBInfo() {
 	n.generateTSDBRegion()
 	n.generatesysConfiguration()
-	dbTSDBs, _ := dbmgr.DBMgr[models.Analyzer](n.db).Gets()
+	dbTSDBs, err := dbmgr.DBMgr[models.Analyzer](n.db).Gets()
+	if err != nil {
+		log.Error(n.Log(err.Error()))
+		return
+	}
 	dbKeys := mapset.NewSet()
 	ipToTSDB := make(map[string]*models.Analyzer)
 	tsdbToNATIP := make(map[string]string)
@@ -464,8 +532,13 @@ func (n *NodeInfo) generateTSDBCache() {
 	n.updateTSDBSyncedToDB()
 }
 
-func (n *NodeInfo) generateNodeCache() {
+func (n *NodeInfo) generateDataForDefaultORG() {
 	n.generateTSDBCache()
+	n.generateControllerInfo()
+}
+
+func (n *NodeInfo) generateDataForNoDefaultORG() {
+	n.updateTSDBInfo()
 	n.generateControllerInfo()
 }
 
@@ -473,7 +546,7 @@ func (n *NodeInfo) registerTSDBToDB(tsdb *models.Analyzer) {
 	tsdbMgr := dbmgr.DBMgr[models.Analyzer](n.db)
 	tsdbs, err := tsdbMgr.Gets()
 	if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 		return
 	}
 	var azConns []*models.AZAnalyzerConnection
@@ -508,12 +581,12 @@ func (n *NodeInfo) registerTSDBToDB(tsdb *models.Analyzer) {
 					log.Error(err)
 				}
 			} else {
-				log.Error(err)
+				log.Error(n.Log(err.Error()))
 			}
 		}
 		err = tsdbMgr.Insert(tsdb)
 		if err != nil {
-			log.Error(err)
+			log.Error(n.Log(err.Error()))
 			return
 		}
 		n.AddTSDBCache(tsdb)
@@ -521,28 +594,29 @@ func (n *NodeInfo) registerTSDBToDB(tsdb *models.Analyzer) {
 			for _, azConn := range azConns {
 				err := dbmgr.DBMgr[models.AZAnalyzerConnection](n.db).Insert(azConn)
 				if err != nil {
-					log.Error(err)
+					log.Error(n.Log(err.Error()))
 				}
 			}
 		}
 
+		dataSourceService := service.NewDataSourceWithIngesterAPIConfig(&common.UserInfo{ORGID: n.GetORGID()}, n.config.GetIngesterAPI())
 		if IsStandaloneRunningMode() {
 			// in standalone mode, since all in one deployment and analyzer communication use 127.0.0.1
-			err = service.ConfigAnalyzerDataSource("127.0.0.1")
+			err = dataSourceService.ConfigAnalyzerDataSource(n.GetORGID(), "127.0.0.1")
 		} else {
-			err = service.ConfigAnalyzerDataSource(tsdb.IP)
+			err = dataSourceService.ConfigAnalyzerDataSource(n.GetORGID(), tsdb.IP)
 		}
 
 		if err != nil {
-			log.Error(err)
+			log.Error(n.Log(err.Error()))
 		}
 	} else if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 	}
 }
 
 func (n *NodeInfo) RegisterTSDB(request *trident.SyncRequest) {
-	log.Infof("register tsdb(%v)", request)
+	log.Infof(n.Logf("register tsdb(%v)", request))
 	n.tsdbRegister.register(request)
 	select {
 	case n.chRegister <- struct{}{}:
@@ -618,36 +692,21 @@ func (n *NodeInfo) isRegisterController() {
 	} else if errors.Is(err, gorm.ErrRecordNotFound) {
 		n.registerControllerToDB(data)
 	} else {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 	}
 }
 
-func (n *NodeInfo) GetGroups() []byte {
-	return n.metaData.GetDropletGroups()
-}
-
-func (n *NodeInfo) GetGroupsVersion() uint64 {
-	return n.metaData.GetDropletGroupsVersion()
-}
-
-func (n *NodeInfo) GetPolicy() []byte {
-	return n.metaData.GetDropletPolicyStr()
-}
-
-func (n *NodeInfo) GetPolicyVersion() uint64 {
-	return n.metaData.GetDropletPolicyVersion()
-}
-
 func (n *NodeInfo) registerControllerToDB(data *models.Controller) {
-	log.Infof("resiter controller(%+v)", data)
+	log.Infof(n.Logf("resiter controller(%+v)", data))
 	controllerDBMgr := dbmgr.DBMgr[models.Controller](n.db)
 	controllers, err := controllerDBMgr.Gets()
 	if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 		return
 	}
 	controllerCount := len(controllers)
 	var azConns []*models.AZControllerConnection
+
 	switch {
 	case controllerCount == 0 || data.CAMD5 == "":
 		azConn := &models.AZControllerConnection{
@@ -672,15 +731,15 @@ func (n *NodeInfo) registerControllerToDB(data *models.Controller) {
 					azConns = append(azConns, azConn)
 				}
 			} else {
-				log.Error(err)
+				log.Error(n.Log(err.Error()))
 			}
 		} else {
-			log.Error(err)
+			log.Error(n.Log(err.Error()))
 		}
 	}
 	err = controllerDBMgr.Insert(data)
 	if err != nil {
-		log.Error(err)
+		log.Error(n.Log(err.Error()))
 		return
 	}
 	if len(azConns) != 0 {
@@ -688,14 +747,66 @@ func (n *NodeInfo) registerControllerToDB(data *models.Controller) {
 		for _, azConn := range azConns {
 			err := connDBMgr.Insert(azConn)
 			if err != nil {
-				log.Error(err)
+				log.Error(n.Log(err.Error()))
 			}
 		}
 	}
 }
 
+func (n *NodeInfo) GetGroups() []byte {
+	if n == nil {
+		return nil
+	}
+	return n.metaData.GetDropletGroups()
+}
+
+func (n *NodeInfo) GetGroupsVersion() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.metaData.GetDropletGroupsVersion()
+}
+
+func (n *NodeInfo) GetPolicy() []byte {
+	if n == nil {
+		return nil
+	}
+	return n.metaData.GetDropletPolicyStr()
+}
+
+func (n *NodeInfo) GetPolicyVersion() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.metaData.GetDropletPolicyVersion()
+}
+
+func (n *NodeInfo) GetPlatformDataVersion() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.getPlatformData().GetPlatformDataVersion()
+}
+
 func (n *NodeInfo) getPlatformData() *metadata.PlatformData {
+	if n == nil {
+		return nil
+	}
 	return n.platformData.Load().(*metadata.PlatformData)
+}
+
+func (n *NodeInfo) GetPlatformDataStr() []byte {
+	if n == nil {
+		return nil
+	}
+	return n.getPlatformData().GetPlatformDataStr()
+}
+
+func (n *NodeInfo) GetPodIPs() []*trident.PodIp {
+	if n == nil {
+		return nil
+	}
+	return n.metaData.GetPlatformDataOP().GetPodIPs()
 }
 
 func (n *NodeInfo) updatePlatformData(data *metadata.PlatformData) {
@@ -706,11 +817,151 @@ func (n *NodeInfo) getPodClusterInternalIPToIngester() int {
 	return n.config.PodClusterInternalIPToIngester
 }
 
+func (n *NodeInfo) GetUniversalTagNames() *trident.UniversalTagNameMapsResponse {
+	if n == nil {
+		return nil
+	}
+	return n.universalTagNames
+}
+
+func (m *NodeInfo) updateUniversalTagNames(data *trident.UniversalTagNameMapsResponse) {
+	m.universalTagNames = data
+}
+
+func (n *NodeInfo) generateUniversalTagNameMaps() {
+	dbCache := n.metaData.GetDBDataCache()
+	devices := dbCache.GetChDevicesIDTypeAndName()
+	pods := dbCache.GetPods()
+	regions := dbCache.GetRegions()
+	azs := dbCache.GetAZs()
+	podNodes := dbCache.GetPodNodes()
+	podNSes := dbCache.GetPodNSsIDAndName()
+	podGroups := dbCache.GetPodGroups()
+	podClusters := dbCache.GetPodClusters()
+	vpcs := dbCache.GetVPCs()
+	subnets := dbCache.GetSubnets()
+	processes := dbCache.GetProcesses()
+	vtaps := dbCache.GetVTapsIDAndName()
+	resp := &trident.UniversalTagNameMapsResponse{
+		DeviceMap:      make([]*trident.DeviceMap, len(devices)),
+		PodK8SLabelMap: make([]*trident.PodK8SLabelMap, len(pods)),
+		PodMap:         make([]*trident.IdNameMap, len(pods)),
+		RegionMap:      make([]*trident.IdNameMap, len(regions)),
+		AzMap:          make([]*trident.IdNameMap, len(azs)),
+		PodNodeMap:     make([]*trident.IdNameMap, len(podNodes)),
+		PodNsMap:       make([]*trident.IdNameMap, len(podNSes)),
+		PodGroupMap:    make([]*trident.IdNameMap, len(podGroups)),
+		PodClusterMap:  make([]*trident.IdNameMap, len(podClusters)),
+		L3EpcMap:       make([]*trident.IdNameMap, len(vpcs)),
+		SubnetMap:      make([]*trident.IdNameMap, len(subnets)),
+		GprocessMap:    make([]*trident.IdNameMap, len(processes)),
+		VtapMap:        make([]*trident.IdNameMap, len(vtaps)),
+	}
+	for i, pod := range pods {
+		var labelName, labelValue []string
+		for _, label := range strings.Split(pod.Label, ", ") {
+			if value := strings.Split(label, ":"); len(value) > 1 {
+				labelName = append(labelName, value[0])
+				labelValue = append(labelValue, value[1])
+			}
+		}
+		resp.PodK8SLabelMap[i] = &trident.PodK8SLabelMap{
+			PodId:      proto.Uint32(uint32(pod.ID)),
+			LabelName:  labelName,
+			LabelValue: labelValue,
+		}
+		resp.PodMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(pod.ID)),
+			Name: proto.String(pod.Name),
+		}
+	}
+	for i, region := range regions {
+		resp.RegionMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(region.ID)),
+			Name: proto.String(region.Name),
+		}
+	}
+	for i, az := range azs {
+		resp.AzMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(az.ID)),
+			Name: proto.String(az.Name),
+		}
+	}
+	for i, podNode := range podNodes {
+		resp.PodNodeMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(podNode.ID)),
+			Name: proto.String(podNode.Name),
+		}
+	}
+	for i, podNS := range podNSes {
+		resp.PodNsMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(podNS.ID)),
+			Name: proto.String(podNS.Name),
+		}
+	}
+	for i, podGroup := range podGroups {
+		resp.PodGroupMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(podGroup.ID)),
+			Name: proto.String(podGroup.Name),
+		}
+	}
+	for i, podCluster := range podClusters {
+		resp.PodClusterMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(podCluster.ID)),
+			Name: proto.String(podCluster.Name),
+		}
+	}
+	for i, vpc := range vpcs {
+		resp.L3EpcMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(vpc.ID)),
+			Name: proto.String(vpc.Name),
+		}
+	}
+	for i, subnet := range subnets {
+		resp.SubnetMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(subnet.ID)),
+			Name: proto.String(subnet.Name),
+		}
+	}
+	for i, process := range processes {
+		resp.GprocessMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(process.ID)),
+			Name: proto.String(process.Name),
+		}
+	}
+	for i, vtap := range vtaps {
+		resp.VtapMap[i] = &trident.IdNameMap{
+			Id:   proto.Uint32(uint32(vtap.ID)),
+			Name: proto.String(vtap.Name),
+		}
+	}
+	for i, chDevice := range devices {
+		resp.DeviceMap[i] = &trident.DeviceMap{
+			Id:   proto.Uint32(uint32(chDevice.DeviceID)),
+			Type: proto.Uint32(uint32(chDevice.DeviceType)),
+			Name: proto.String(chDevice.Name),
+		}
+	}
+	respStr, err := resp.Marshal()
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	h64 := fnv.New64()
+	h64.Write(respStr)
+	if h64.Sum64() != n.tagNameMapsHash {
+		n.tagNameMapsVersion += 1
+		n.tagNameMapsHash = h64.Sum64()
+	}
+	resp.Version = proto.Uint32(n.tagNameMapsVersion)
+	n.updateUniversalTagNames(resp)
+}
+
 func (n *NodeInfo) generatePlatformData() {
 	podClusterInternalIPToIngester := n.getPodClusterInternalIPToIngester()
 	localRegion := n.getLocalRegion()
 	localAZs := n.getLocalAZs()
-	log.Infof("generate ingester platform data (region=%s azs=%s podClusterInternalIPToIngester=%d)", n.getLocalRegion(), n.getLocalAZs(), podClusterInternalIPToIngester)
+	log.Infof(n.Logf("generate ingester platform data (region=%s azs=%s podClusterInternalIPToIngester=%d)", n.getLocalRegion(), n.getLocalAZs(), podClusterInternalIPToIngester))
 	switch podClusterInternalIPToIngester {
 	case ALL_K8S_CLUSTER:
 		n.updatePlatformData(n.metaData.GetPlatformDataOP().GetAllPlatformDataForIngester())
@@ -766,12 +1017,12 @@ func (n *NodeInfo) generatePlatformData() {
 }
 
 func (n *NodeInfo) registerTSDB() {
-	log.Info("start register rsdb")
+	log.Info(n.Log("start register tsdb"))
 	data := n.tsdbRegister.getRegisterData()
 	for _, tsdb := range data {
 		n.registerTSDBToDB(tsdb)
 	}
-	log.Info("end register tsdb")
+	log.Info(n.Log("end register tsdb"))
 }
 
 func (n *NodeInfo) PutChNodeInfo() {
@@ -781,37 +1032,48 @@ func (n *NodeInfo) PutChNodeInfo() {
 	}
 }
 
-func (n *NodeInfo) startMonitoRegister() {
-	for {
-		select {
-		case <-n.chRegister:
-			n.registerTSDB()
-		}
-	}
-}
-
 func (n *NodeInfo) TimedRefreshNodeCache() {
 	n.initTSDBInfo()
 	n.generateControllerInfo()
-	n.isRegisterController()
 	n.generatePlatformData()
-	go n.startMonitoRegister()
+	n.generateUniversalTagNameMaps()
+	if n.GetORGID() == DEFAULT_ORG_ID {
+		n.isRegisterController()
+	}
 	interval := time.Duration(n.config.NodeRefreshInterval)
 	ticker := time.NewTicker(interval * time.Second).C
 	for {
 		select {
 		case <-ticker:
-			log.Info("start generate node cache data from timed")
-			n.isRegisterController()
-			n.generateNodeCache()
+			log.Info(n.Log("start generate node cache data from timed"))
+			if n.GetORGID() == DEFAULT_ORG_ID {
+				n.isRegisterController()
+				n.generateDataForDefaultORG()
+			} else {
+				n.generateDataForNoDefaultORG()
+			}
 			n.generatePlatformData()
-			log.Info("end generate node cache data from timed")
+			n.generateUniversalTagNameMaps()
+			log.Info(n.Log("end generate node cache data from timed"))
 		case <-n.chNodeInfo:
-			log.Info("start generate node cache data from rpc")
-			n.generateNodeCache()
+			log.Info(n.Log("start generate node cache data from rpc"))
+			if n.GetORGID() == DEFAULT_ORG_ID {
+				n.generateDataForDefaultORG()
+			} else {
+				n.generateDataForNoDefaultORG()
+			}
 			n.generatePlatformData()
-			pushmanager.Broadcast()
-			log.Info("end generate node cache data from rpc")
+			log.Info(n.Log("end generate node cache data from rpc"))
+			pushmanager.IngesterBroadcast(n.GetORGID())
+		case <-n.chRegister:
+			n.registerTSDB()
+		case <-n.chBasePlatformDataChanged:
+			log.Info(n.Log("platformData changed generate ingester platformData"))
+			n.generatePlatformData()
+			pushmanager.IngesterBroadcast(n.GetORGID())
+		case <-n.ctx.Done():
+			log.Info(n.Log("exit generate node data"))
+			return
 		}
 	}
 }

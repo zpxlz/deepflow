@@ -18,38 +18,31 @@ package listener
 
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
-	"github.com/deepflowio/deepflow/server/controller/recorder/event"
-	"github.com/deepflowio/deepflow/server/libs/queue"
 )
 
 type PodNode struct {
-	cache         *cache.Cache
-	eventProducer *event.PodNode
+	cache *cache.Cache
 }
 
-func NewPodNode(c *cache.Cache, eq *queue.OverwriteQueue) *PodNode {
+func NewPodNode(c *cache.Cache) *PodNode {
 	listener := &PodNode{
-		cache:         c,
-		eventProducer: event.NewPodNode(c.ToolDataSet, eq),
+		cache: c,
 	}
 	return listener
 }
 
-func (n *PodNode) OnUpdaterAdded(addedDBItems []*mysql.PodNode) {
-	n.eventProducer.ProduceByAdd(addedDBItems)
+func (n *PodNode) OnUpdaterAdded(addedDBItems []*metadbmodel.PodNode) {
 	n.cache.AddPodNodes(addedDBItems)
 }
 
 func (n *PodNode) OnUpdaterUpdated(cloudItem *cloudmodel.PodNode, diffBase *diffbase.PodNode) {
-	n.eventProducer.ProduceByUpdate(cloudItem, diffBase)
 	diffBase.Update(cloudItem)
 	n.cache.UpdatePodNode(cloudItem)
 }
 
 func (n *PodNode) OnUpdaterDeleted(lcuuids []string) {
-	n.eventProducer.ProduceByDelete(lcuuids)
 	n.cache.DeletePodNodes(lcuuids)
 }

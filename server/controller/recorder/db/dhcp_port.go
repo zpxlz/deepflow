@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type DHCPPort struct {
-	OperatorBase[mysql.DHCPPort]
+	OperatorBase[*metadbmodel.DHCPPort, metadbmodel.DHCPPort]
 }
 
 func NewDHCPPort() *DHCPPort {
 	operater := &DHCPPort{
-		OperatorBase[mysql.DHCPPort]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.DHCPPort](
+			ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *DHCPPort) setDBItemID(dbItem *mysql.DHCPPort, id int) {
-	dbItem.ID = id
 }

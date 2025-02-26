@@ -5,7 +5,7 @@ REVISION = $(shell git rev-parse HEAD)
 BRANCH = $(shell git branch  --show-current)
 COMPILE_TIME= $(shell date +"%Y-%m-%d %H:%M:%S")
 # build tags: [-tags=go-json] used for [gin-gonic/gin] marshal json
-FLAGS = -gcflags "-l -l" -ldflags "-X main.Branch=${BRANCH} -X main.RevCount=${REV_COUNT} -X main.Revision=${REVISION} -X main.CommitDate=${COMMIT_DATE} \
+FLAGS = -ldflags "-X main.Branch=${BRANCH} -X main.RevCount=${REV_COUNT} -X main.Revision=${REVISION} -X main.CommitDate=${COMMIT_DATE} \
 		-X 'main.goVersion=$(shell go version)' -X 'main.CompileTime=${COMPILE_TIME}'" \
 		-tags=go_json
 BINARY_SUFFIX :=
@@ -16,9 +16,9 @@ all: server
 generate_sources = $(shell find -not -path './vendor/*' -name '*.go.tmpl' -or -name '*.tmpldata')
 generated_libs = libs/hmap/idmap/ubig_id_map.go libs/hmap/idmap/ubig_id_map_test.go \
 		 libs/hmap/lru/ubig_lru.go libs/hmap/lru/ubig_lru_test.go \
-		 libs/zerodoc/pooled_meters.go libs/kubernetes/watcher.gen.go
+		 libs/flow-metrics/pooled_meters.go libs/kubernetes/watcher.gen.go
 
-proto = vendor/${MESSAGE}/common/common.pb.go vendor/${MESSAGE}/trident/trident.pb.go vendor/${MESSAGE}/controller/controller.pb.go vendor/${MESSAGE}/alarm_event/alarm_event.pb.go libs/datatype/pb/flow_log.pb.go libs/zerodoc/pb/metric.pb.go libs/stats/pb/stats.pb.go
+proto = vendor/${MESSAGE}/common/common.pb.go vendor/${MESSAGE}/trident/trident.pb.go vendor/${MESSAGE}/agent/agent.pb.go vendor/${MESSAGE}/controller/controller.pb.go vendor/${MESSAGE}/alert_event/alert_event.pb.go vendor/${MESSAGE}/k8s_event/k8s_event.pb.go libs/datatype/pb/flow_log.pb.go libs/flow-metrics/pb/metric.pb.go libs/stats/pb/stats.pb.go
 
 $(generated_libs): $(generate_sources)
 	go generate ./...
@@ -37,6 +37,13 @@ vendor/${MESSAGE}/trident.proto: vendor
 	cp -r ../message/trident.proto vendor/${MESSAGE}/
 	cp -r ../message/trident vendor/${MESSAGE}/
 
+vendor/${MESSAGE}/agent/agent.pb.go: vendor/${MESSAGE}/agent.proto
+	cd vendor/${MESSAGE} && go generate agent/stub.go
+
+vendor/${MESSAGE}/agent.proto: vendor
+	cp -r ../message/agent.proto vendor/${MESSAGE}/
+	cp -r ../message/agent vendor/${MESSAGE}/
+
 vendor/${MESSAGE}/controller/controller.pb.go: vendor/${MESSAGE}/controller.proto
 	cd vendor/${MESSAGE} && go generate controller/stub.go
 
@@ -44,12 +51,19 @@ vendor/${MESSAGE}/controller.proto: vendor
 	cp -r ../message/controller.proto vendor/${MESSAGE}/
 	cp -r ../message/controller vendor/${MESSAGE}/
 
-vendor/${MESSAGE}/alarm_event/alarm_event.pb.go: vendor/${MESSAGE}/alarm_event.proto
-	cd vendor/${MESSAGE} && go generate alarm_event/stub.go
+vendor/${MESSAGE}/alert_event/alert_event.pb.go: vendor/${MESSAGE}/alert_event.proto
+	cd vendor/${MESSAGE} && go generate alert_event/stub.go
 
-vendor/${MESSAGE}/alarm_event.proto: vendor
-	cp -r ../message/alarm_event.proto vendor/${MESSAGE}/
-	cp -r ../message/alarm_event vendor/${MESSAGE}/
+vendor/${MESSAGE}/alert_event.proto: vendor
+	cp -r ../message/alert_event.proto vendor/${MESSAGE}/
+	cp -r ../message/alert_event vendor/${MESSAGE}/
+
+vendor/${MESSAGE}/k8s_event/k8s_event.pb.go: vendor/${MESSAGE}/k8s_event.proto
+	cd vendor/${MESSAGE} && go generate k8s_event/stub.go
+
+vendor/${MESSAGE}/k8s_event.proto: vendor
+	cp -r ../message/k8s_event.proto vendor/${MESSAGE}/
+	cp -r ../message/k8s_event vendor/${MESSAGE}/
 
 
 libs/datatype/pb/flow_log.proto: vendor
@@ -60,13 +74,13 @@ libs/datatype/pb/flow_log.proto: vendor
 libs/datatype/pb/flow_log.pb.go: libs/datatype/pb/flow_log.proto
 	cd libs/datatype/pb && go generate ./...
 
-libs/zerodoc/pb/metric.proto: vendor
-	cp -r ../message/metric.proto libs/zerodoc/pb
+libs/flow-metrics/pb/metric.proto: vendor
+	cp -r ../message/metric.proto libs/flow-metrics/pb
 	# delete first 3 char of line 6-10 for go language
-	sed -i '6,10s/^...//' libs/zerodoc/pb/metric.proto
+	sed -i '6,10s/^...//' libs/flow-metrics/pb/metric.proto
 
-libs/zerodoc/pb/metric.pb.go: libs/zerodoc/pb/metric.proto
-	cd libs/zerodoc/pb && go generate ./...
+libs/flow-metrics/pb/metric.pb.go: libs/flow-metrics/pb/metric.proto
+	cd libs/flow-metrics/pb && go generate ./...
 
 vendor/${MESSAGE}/stats.proto: vendor
 	cp -r ../message/stats.proto vendor/${MESSAGE}/
@@ -89,6 +103,8 @@ vendor:
 	patch -p1 -d vendor/github.com/ClickHouse/clickhouse-go/v2/ < patch/clickhouse-go/nullable.patch
 	# optimize write datatime
 	patch -p1 -d vendor/github.com/ClickHouse/clickhouse-go/v2/ < patch/clickhouse-go/datetime_uint32.patch
+	# reduce connection memory
+	patch -p1 -d vendor/github.com/ClickHouse/clickhouse-go/v2/ < patch/clickhouse-go/reduce_connection_memory.patch
 	# optimize the performance of hashmap when writing a large amount of data
 	patch -p1 -d vendor/github.com/cornelk/hashmap < patch/cornelk_hashmap/perf.patch
 	# hashmap support key [2]uint64
@@ -101,7 +117,7 @@ test: vendor $(proto) $(generated_libs)
 
 .PHONY: server
 server: vendor $(proto) $(generated_libs)
-	go build -mod vendor ${FLAGS} -o bin/deepflow-server${BINARY_SUFFIX} cmd/server/main.go cmd/server/config.go
+	go build -mod vendor ${FLAGS} -o bin/deepflow-server${BINARY_SUFFIX} cmd/server/main.go cmd/server/config.go cmd/server/free_os_memory_handler.go
 
 .PHONY: querier
 querier: vendor $(proto) $(generated_libs)
@@ -118,6 +134,6 @@ clean:
 	rm -f libs/geo/ip_info.go
 	rm -f $(generated_libs)
 	rm -f libs/datatype/pb/flow_log.proto
-	rm -f libs/zerodoc/pb/metric.proto
+	rm -f libs/flow-metrics/pb/metric.proto
 	rm -f libs/stats/pb/stats.proto
 	rm -f libs/kubernetes/watcher.gen.go

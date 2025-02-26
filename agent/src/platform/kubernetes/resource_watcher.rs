@@ -37,10 +37,14 @@ use k8s_openapi::{
         core::v1::{
             Container, ContainerStatus, Namespace, Node, NodeSpec, NodeStatus, Pod, PodSpec,
             PodStatus, ReplicationController, ReplicationControllerSpec, Service, ServiceSpec,
+            ServiceStatus,
         },
         extensions, networking,
     },
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    apimachinery::pkg::apis::meta::v1::{
+        FieldsV1, ManagedFieldsEntry, ObjectMeta, OwnerReference, Time,
+    },
+    Metadata,
 };
 use kube::{
     api::{ListParams, WatchEvent},
@@ -48,7 +52,6 @@ use kube::{
     Api, Client, Error as ClientErr, Resource as KubeResource, ResourceExt,
 };
 use log::{debug, info, trace, warn};
-use openshift_openapi::api::route::v1::Route;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 use tokio::{runtime::Handle, sync::Mutex, task::JoinHandle, time};
@@ -56,11 +59,11 @@ use tokio::{runtime::Handle, sync::Mutex, task::JoinHandle, time};
 use super::crd::{
     calico::IpPool,
     kruise::{CloneSet, StatefulSet as KruiseStatefulSet},
-    pingan::ServiceRule,
+    opengauss::OpenGaussCluster,
+    pingan_cloud::ServiceRule,
+    tkex::StatefulSetPlus,
 };
-use crate::utils::stats::{
-    self, Countable, Counter, CounterType, CounterValue, RefCountable, StatsOption,
-};
+use crate::utils::stats::{self, Countable, Counter, CounterType, CounterValue, RefCountable};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 const SLEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -76,6 +79,121 @@ pub trait Watcher {
     fn pb_name(&self) -> &str;
     fn version(&self) -> u64;
     fn ready(&self) -> bool;
+}
+
+#[derive(Clone, Debug)]
+pub struct Route {
+    metadata: ObjectMeta,
+    inner: openshift_openapi::api::route::v1::Route,
+}
+
+impl Metadata for Route {
+    type Ty = ObjectMeta;
+
+    fn metadata(&self) -> &<Self as Metadata>::Ty {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut <Self as Metadata>::Ty {
+        &mut self.metadata
+    }
+}
+
+impl k8s_openapi::Resource for Route {
+    type Scope = k8s_openapi::NamespaceResourceScope;
+
+    const API_VERSION: &'static str = "route.openshift.io/v1";
+    const GROUP: &'static str = "route.openshift.io";
+    const KIND: &'static str = "Route";
+    const VERSION: &'static str = "v1";
+    const URL_PATH_SEGMENT: &'static str = "routes";
+}
+
+impl serde::Serialize for Route {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct(<Self as k8s_openapi::Resource>::KIND, 5)?;
+        serde::ser::SerializeStruct::serialize_field(
+            &mut state,
+            "apiVersion",
+            <Self as k8s_openapi::Resource>::API_VERSION,
+        )?;
+        serde::ser::SerializeStruct::serialize_field(
+            &mut state,
+            "kind",
+            <Self as k8s_openapi::Resource>::KIND,
+        )?;
+        serde::ser::SerializeStruct::serialize_field(&mut state, "metadata", &self.metadata)?;
+        serde::ser::SerializeStruct::serialize_field(&mut state, "spec", &self.inner.spec)?;
+        serde::ser::SerializeStruct::serialize_field(&mut state, "status", &self.inner.status)?;
+        serde::ser::SerializeStruct::end(state)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Route {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut os_route = openshift_openapi::api::route::v1::Route::deserialize(deserializer)?;
+        Ok(Route {
+            metadata: ObjectMeta {
+                annotations: os_route.metadata.annotations.take(),
+                creation_timestamp: os_route
+                    .metadata
+                    .creation_timestamp
+                    .take()
+                    .map(|t| Time(t.0)),
+                deletion_grace_period_seconds: os_route
+                    .metadata
+                    .deletion_grace_period_seconds
+                    .take(),
+                deletion_timestamp: os_route
+                    .metadata
+                    .deletion_timestamp
+                    .take()
+                    .map(|t| Time(t.0)),
+                finalizers: os_route.metadata.finalizers.take(),
+                generate_name: os_route.metadata.generate_name.take(),
+                generation: os_route.metadata.generation.take(),
+                labels: os_route.metadata.labels.take(),
+                managed_fields: os_route.metadata.managed_fields.take().map(|fs| {
+                    fs.into_iter()
+                        .map(|f| ManagedFieldsEntry {
+                            api_version: f.api_version,
+                            fields_type: f.fields_type,
+                            fields_v1: f.fields_v1.map(|f| FieldsV1(f.0)),
+                            manager: f.manager,
+                            operation: f.operation,
+                            time: f.time.map(|t| Time(t.0)),
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
+                name: os_route.metadata.name.take(),
+                namespace: os_route.metadata.namespace.take(),
+                owner_references: os_route.metadata.owner_references.take().map(|rs| {
+                    rs.into_iter()
+                        .map(|r| OwnerReference {
+                            api_version: r.api_version,
+                            block_owner_deletion: r.block_owner_deletion,
+                            controller: r.controller,
+                            kind: r.kind,
+                            name: r.name,
+                            uid: r.uid,
+                        })
+                        .collect()
+                }),
+                resource_version: os_route.metadata.resource_version.take(),
+                self_link: os_route.metadata.self_link.take(),
+                uid: os_route.metadata.uid.take(),
+                ..Default::default()
+            },
+            inner: os_route,
+        })
+    }
 }
 
 #[enum_dispatch(Watcher)]
@@ -100,6 +218,8 @@ pub enum GenericResourceWatcher {
     CloneSet(ResourceWatcher<CloneSet>),
     KruiseStatefulSet(ResourceWatcher<KruiseStatefulSet>),
     IpPool(ResourceWatcher<IpPool>),
+    OpenGaussCluster(ResourceWatcher<OpenGaussCluster>),
+    StatefulSetPlus(ResourceWatcher<StatefulSetPlus>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,20 +235,43 @@ impl fmt::Display for GroupVersion {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum SelectedGv {
+    None,
+    Specified(GroupVersion),
+    Inferred(GroupVersion),
+}
+
+impl SelectedGv {
+    pub fn is_none(&self) -> bool {
+        matches!(self, SelectedGv::None)
+    }
+
+    pub fn unwrap(&self) -> &GroupVersion {
+        match self {
+            SelectedGv::None => unreachable!(),
+            SelectedGv::Specified(gv) => gv,
+            SelectedGv::Inferred(gv) => gv,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Resource {
     pub name: &'static str,
     pub pb_name: &'static str,
     // supported group versions ordered by priority
     pub group_versions: Vec<GroupVersion>,
     // group version to use
-    pub selected_gv: Option<GroupVersion>,
+    pub selected_gv: SelectedGv,
+    pub field_selector: String,
 }
 
 impl fmt::Display for Resource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.selected_gv {
-            Some(gv) => write!(f, "{}/{}", gv, self.name),
-            None => write!(f, "{}: {:?}", self.name, self.group_versions),
+            SelectedGv::None => write!(f, "{}: {:?}", self.name, self.group_versions),
+            SelectedGv::Specified(gv) => write!(f, "{}/{}", gv, self.name),
+            SelectedGv::Inferred(gv) => write!(f, "{}/{}", gv, self.name),
         }
     }
 }
@@ -142,7 +285,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "nodes",
@@ -151,7 +295,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "pods",
@@ -160,7 +305,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "replicationcontrollers",
@@ -169,7 +315,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "services",
@@ -178,7 +325,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "daemonsets",
@@ -187,7 +335,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "deployments",
@@ -196,7 +345,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "replicasets",
@@ -205,7 +355,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "statefulsets",
@@ -214,7 +365,8 @@ pub fn default_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "ingresses",
@@ -233,7 +385,8 @@ pub fn default_resources() -> Vec<Resource> {
                     version: "v1beta1",
                 },
             ],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
     ]
 }
@@ -247,7 +400,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "nodes",
@@ -256,7 +410,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "pods",
@@ -265,7 +420,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "replicationcontrollers",
@@ -274,7 +430,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "services",
@@ -283,7 +440,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "core",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "daemonsets",
@@ -292,7 +450,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "deployments",
@@ -301,7 +460,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "replicasets",
@@ -310,7 +470,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "apps",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "statefulsets",
@@ -324,8 +485,13 @@ pub fn supported_resources() -> Vec<Resource> {
                     group: "apps.kruise.io",
                     version: "v1beta1",
                 },
+                GroupVersion {
+                    group: "platform.stke",
+                    version: "v1alpha1",
+                },
             ],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "ingresses",
@@ -344,7 +510,8 @@ pub fn supported_resources() -> Vec<Resource> {
                     version: "v1beta1",
                 },
             ],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "routes",
@@ -353,7 +520,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "route.openshift.io",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "servicerules",
@@ -362,7 +530,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "crd.pingan.org",
                 version: "v1alpha1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "clonesets",
@@ -371,7 +540,8 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "apps.kruise.io",
                 version: "v1alpha1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
         Resource {
             name: "ippools",
@@ -380,7 +550,18 @@ pub fn supported_resources() -> Vec<Resource> {
                 group: "crd.projectcalico.org",
                 version: "v1",
             }],
-            selected_gv: None,
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
+        },
+        Resource {
+            name: "opengaussclusters",
+            pb_name: "*v1.OpenGaussCluster",
+            group_versions: vec![GroupVersion {
+                group: "opengauss.cmbc.com.cn",
+                version: "v1",
+            }],
+            selected_gv: SelectedGv::None,
+            field_selector: String::new(),
         },
     ]
 }
@@ -393,7 +574,6 @@ pub struct WatcherCounter {
     list_error: AtomicU32,
     watch_applied: AtomicU32,
     watch_deleted: AtomicU32,
-    watch_restarted: AtomicU32,
 }
 
 impl RefCountable for WatcherCounter {
@@ -434,11 +614,6 @@ impl RefCountable for WatcherCounter {
                 "watch_deleted",
                 CounterType::Gauged,
                 CounterValue::Unsigned(self.watch_deleted.swap(0, Ordering::Relaxed) as u64),
-            ),
-            (
-                "watch_restarted",
-                CounterType::Gauged,
-                CounterValue::Unsigned(self.watch_restarted.swap(0, Ordering::Relaxed) as u64),
             ),
         ]
     }
@@ -560,7 +735,7 @@ where
             let mut stream = match ctx
                 .api
                 .watch(
-                    &ListParams::default(),
+                    &ListParams::default().fields(&ctx.kind.field_selector),
                     ctx.resource_version
                         .as_ref()
                         .map(|s| s as &str)
@@ -681,8 +856,11 @@ where
         );
         let mut all_entries = HashMap::new();
         let mut total_count = 0;
+        let mut estimated_total = None;
         let mut total_bytes = 0;
-        let mut params = ListParams::default().limit(ctx.config.list_limit);
+        let mut params = ListParams::default()
+            .fields(&ctx.kind.field_selector)
+            .limit(ctx.config.list_limit);
         loop {
             trace!("{} list with {:?}", ctx.kind, params);
             match ctx.api.list(&params).await {
@@ -706,6 +884,9 @@ where
                             .remaining_item_count
                             .unwrap_or_default()
                     );
+                    if let Some(r) = object_list.metadata.remaining_item_count {
+                        estimated_total = Some(total_count + r as usize);
+                    }
 
                     for object in object_list.items {
                         if object.meta().uid.as_ref().is_none() {
@@ -768,7 +949,31 @@ where
                 }
                 Err(err) => {
                     ctx.stats_counter.list_error.fetch_add(1, Ordering::Relaxed);
-                    let msg = format!("{} watcher list failed: {}", ctx.kind, err);
+                    let msg = if matches!(
+                        err,
+                        ClientErr::Api(ErrorResponse {
+                            code: HTTP_GONE,
+                            ..
+                        })
+                    ) {
+                        // kubernetes api pagination token expires after a certain timeout (default 5min)
+                        // Should an api have high RTT or large quantity of resources, it may not
+                        // be able to return all resources before token expires. Notice the user to
+                        // increase page size if this happens.
+                        format!(
+                            "{} watcher list HTTP Gone failed when {}/{} entries returned, \
+                            try increasing 'kubernetes-api-list-limit' in agent config: {}",
+                            ctx.kind,
+                            total_count,
+                            match estimated_total {
+                                Some(total) => total.to_string(),
+                                None => "unknown".to_owned(),
+                            },
+                            err
+                        )
+                    } else {
+                        format!("{} watcher list failed: {}", ctx.kind, err)
+                    };
                     warn!("{}", msg);
                     ctx.err_msg.lock().await.replace(msg);
                     return false;
@@ -1029,7 +1234,7 @@ impl Trimmable for Route {
             namespace: self.metadata.namespace.take(),
             ..Default::default()
         };
-        self.status = Default::default();
+        self.inner.status = Default::default();
         self
     }
 }
@@ -1124,6 +1329,12 @@ impl Trimmable for Service {
                 ..Default::default()
             });
         }
+        if let Some(svc_status) = self.status.take() {
+            trim_svc.status = Some(ServiceStatus {
+                load_balancer: svc_status.load_balancer,
+                ..Default::default()
+            });
+        }
         trim_svc
     }
 }
@@ -1157,31 +1368,61 @@ impl ResourceWatcherFactory {
         }
     }
 
-    fn new_watcher_inner<K>(
+    fn new_cluster_resource<K>(
         &self,
         kind: Resource,
         stats_collector: &stats::Collector,
-        namespace: Option<&str>,
         config: &WatcherConfig,
     ) -> ResourceWatcher<K>
     where
-        K: Clone + Debug + DeserializeOwned + KubeResource + Serialize + Trimmable,
+        K: Clone
+            + Debug
+            + DeserializeOwned
+            + KubeResource<Scope = k8s_openapi::ClusterResourceScope>
+            + Serialize
+            + Trimmable,
         <K as KubeResource>::DynamicType: Default,
     {
         let watcher = ResourceWatcher::new(
-            match namespace {
-                Some(namespace) => Api::namespaced(self.client.clone(), namespace),
-                None => Api::all(self.client.clone()),
-            },
+            Api::all(self.client.clone()),
             kind,
             self.runtime.clone(),
             config,
             self.listing.clone(),
         );
         stats_collector.register_countable(
-            "resource_watcher",
+            &stats::SingleTagModule("resource_watcher", "kind", &watcher.kind),
             Countable::Ref(Arc::downgrade(&watcher.stats_counter) as Weak<dyn RefCountable>),
-            vec![StatsOption::Tag("kind", watcher.kind.to_string())],
+        );
+        watcher
+    }
+
+    fn new_namespace_resource<K>(
+        &self,
+        kind: Resource,
+        stats_collector: &stats::Collector,
+        namespace: &str,
+        config: &WatcherConfig,
+    ) -> ResourceWatcher<K>
+    where
+        K: Clone
+            + Debug
+            + DeserializeOwned
+            + KubeResource<Scope = k8s_openapi::NamespaceResourceScope>
+            + Serialize
+            + Trimmable,
+        <K as KubeResource>::DynamicType: Default,
+    {
+        let watcher = ResourceWatcher::new(
+            Api::namespaced(self.client.clone(), namespace),
+            kind,
+            self.runtime.clone(),
+            config,
+            self.listing.clone(),
+        );
+        stats_collector.register_countable(
+            &stats::SingleTagModule("resource_watcher", "kind", &watcher.kind),
+            Countable::Ref(Arc::downgrade(&watcher.stats_counter) as Weak<dyn RefCountable>),
         );
         watcher
     }
@@ -1193,43 +1434,51 @@ impl ResourceWatcherFactory {
         stats_collector: &stats::Collector,
         config: &WatcherConfig,
     ) -> Option<GenericResourceWatcher> {
+        let namespace = namespace.unwrap_or("");
         let watcher = match resource.name {
             // 特定namespace不支持Node/Namespace资源
-            "nodes" => GenericResourceWatcher::Node(self.new_watcher_inner(
+            "nodes" => GenericResourceWatcher::Node(self.new_cluster_resource(
                 resource,
                 stats_collector,
-                None,
                 config,
             )),
-            "namespaces" => GenericResourceWatcher::Namespace(self.new_watcher_inner(
+            "namespaces" => GenericResourceWatcher::Namespace(self.new_cluster_resource(
                 resource,
                 stats_collector,
-                None,
                 config,
             )),
-            "services" => GenericResourceWatcher::Service(self.new_watcher_inner(
-                resource,
-                stats_collector,
-                namespace,
-                config,
-            )),
-            "deployments" => GenericResourceWatcher::Deployment(self.new_watcher_inner(
+            "services" => GenericResourceWatcher::Service(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "pods" => GenericResourceWatcher::Pod(self.new_watcher_inner(
+            "deployments" => GenericResourceWatcher::Deployment(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "statefulsets" => match resource.selected_gv.as_ref().unwrap() {
+            "pods" => GenericResourceWatcher::Pod(self.new_namespace_resource(
+                resource,
+                stats_collector,
+                namespace,
+                config,
+            )),
+            "statefulsets" => match resource.selected_gv.unwrap() {
                 GroupVersion {
                     group: "apps.kruise.io",
                     version: "v1beta1",
-                } => GenericResourceWatcher::KruiseStatefulSet(self.new_watcher_inner(
+                } => GenericResourceWatcher::KruiseStatefulSet(self.new_namespace_resource(
+                    resource,
+                    stats_collector,
+                    namespace,
+                    config,
+                )),
+                GroupVersion {
+                    group: "platform.stke",
+                    version: "v1alpha1",
+                } => GenericResourceWatcher::StatefulSetPlus(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,
@@ -1238,7 +1487,7 @@ impl ResourceWatcherFactory {
                 GroupVersion {
                     group: "apps",
                     version: "v1",
-                } => GenericResourceWatcher::StatefulSet(self.new_watcher_inner(
+                } => GenericResourceWatcher::StatefulSet(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,
@@ -1248,31 +1497,31 @@ impl ResourceWatcherFactory {
                     warn!(
                         "unsupported resource {} group version {}",
                         resource.name,
-                        resource.selected_gv.as_ref().unwrap()
+                        resource.selected_gv.unwrap()
                     );
                     return None;
                 }
             },
-            "daemonsets" => GenericResourceWatcher::DaemonSet(self.new_watcher_inner(
+            "daemonsets" => GenericResourceWatcher::DaemonSet(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
             "replicationcontrollers" => GenericResourceWatcher::ReplicationController(
-                self.new_watcher_inner(resource, stats_collector, namespace, config),
+                self.new_namespace_resource(resource, stats_collector, namespace, config),
             ),
-            "replicasets" => GenericResourceWatcher::ReplicaSet(self.new_watcher_inner(
+            "replicasets" => GenericResourceWatcher::ReplicaSet(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "ingresses" => match resource.selected_gv.as_ref().unwrap() {
+            "ingresses" => match resource.selected_gv.unwrap() {
                 GroupVersion {
                     group: "networking.k8s.io",
                     version: "v1",
-                } => GenericResourceWatcher::V1Ingress(self.new_watcher_inner(
+                } => GenericResourceWatcher::V1Ingress(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,
@@ -1281,7 +1530,7 @@ impl ResourceWatcherFactory {
                 GroupVersion {
                     group: "networking.k8s.io",
                     version: "v1beta1",
-                } => GenericResourceWatcher::V1beta1Ingress(self.new_watcher_inner(
+                } => GenericResourceWatcher::V1beta1Ingress(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,
@@ -1290,7 +1539,7 @@ impl ResourceWatcherFactory {
                 GroupVersion {
                     group: "extensions",
                     version: "v1beta1",
-                } => GenericResourceWatcher::ExtV1beta1Ingress(self.new_watcher_inner(
+                } => GenericResourceWatcher::ExtV1beta1Ingress(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,
@@ -1300,35 +1549,38 @@ impl ResourceWatcherFactory {
                     warn!(
                         "unsupported resource {} group version {}",
                         resource.name,
-                        resource.selected_gv.as_ref().unwrap()
+                        resource.selected_gv.unwrap()
                     );
                     return None;
                 }
             },
-            "routes" => GenericResourceWatcher::Route(self.new_watcher_inner(
+            "routes" => GenericResourceWatcher::Route(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "servicerules" => GenericResourceWatcher::ServiceRule(self.new_watcher_inner(
+            "servicerules" => GenericResourceWatcher::ServiceRule(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "clonesets" => GenericResourceWatcher::CloneSet(self.new_watcher_inner(
+            "clonesets" => GenericResourceWatcher::CloneSet(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
-            "ippools" => GenericResourceWatcher::IpPool(self.new_watcher_inner(
+            "ippools" => GenericResourceWatcher::IpPool(self.new_namespace_resource(
                 resource,
                 stats_collector,
                 namespace,
                 config,
             )),
+            "opengaussclusters" => GenericResourceWatcher::OpenGaussCluster(
+                self.new_namespace_resource(resource, stats_collector, namespace, config),
+            ),
             _ => {
                 warn!("unsupported resource {}", resource.name);
                 return None;

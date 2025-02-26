@@ -21,25 +21,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBPodIngress() *mysql.PodIngress {
-	return &mysql.PodIngress{Base: mysql.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
+func newDBPodIngress() *metadbmodel.PodIngress {
+	return &metadbmodel.PodIngress{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}, Name: uuid.New().String()}
 }
 
 func (t *SuiteTest) TestAddPodIngressBatchSuccess() {
 	operator := NewPodIngress()
 	itemToAdd := newDBPodIngress()
 
-	_, ok := operator.AddBatch([]*mysql.PodIngress{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.PodIngress{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.PodIngress
+	var addedItem *metadbmodel.PodIngress
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Lcuuid, itemToAdd.Lcuuid)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.PodIngress{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.PodIngress{})
 }
 
 func (t *SuiteTest) TestUpdatePodIngressSuccess() {
@@ -52,11 +52,11 @@ func (t *SuiteTest) TestUpdatePodIngressSuccess() {
 	_, ok := operator.Update(addedItem.Lcuuid, updateInfo)
 	assert.True(t.T(), ok)
 
-	var updatedItem *mysql.PodIngress
+	var updatedItem *metadbmodel.PodIngress
 	t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&updatedItem)
 	assert.Equal(t.T(), updatedItem.Name, updateInfo["name"])
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.PodIngress{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.PodIngress{})
 }
 
 func (t *SuiteTest) TestDeletePodIngressBatchSuccess() {
@@ -66,7 +66,7 @@ func (t *SuiteTest) TestDeletePodIngressBatchSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.PodIngress
+	var deletedItem *metadbmodel.PodIngress
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }

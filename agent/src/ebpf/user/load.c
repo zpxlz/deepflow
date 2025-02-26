@@ -25,25 +25,180 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
-#include "common.h"
+#include "config.h"
+#include "utils.h"
 #include "log.h"
 #include "elf.h"
 #include <bcc/linux/bpf.h>
 #include <bcc/linux/bpf_common.h>
+#include <bcc/linux/btf.h>
 #include <bcc/libbpf.h>
 #include "load.h"
-#include "btf_vmlinux.h"
+#include "btf_core.h"
+#include "../kernel/include/bpf_base.h"
+#include "../kernel/include/common.h"
+#include "tracer.h"
+#include "symbol.h"
+#include "proc.h"
+#include "go_tracer.h"
+#include "ssl_tracer.h"
+#include "profile/perf_profiler.h"
+#include "unwind_tracer.h"
 
+/*
+ * When full map preallocation is too expensive, the 'BPF_F_NO_PREALLOC'
+ * flag can be used to define a map without preallocated memory. By
+ * default, bpf_map_no_prealloc is set to false, meaning memory preallocation
+ * is enabled.
+ */
+static bool bpf_map_no_prealloc;
 extern struct btf_ext *btf_ext__new(const uint8_t * data, uint32_t size);
 extern struct btf *btf__new(const void *data, uint32_t size);
 extern void btf__free(struct btf *btf);
 extern void btf_ext__free(struct btf_ext *btf_ext);
 extern int btf__set_pointer_size(struct btf *btf, size_t ptr_sz);
 
+#define FN_ID(F) ((int32_t)((uint64_t)F))
+#define KERN_FEAT_UNKNOWN	0
+#define KERN_FEAT_SUP		1
+#define KERN_FEAT_NOTSUP        2
+
+static int probe_read_kernel_feat;
+
+int suspend_stderr()
+{
+	fflush(stderr);
+
+	int ret = dup(STDERR_FILENO);
+	if (ret == -1) {
+		return -1;
+	}
+	int fd = open("/dev/null", O_WRONLY);
+	if (fd == -1) {
+		close(ret);
+		return -1;
+	}
+	if (dup2(fd, STDERR_FILENO) == -1) {
+		close(fd);
+		close(ret);
+		return -1;
+	}
+	close(fd);
+	return ret;
+}
+
+void resume_stderr(int fd)
+{
+	fflush(stderr);
+	if (fd < 0)
+		return;
+	dup2(fd, STDERR_FILENO);
+	close(fd);
+}
+
+static inline bool str_is_empty(const char *s)
+{
+	return !s || !s[0];
+}
+
+int load_ebpf_prog(struct ebpf_prog *prog)
+{
+	return bcc_prog_load(prog->type, prog->name,
+			     prog->insns, prog->insns_size, prog->obj->license,
+			     prog->obj->kern_version, 0, NULL,
+			     0 /*EBPF_LOG_LEVEL, log_buf, LOG_BUF_SZ */ );
+}
+
+int df_prog_load(enum bpf_prog_type prog_type, const char *name,
+		 const struct bpf_insn *insns, int prog_len)
+{
+	return bcc_prog_load(prog_type, name, insns, prog_len, LICENSE_DEF,
+			     fetch_kernel_version_code(), 0, NULL, 0);
+}
+
+/*
+ * Feature checks for the Linux kernel, 
+ * `bpf_probe_read{kernel,user}[_str]`, vary across
+ * different versions of the Linux kernel. Using eBPF
+ * instructions to determine whether the currently
+ * running Linux kernel supports this feature.
+ */
+static bool feat_probe_read_kernel(unsigned kern_version)
+{
+	if (probe_read_kernel_feat == KERN_FEAT_SUP)
+		return true;
+	else if (probe_read_kernel_feat == KERN_FEAT_NOTSUP)
+		return false;
+
+	struct bpf_insn insns[] = {
+		BPF_MOV64_REG(BPF_REG_1, BPF_REG_10),	/* r1 = r10 (fp) */
+		BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, -8),	/* r1 += -8 */
+		BPF_MOV64_IMM(BPF_REG_2, 8),	/* r2 = 8 */
+		BPF_MOV64_IMM(BPF_REG_3, 0),	/* r3 = 0 */
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+			     FN_ID(bpf_probe_read_kernel)),
+		BPF_EXIT_INSN(),
+	};
+
+	int stderr_fd = suspend_stderr();
+	if (stderr_fd < 0) {
+		ebpf_warning("Failed to suspend stderr\n");
+	}
+	int fd = bcc_prog_load
+	    (BPF_PROG_TYPE_TRACEPOINT, NULL, insns, sizeof(insns), LICENSE_DEF,
+	     kern_version, 0, NULL,
+	     0 /*EBPF_LOG_LEVEL, log_buf, LOG_BUF_SZ */ );
+	resume_stderr(stderr_fd);
+	if (fd >= 0) {
+		close(fd);
+		probe_read_kernel_feat = KERN_FEAT_SUP;
+		ebpf_info
+		    ("Kernel support interfaces `bpf_probe_read{kernel,user}[_str]`\n");
+		return true;
+	}
+
+	probe_read_kernel_feat = KERN_FEAT_NOTSUP;
+	ebpf_info
+	    ("Kernel not support interfaces `bpf_probe_read{kernel,user}[_str]`\n");
+
+	return false;
+}
+
+static bool is_helper_call_insn(struct bpf_insn *insn, int32_t * func_id)
+{
+	if (BPF_CLASS(insn->code) == BPF_JMP &&
+	    BPF_OP(insn->code) == BPF_CALL &&
+	    BPF_SRC(insn->code) == BPF_K &&
+	    insn->src_reg == 0 && insn->dst_reg == 0) {
+		*func_id = insn->imm;
+		return true;
+	}
+	return false;
+}
+
+static void sanitize_prog_instructions(struct ebpf_object *obj,
+				       struct ebpf_prog *prog)
+{
+	struct bpf_insn *insn = prog->insns;
+	int32_t func_id;
+
+	for (int i = 0; i < prog->insns_cnt; i++, insn++) {
+		if (!is_helper_call_insn(insn, &func_id))
+			continue;
+		if (func_id == FN_ID(bpf_probe_read_kernel)
+		    || func_id == FN_ID(bpf_probe_read_user)) {
+			if (!feat_probe_read_kernel(obj->kern_version))
+				insn->imm = FN_ID(bpf_probe_read);
+		} else if (func_id == FN_ID(bpf_probe_read_kernel_str)
+			   || func_id == FN_ID(bpf_probe_read_user_str)) {
+			if (!feat_probe_read_kernel(obj->kern_version))
+				insn->imm = FN_ID(bpf_probe_read_str);
+		}
+	}
+}
+
 static void ebpf_object__release_elf(struct ebpf_object *obj)
 {
-	int i;
-
 	if (obj->elf_info.elf) {
 		elf_end(obj->elf_info.elf);
 		obj->elf_info.elf = NULL;
@@ -91,11 +246,11 @@ static void ebpf_object__release_elf(struct ebpf_object *obj)
 		zfree(obj->elf_info.btf_ext_sec);
 	}
 
-	struct ebpf_prog *prog;
-	for (i = 0; i < obj->progs_cnt; i++) {
-		prog = &obj->progs[i];
-		prog->insns = NULL;
-	}
+	//struct ebpf_prog *prog;
+	//for (i = 0; i < obj->progs_cnt; i++) {
+	//	prog = &obj->progs[i];
+	//	prog->insns = NULL;
+	//}
 }
 
 void release_object(struct ebpf_object *obj)
@@ -167,13 +322,15 @@ static struct ebpf_object *create_new_obj(const void *buf, size_t buf_sz,
 		zfree(obj);
 		return NULL;
 	}
+
 	safe_buf_copy(obj->name, sizeof(obj->name), (void *)name, strlen(name));
 	obj->name[sizeof(obj->name) - 1] = '\0';
 	obj->elf_info.fd = -1;
 	obj->elf_info.obj_buf = (void *)buf;
 	obj->elf_info.obj_buf_sz = buf_sz;
 	obj->kern_version = fetch_kernel_version_code();
-	safe_buf_copy(obj->license, sizeof(obj->license), LICENSE_DEF, sizeof(LICENSE_DEF));
+	safe_buf_copy(obj->license, sizeof(obj->license), LICENSE_DEF,
+		      sizeof(LICENSE_DEF));
 	obj->license[sizeof(obj->license) - 1] = '\0';
 	return obj;
 }
@@ -312,8 +469,13 @@ static enum bpf_prog_type get_prog_type(struct sec_desc *desc)
 		prog_type = BPF_PROG_TYPE_TRACEPOINT;
 	} else if (!memcmp(desc->name, "perf_event", 10)) {
 		prog_type = BPF_PROG_TYPE_PERF_EVENT;
+	} else if (!memcmp(desc->name, "fentry/", 7) ||
+		   !memcmp(desc->name, "fexit/", 6)) {
+		prog_type = BPF_PROG_TYPE_TRACING;
+	} else if (!memcmp(desc->name, "socket/", 7)) {
+		prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
 	} else {
-		prog_type = BPF_PROG_TYPE_UNSPEC; 
+		prog_type = BPF_PROG_TYPE_UNSPEC;
 	}
 
 	return prog_type;
@@ -366,6 +528,8 @@ static int load_obj__progs(struct ebpf_object *obj)
 				prog_type = BPF_PROG_TYPE_TRACEPOINT;
 			} else if (!memcmp(desc->name, "prog/kp/", 8)) {
 				prog_type = BPF_PROG_TYPE_KPROBE;
+			} else if (!memcmp(desc->name, "prog/pe/", 8)) {
+				prog_type = BPF_PROG_TYPE_PERF_EVENT;
 			} else {
 				ebpf_warning("Prog %s type %d invalid\n",
 					     desc->name, prog_type);
@@ -386,6 +550,10 @@ static int load_obj__progs(struct ebpf_object *obj)
 					    obj->elf_info.syms_sec->strtabidx,
 					    sym.st_name);
 
+		// Typically, the sec_off offset value is 0
+		size_t sec_off = sym.st_value;
+		size_t prog_sz = sym.st_size;
+
 		new_prog = NULL;
 		add_new_prog(obj->progs, obj->progs_cnt, new_prog);
 		if (new_prog == NULL) {
@@ -402,27 +570,58 @@ static int load_obj__progs(struct ebpf_object *obj)
 			return ETR_NOMEM;
 		}
 
-		new_prog->insns = insns;
-		new_prog->insns_cnt = desc->size / sizeof(struct bpf_insn);
+		new_prog->insns = insns + sec_off;
+		new_prog->insns_cnt = desc->size / BPF_INSN_SZ;
+		new_prog->insns_size = desc->size;
 		new_prog->obj = obj;
 		new_prog->type = prog_type;
+		new_prog->sec_insn_off = sec_off / BPF_INSN_SZ;
+		new_prog->sec_insn_cnt = prog_sz / BPF_INSN_SZ;
+		new_prog->sec_desc = desc;
 
+		ebpf_debug
+		    ("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
+		     new_prog->sec_name, new_prog->name, new_prog->sec_insn_off,
+		     sec_off, prog_sz / BPF_INSN_SZ, prog_sz);
+
+		/*
+		 * Addressing the adaptability issues of bpf_probe_read{kernel,user}[_str]
+		 * helpers in the kernel.
+		 */
+		sanitize_prog_instructions(obj, new_prog);
+
+		// Modify eBPF instructions based on BTF relocation information.
+		obj_relocate_core(new_prog);
+
+		int stderr_fd = suspend_stderr();
+		if (stderr_fd < 0) {
+			ebpf_warning("Failed to suspend stderr\n");
+		}
 		new_prog->prog_fd =
 		    bcc_prog_load(new_prog->type, new_prog->name,
 				  new_prog->insns, desc->size, obj->license,
 				  obj->kern_version, 0, NULL,
 				  0 /*EBPF_LOG_LEVEL, log_buf, LOG_BUF_SZ */ );
-
+		resume_stderr(stderr_fd);
 		if (new_prog->prog_fd < 0) {
-			ebpf_warning("bcc_prog_load() failed. name: %s, %s errno: %d\n",
-				     new_prog->name, strerror(errno), errno);
+			ebpf_warning
+			    ("bcc_prog_load() failed. name: %s, %s errno: %d\n",
+			     new_prog->name, strerror(errno), errno);
 			if (new_prog->insns_cnt > BPF_MAXINSNS) {
-				ebpf_warning("The number of EBPF instructions (%d) "
-					     "exceeded the maximum limit (%d).\n",
-					     new_prog->insns_cnt, BPF_MAXINSNS);
+				ebpf_warning
+				    ("The number of EBPF instructions (%d) "
+				     "exceeded the maximum limit (%d).\n",
+				     new_prog->insns_cnt, BPF_MAXINSNS);
 			}
 
-			return ETR_INVAL;
+			if (memcmp(desc->name, "uprobe/", 7) &&
+			    memcmp(desc->name, "uretprobe/", 10)) {
+				return ETR_INVAL;
+			} else {
+				ebpf_warning("The reason for the eBPF uprobe program "
+					     "loading failure is that the linux version "
+					     "needs to be 3.10 or 4.17+.\n");
+			}
 		}
 
 		ebpf_debug
@@ -458,6 +657,7 @@ static int ebpf_btf_ext_collect(struct ebpf_object *obj)
 {
 	struct sec_desc *desc = obj->elf_info.btf_ext_sec;
 	struct btf_ext *ext = btf_ext__new(desc->d_buf, desc->size);
+
 	if (DF_IS_ERR(ext)) {
 		ebpf_warning("Processing .BTF.ext section failed\n");
 		obj->btf_ext = NULL;
@@ -468,7 +668,52 @@ static int ebpf_btf_ext_collect(struct ebpf_object *obj)
 		   desc->name);
 	obj->btf_ext = ext;
 
+	// Setup .BTF.ext to ELF section mapping
+	struct btf_ext_info *ext_segs[] = {
+		&obj->btf_ext->func_info,
+		&obj->btf_ext->line_info,
+		&obj->btf_ext->core_relo_info
+	};
+
+	for (int seg_num = 0; seg_num < ARRAY_SIZE(ext_segs); seg_num++) {
+		struct btf_ext_info *seg = ext_segs[seg_num];
+
+		if (seg->sec_cnt == 0)
+			continue;
+
+		seg->sec_idxs = calloc(seg->sec_cnt, sizeof(*seg->sec_idxs));
+		if (!seg->sec_idxs) {
+			ebpf_warning("calloc failed\n");
+			return ETR_INVAL;
+		}
+
+		int sec_num = 0;
+		const struct btf_ext_info_sec *sec;
+
+		// Iterate through each section within the current segment
+		for_each_btf_ext_sec(seg, sec) {
+			sec_num++;
+
+			const char *sec_name =
+			    btf_name_by_offset(obj->btf, sec->sec_name_off);
+			if (str_is_empty(sec_name))
+				continue;
+
+			Elf_Scn *scn =
+			    get_scn_by_sec_name(obj->elf_info.elf, sec_name);
+			if (!scn)
+				continue;
+
+			seg->sec_idxs[sec_num - 1] = elf_ndxscn(scn);
+		}
+	}
+
 	return ETR_OK;
+}
+
+static inline bool is_ldimm64_insn(struct bpf_insn *insn)
+{
+	return insn->code == (BPF_LD | BPF_IMM | BPF_DW);
 }
 
 static int ebpf_obj__maps_collect(struct ebpf_object *obj)
@@ -577,7 +822,8 @@ static int ebpf_obj__maps_collect(struct ebpf_object *obj)
 		new_map->fd = -1;
 		// Symbol value is offset into ELF maps section data area.
 		new_map->elf_offset = sym.st_value;
-		safe_buf_copy(new_map->name, sizeof(new_map->name), map_name, strlen(map_name));
+		safe_buf_copy(new_map->name, sizeof(new_map->name), map_name,
+			      strlen(map_name));
 		new_map->name[sizeof(new_map->name) - 1] = '\0';
 		def =
 		    (struct bpf_load_map_def *)(map_desc->d_buf +
@@ -586,10 +832,11 @@ static int ebpf_obj__maps_collect(struct ebpf_object *obj)
 		memcpy(&new_map->def, def, cp_sz);
 		ebpf_debug
 		    ("map_name %s\tmaps_cnt:%d\toffset %zd\ttype %u\tkey_size "
-		     "%u\tvalue_size %u\tmax_entries %u\n",
+		     "%u\tvalue_size %u\tmax_entries %u feat %u\n",
 		     map_name, obj->maps_cnt, new_map->elf_offset,
 		     new_map->def.type, new_map->def.key_size,
-		     new_map->def.value_size, new_map->def.max_entries);
+		     new_map->def.value_size, new_map->def.max_entries,
+		     new_map->def.feat_flags);
 	}
 
 	return ETR_OK;
@@ -693,20 +940,51 @@ int ebpf_obj_load(struct ebpf_object *obj)
 	struct ebpf_map *map;
 	for (i = 0; i < obj->maps_cnt; i++) {
 		map = &obj->maps[i];
+		int map_flags = 0;
+		// Note : perf_event programs can only use preallocated hash map
+		if (map->def.type == BPF_MAP_TYPE_HASH &&
+		    bpf_map_no_prealloc &&
+		    strstr(obj->name, "profiler") == NULL) {
+			map_flags = BPF_F_NO_PREALLOC;
+		}
+
+		uint32_t enabled_feats = map->def.feat_flags;
+		if (!is_golang_trace_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_UPROBE_GOLANG;
+		}
+		if (!is_openssl_trace_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_UPROBE_OPENSSL;
+		}
+		if (!oncpu_profiler_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_PROFILE_ONCPU;
+		}
+		if (!get_dwarf_enabled()) {
+			enabled_feats &= ~FEATURE_FLAG_DWARF_UNWINDING;
+		}
+		enabled_feats &= ~extended_feature_flags(map);
+		if (enabled_feats == 0 &&
+		    map->def.type != BPF_MAP_TYPE_PROG_ARRAY &&
+		    map->def.type != BPF_MAP_TYPE_PERF_EVENT_ARRAY) {
+			map->def.max_entries = 1;
+		}
+
+		extended_map_preprocess(map);
+
 		map->fd =
 		    bcc_create_map(map->def.type, map->name, map->def.key_size,
 				   map->def.value_size, map->def.max_entries,
-				   0);
+				   map_flags);
 		if (map->fd < 0) {
-			ebpf_warning("bcc_create_map() failed, map name:%s - %s\n",
-				     map->name, strerror(errno));
+			ebpf_warning
+			    ("bcc_create_map() failed, map name:%s - %s\n",
+			     map->name, strerror(errno));
 			goto failed;
 		}
 		ebpf_debug
 		    ("map->fd:%d map->def.type:%d, map->name:%s, map->def.key_size:%d,"
-		     "map->def.value_size:%d, map->def.max_entries:%d\n",
+		     "map->def.value_size:%d, map->def.max_entries:%d, map_flags %d\n",
 		     map->fd, map->def.type, map->name, map->def.key_size,
-		     map->def.value_size, map->def.max_entries);
+		     map->def.value_size, map->def.max_entries, map_flags);
 	}
 
 	ebpf_obj__load_vmlinux_btf(obj);
@@ -723,4 +1001,9 @@ failed:
 	ebpf_warning("eBPF load programs failed. (errno %d)\n", errno);
 	release_object(obj);
 	return ETR_INVAL;
+}
+
+void set_bpf_map_prealloc(bool enabled)
+{
+	bpf_map_no_prealloc = !enabled;
 }

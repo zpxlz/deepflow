@@ -19,25 +19,50 @@ package updater
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 )
 
 type PodReplicaSet struct {
-	UpdaterBase[cloudmodel.PodReplicaSet, mysql.PodReplicaSet, *diffbase.PodReplicaSet]
+	UpdaterBase[
+		cloudmodel.PodReplicaSet,
+		*diffbase.PodReplicaSet,
+		*metadbmodel.PodReplicaSet,
+		metadbmodel.PodReplicaSet,
+		*message.PodReplicaSetAdd,
+		message.PodReplicaSetAdd,
+		*message.PodReplicaSetUpdate,
+		message.PodReplicaSetUpdate,
+		*message.PodReplicaSetFieldsUpdate,
+		message.PodReplicaSetFieldsUpdate,
+		*message.PodReplicaSetDelete,
+		message.PodReplicaSetDelete]
 }
 
 func NewPodReplicaSet(wholeCache *cache.Cache, cloudData []cloudmodel.PodReplicaSet) *PodReplicaSet {
 	updater := &PodReplicaSet{
-		UpdaterBase[cloudmodel.PodReplicaSet, mysql.PodReplicaSet, *diffbase.PodReplicaSet]{
-			resourceType: ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN,
-			cache:        wholeCache,
-			dbOperator:   db.NewPodReplicaSet(),
-			diffBaseData: wholeCache.DiffBaseDataSet.PodReplicaSets,
-			cloudData:    cloudData,
-		},
+		newUpdaterBase[
+			cloudmodel.PodReplicaSet,
+			*diffbase.PodReplicaSet,
+			*metadbmodel.PodReplicaSet,
+			metadbmodel.PodReplicaSet,
+			*message.PodReplicaSetAdd,
+			message.PodReplicaSetAdd,
+			*message.PodReplicaSetUpdate,
+			message.PodReplicaSetUpdate,
+			*message.PodReplicaSetFieldsUpdate,
+			message.PodReplicaSetFieldsUpdate,
+			*message.PodReplicaSetDelete,
+		](
+			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN,
+			wholeCache,
+			db.NewPodReplicaSet().SetMetadata(wholeCache.GetMetadata()),
+			wholeCache.DiffBaseDataSet.PodReplicaSets,
+			cloudData,
+		),
 	}
 	updater.dataGenerator = updater
 	return updater
@@ -48,32 +73,32 @@ func (r *PodReplicaSet) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodReplicaS
 	return
 }
 
-func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet) (*mysql.PodReplicaSet, bool) {
+func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet) (*metadbmodel.PodReplicaSet, bool) {
 	podNamespaceID, exists := r.cache.ToolDataSet.GetPodNamespaceIDByLcuuid(cloudItem.PodNamespaceLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_NAMESPACE_EN, cloudItem.PodNamespaceLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		), r.metadata.LogPrefixes)
 		return nil, false
 	}
 	podClusterID, exists := r.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN, cloudItem.PodClusterLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		), r.metadata.LogPrefixes)
 		return nil, false
 	}
 	podGroupID, exists := r.cache.ToolDataSet.GetPodGroupIDByLcuuid(cloudItem.PodGroupLcuuid)
 	if !exists {
-		log.Errorf(resourceAForResourceBNotFound(
+		log.Error(resourceAForResourceBNotFound(
 			ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, cloudItem.PodGroupLcuuid,
 			ctrlrcommon.RESOURCE_TYPE_POD_REPLICA_SET_EN, cloudItem.Lcuuid,
-		))
+		), r.metadata.LogPrefixes)
 		return nil, false
 	}
-	dbItem := &mysql.PodReplicaSet{
+	dbItem := &metadbmodel.PodReplicaSet{
 		Name:           cloudItem.Name,
 		Label:          cloudItem.Label,
 		PodClusterID:   podClusterID,
@@ -81,7 +106,7 @@ func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet)
 		PodNamespaceID: podNamespaceID,
 		PodNum:         cloudItem.PodNum,
 		SubDomain:      cloudItem.SubDomainLcuuid,
-		Domain:         r.cache.DomainLcuuid,
+		Domain:         r.metadata.Domain.Lcuuid,
 		Region:         cloudItem.RegionLcuuid,
 		AZ:             cloudItem.AZLcuuid,
 	}
@@ -89,26 +114,29 @@ func (r *PodReplicaSet) generateDBItemToAdd(cloudItem *cloudmodel.PodReplicaSet)
 	return dbItem, true
 }
 
-func (r *PodReplicaSet) generateUpdateInfo(diffBase *diffbase.PodReplicaSet, cloudItem *cloudmodel.PodReplicaSet) (map[string]interface{}, bool) {
-	updateInfo := make(map[string]interface{})
+func (r *PodReplicaSet) generateUpdateInfo(diffBase *diffbase.PodReplicaSet, cloudItem *cloudmodel.PodReplicaSet) (*message.PodReplicaSetFieldsUpdate, map[string]interface{}, bool) {
+	structInfo := new(message.PodReplicaSetFieldsUpdate)
+	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
-		updateInfo["name"] = cloudItem.Name
+		mapInfo["name"] = cloudItem.Name
+		structInfo.Name.Set(diffBase.Name, cloudItem.Name)
 	}
 	if diffBase.PodNum != cloudItem.PodNum {
-		updateInfo["pod_num"] = cloudItem.PodNum
+		mapInfo["pod_num"] = cloudItem.PodNum
+		structInfo.PodNum.Set(diffBase.PodNum, cloudItem.PodNum)
 	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
-		updateInfo["region"] = cloudItem.RegionLcuuid
+		mapInfo["region"] = cloudItem.RegionLcuuid
+		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
-	if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-		updateInfo["az"] = cloudItem.AZLcuuid
-	}
+	// if diffBase.AZLcuuid != cloudItem.AZLcuuid {
+	// 	mapInfo["az"] = cloudItem.AZLcuuid
+	// 	structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
+	// }
 	if diffBase.Label != cloudItem.Label {
-		updateInfo["label"] = cloudItem.Label
+		mapInfo["label"] = cloudItem.Label
+		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
 
-	if len(updateInfo) > 0 {
-		return updateInfo, true
-	}
-	return nil, false
+	return structInfo, mapInfo, len(mapInfo) > 0
 }

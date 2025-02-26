@@ -19,49 +19,49 @@ package tagrecorder
 import (
 	"strings"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChTargetLabel struct {
-	UpdaterBase[mysql.ChTargetLabel, PrometheusTargetLabelKey]
+	UpdaterComponent[metadbmodel.ChTargetLabel, PrometheusTargetLabelKey]
 }
 
 func NewChTargetLabel() *ChTargetLabel {
 	updater := &ChTargetLabel{
-		UpdaterBase[mysql.ChTargetLabel, PrometheusTargetLabelKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_TARGET_LABEL,
-		},
+		newUpdaterComponent[metadbmodel.ChTargetLabel, PrometheusTargetLabelKey](
+			RESOURCE_TYPE_CH_TARGET_LABEL,
+		),
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (l *ChTargetLabel) generateNewData() (map[PrometheusTargetLabelKey]mysql.ChTargetLabel, bool) {
-	var prometheusMetricNames []mysql.PrometheusMetricName
-
-	err := mysql.Db.Unscoped().Find(&prometheusMetricNames).Error
+func (l *ChTargetLabel) generateNewData(db *metadb.DB) (map[PrometheusTargetLabelKey]metadbmodel.ChTargetLabel, bool) {
+	var prometheusMetricNames []metadbmodel.PrometheusMetricName
+	err := db.Unscoped().Find(&prometheusMetricNames).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
-	metricNameTargetIDMap, ok := l.generateMetricTargetData()
+	metricNameTargetIDMap, ok := l.generateMetricTargetData(db)
 	if !ok {
 		return nil, false
 	}
 
-	targetLabelNameValueMap, ok := l.generateTargetData()
+	targetLabelNameValueMap, ok := l.generateTargetData(db)
 	if !ok {
 		return nil, false
 	}
 
-	metricLabelNameIDMap, ok := l.generateLabelNameIDData()
+	metricLabelNameIDMap, ok := l.generateLabelNameIDData(db)
 	if !ok {
 		return nil, false
 	}
 
-	keyToItem := make(map[PrometheusTargetLabelKey]mysql.ChTargetLabel)
+	keyToItem := make(map[PrometheusTargetLabelKey]metadbmodel.ChTargetLabel)
 	for _, prometheusMetricName := range prometheusMetricNames {
 		metricID := prometheusMetricName.ID
 		metricName := prometheusMetricName.Name
@@ -73,7 +73,7 @@ func (l *ChTargetLabel) generateNewData() (map[PrometheusTargetLabelKey]mysql.Ch
 					targetLabelItem := strings.SplitN(targetLabel, ":", 2)
 					labelNameID := metricLabelNameIDMap[targetLabelItem[0]]
 					labelValue := targetLabelItem[1]
-					keyToItem[PrometheusTargetLabelKey{MetricID: metricID, LabelNameID: labelNameID, TargetID: targetID}] = mysql.ChTargetLabel{
+					keyToItem[PrometheusTargetLabelKey{MetricID: metricID, LabelNameID: labelNameID, TargetID: targetID}] = metadbmodel.ChTargetLabel{
 						MetricID:    metricID,
 						LabelNameID: labelNameID,
 						LabelValue:  labelValue,
@@ -86,11 +86,11 @@ func (l *ChTargetLabel) generateNewData() (map[PrometheusTargetLabelKey]mysql.Ch
 	return keyToItem, true
 }
 
-func (l *ChTargetLabel) generateKey(dbItem mysql.ChTargetLabel) PrometheusTargetLabelKey {
+func (l *ChTargetLabel) generateKey(dbItem metadbmodel.ChTargetLabel) PrometheusTargetLabelKey {
 	return PrometheusTargetLabelKey{MetricID: dbItem.MetricID, LabelNameID: dbItem.LabelNameID, TargetID: dbItem.TargetID}
 }
 
-func (l *ChTargetLabel) generateUpdateInfo(oldItem, newItem mysql.ChTargetLabel) (map[string]interface{}, bool) {
+func (l *ChTargetLabel) generateUpdateInfo(oldItem, newItem metadbmodel.ChTargetLabel) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.LabelValue != newItem.LabelValue {
 		updateInfo["label_value"] = newItem.LabelValue
@@ -101,13 +101,13 @@ func (l *ChTargetLabel) generateUpdateInfo(oldItem, newItem mysql.ChTargetLabel)
 	return nil, false
 }
 
-func (l *ChTargetLabel) generateMetricTargetData() (map[string][]int, bool) {
+func (l *ChTargetLabel) generateMetricTargetData(db *metadb.DB) (map[string][]int, bool) {
 	metricNameTargetIDMap := make(map[string][]int)
-	var prometheusMetricTargets []mysql.PrometheusMetricTarget
-	err := mysql.Db.Unscoped().Find(&prometheusMetricTargets).Error
+	var prometheusMetricTargets []metadbmodel.PrometheusMetricTarget
+	err := db.Unscoped().Find(&prometheusMetricTargets).Error
 
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
@@ -118,13 +118,13 @@ func (l *ChTargetLabel) generateMetricTargetData() (map[string][]int, bool) {
 	return metricNameTargetIDMap, true
 }
 
-func (l *ChTargetLabel) generateTargetData() (map[int]string, bool) {
+func (l *ChTargetLabel) generateTargetData(db *metadb.DB) (map[int]string, bool) {
 	targetLabelNameValueMap := make(map[int]string)
-	var prometheusTargets []mysql.PrometheusTarget
-	err := mysql.Db.Unscoped().Find(&prometheusTargets).Error
+	var prometheusTargets []metadbmodel.PrometheusTarget
+	err := db.Unscoped().Find(&prometheusTargets).Error
 
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
@@ -136,13 +136,13 @@ func (l *ChTargetLabel) generateTargetData() (map[int]string, bool) {
 	return targetLabelNameValueMap, true
 }
 
-func (l *ChTargetLabel) generateLabelNameIDData() (map[string]int, bool) {
+func (l *ChTargetLabel) generateLabelNameIDData(db *metadb.DB) (map[string]int, bool) {
 	metricLabelNameIDMap := make(map[string]int)
-	var prometheusLabelNames []mysql.PrometheusLabelName
-	err := mysql.Db.Unscoped().Find(&prometheusLabelNames).Error
+	var prometheusLabelNames []metadbmodel.PrometheusLabelName
+	err := db.Unscoped().Find(&prometheusLabelNames).Error
 
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 

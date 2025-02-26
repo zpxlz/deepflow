@@ -23,13 +23,18 @@ import (
 )
 
 type QuerierParams struct {
-	Debug      string
-	QueryUUID  string
-	DB         string
-	Sql        string
-	DataSource string
-	Context    context.Context
-	NoPreWhere bool
+	Debug         string
+	UseQueryCache bool
+	QueryCacheTTL string
+	QueryUUID     string
+	DB            string
+	Sql           string
+	DataSource    string
+	Context       context.Context
+	NoPreWhere    bool
+	ORGID         string
+	SimpleSql     bool
+	Language      string
 }
 
 type TempoParams struct {
@@ -64,6 +69,11 @@ func (p *TempoParams) SetFilters(filterStr string) {
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+type EntryKey struct {
+	ORGID  string
+	Filter string
 }
 
 type EntryValue struct {

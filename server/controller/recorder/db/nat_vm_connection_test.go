@@ -21,25 +21,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
-func newDBNATVMConnection() *mysql.NATVMConnection {
-	return &mysql.NATVMConnection{Base: mysql.Base{Lcuuid: uuid.New().String()}}
+func newDBNATVMConnection() *metadbmodel.NATVMConnection {
+	return &metadbmodel.NATVMConnection{Base: metadbmodel.Base{Lcuuid: uuid.New().String()}}
 }
 
 func (t *SuiteTest) TestAddNATVMConnectionBatchSuccess() {
 	operator := NewNATVMConnection()
 	itemToAdd := newDBNATVMConnection()
 
-	_, ok := operator.AddBatch([]*mysql.NATVMConnection{itemToAdd})
+	_, ok := operator.AddBatch([]*metadbmodel.NATVMConnection{itemToAdd})
 	assert.True(t.T(), ok)
 
-	var addedItem *mysql.NATVMConnection
+	var addedItem *metadbmodel.NATVMConnection
 	t.db.Where("lcuuid = ?", itemToAdd.Lcuuid).Find(&addedItem)
 	assert.Equal(t.T(), addedItem.Lcuuid, itemToAdd.Lcuuid)
 
-	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&mysql.NATVMConnection{})
+	t.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&metadbmodel.NATVMConnection{})
 }
 
 func (t *SuiteTest) TestDeleteNATVMConnectionBatchSuccess() {
@@ -49,7 +49,7 @@ func (t *SuiteTest) TestDeleteNATVMConnectionBatchSuccess() {
 	assert.Equal(t.T(), result.RowsAffected, int64(1))
 
 	assert.True(t.T(), operator.DeleteBatch([]string{addedItem.Lcuuid}))
-	var deletedItem *mysql.NATVMConnection
+	var deletedItem *metadbmodel.NATVMConnection
 	result = t.db.Where("lcuuid = ?", addedItem.Lcuuid).Find(&deletedItem)
 	assert.Equal(t.T(), result.RowsAffected, int64(0))
 }

@@ -19,11 +19,11 @@ package diffbase
 import (
 	cloudmodel "github.com/deepflowio/deepflow/server/controller/cloud/model"
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/tool"
 )
 
-func (b *DataSet) AddDHCPPort(dbItem *mysql.DHCPPort, seq int, toolDataSet *tool.DataSet) {
+func (b *DataSet) AddDHCPPort(dbItem *metadbmodel.DHCPPort, seq int, toolDataSet *tool.DataSet) {
 	vpcLcuuid, _ := toolDataSet.GetVPCLcuuidByID(dbItem.VPCID)
 	b.DHCPPorts[dbItem.Lcuuid] = &DHCPPort{
 		DiffBase: DiffBase{
@@ -35,12 +35,12 @@ func (b *DataSet) AddDHCPPort(dbItem *mysql.DHCPPort, seq int, toolDataSet *tool
 		AZLcuuid:     dbItem.AZ,
 		VPCLcuuid:    vpcLcuuid,
 	}
-	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, b.DHCPPorts[dbItem.Lcuuid]))
+	b.GetLogFunc()(addDiffBase(ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, b.DHCPPorts[dbItem.Lcuuid]), b.metadata.LogPrefixes)
 }
 
 func (b *DataSet) DeleteDHCPPort(lcuuid string) {
 	delete(b.DHCPPorts, lcuuid)
-	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, lcuuid))
+	log.Info(deleteDiffBase(ctrlrcommon.RESOURCE_TYPE_DHCP_PORT_EN, lcuuid), b.metadata.LogPrefixes)
 }
 
 type DHCPPort struct {

@@ -22,6 +22,8 @@ use serde::Serialize;
 use super::super::{AppProtoHead, LogMessageType};
 use crate::common::flow::L7PerfStats;
 use crate::common::l7_protocol_log::L7ParseResult;
+use crate::config::handler::LogParserConfig;
+use crate::flow_generator::protocol_logs::set_captured_byte;
 use crate::{
     common::{
         enums::IpProtocol,
@@ -72,7 +74,15 @@ pub struct MongoDBInfo {
     #[serde(rename = "response_status")]
     pub status: L7ResponseStatus,
 
+    captured_request_byte: u32,
+    captured_response_byte: u32,
+
     rrt: u64,
+
+    #[serde(skip)]
+    is_on_blacklist: bool,
+    #[serde(skip)]
+    reply_false: bool,
 }
 
 impl L7ProtocolInfoInterface for MongoDBInfo {
@@ -98,11 +108,22 @@ impl L7ProtocolInfoInterface for MongoDBInfo {
     fn is_tls(&self) -> bool {
         self.is_tls
     }
+
+    fn get_request_resource_length(&self) -> usize {
+        self.request.len()
+    }
+
+    fn is_on_blacklist(&self) -> bool {
+        self.is_on_blacklist
+    }
 }
 
 // 协议文档: https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/
 impl MongoDBInfo {
     fn merge(&mut self, other: &mut Self) {
+        if other.is_on_blacklist {
+            self.is_on_blacklist = other.is_on_blacklist;
+        }
         match other.msg_type {
             LogMessageType::Request => {
                 self.req_len = other.req_len;
@@ -110,6 +131,7 @@ impl MongoDBInfo {
                 self.op_code = other.op_code;
                 std::mem::swap(&mut self.request, &mut other.request);
                 self.request_id = other.request_id;
+                self.captured_request_byte = other.captured_request_byte;
             }
             LogMessageType::Response => {
                 self.response_code = other.response_code;
@@ -118,8 +140,16 @@ impl MongoDBInfo {
                 self.status = other.status;
                 self.response_id = other.response_id;
                 std::mem::swap(&mut self.response, &mut other.response);
+                self.captured_response_byte = other.captured_response_byte;
             }
             _ => {}
+        }
+    }
+
+    fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
+        if let Some(t) = config.l7_log_blacklist_trie.get(&L7Protocol::MongoDB) {
+            self.is_on_blacklist = t.request_resource.is_on_blacklist(&self.request)
+                || t.request_type.is_on_blacklist(&self.op_code_name);
         }
     }
 }
@@ -132,10 +162,12 @@ impl From<MongoDBInfo> for L7ProtocolSendLog {
             EbpfFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
+            captured_request_byte: f.captured_request_byte,
+            captured_response_byte: f.captured_response_byte,
             req_len: std::option::Option::<u32>::from(f.req_len),
             req: L7Request {
                 req_type: f.op_code_name,
-                resource: f.request.to_string(),
+                resource: f.request,
                 ..Default::default()
             },
             resp_len: std::option::Option::<u32>::from(f.resp_len),
@@ -161,6 +193,7 @@ impl From<MongoDBInfo> for L7ProtocolSendLog {
 pub struct MongoDBLog {
     info: MongoDBInfo,
     perf_stats: Option<L7PerfStats>,
+    last_is_on_blacklist: bool,
 }
 
 impl L7ProtocolParserInterface for MongoDBLog {
@@ -188,11 +221,33 @@ impl L7ProtocolParserInterface for MongoDBLog {
         };
 
         self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
-        info.cal_rrt(param, None).map(|rrt| {
-            info.rrt = rrt;
-            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-        });
         info.is_tls = param.is_tls();
+        set_captured_byte!(info, param);
+        if let Some(config) = param.parse_config {
+            info.set_is_on_blacklist(config);
+        }
+        if !info.is_on_blacklist && !self.last_is_on_blacklist {
+            match info.msg_type {
+                LogMessageType::Request => {
+                    self.perf_stats.as_mut().map(|p| p.inc_req());
+                }
+                LogMessageType::Response => {
+                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+                    if info.response_code > 0 {
+                        self.perf_stats.as_mut().map(|p| p.inc_req_err());
+                    }
+                }
+                _ => {}
+            }
+            if info.reply_false {
+                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
+            }
+            info.cal_rrt(param).map(|rrt| {
+                info.rrt = rrt;
+                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
+            });
+        }
+        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::MongoDBInfo(info)))
         } else {
@@ -260,15 +315,11 @@ impl MongoDBLog {
             info.msg_type = LogMessageType::Request;
             self.info.req_len = header.length;
             info.request_id = header.request_id;
-            self.perf_stats
-                .as_mut()
-                .map(|p: &mut L7PerfStats| p.inc_req());
         } else {
             info.msg_type = LogMessageType::Response;
             self.info.resp_len = header.length;
             info.request_id = header.response_to;
             info.response_id = header.request_id;
-            self.perf_stats.as_mut().map(|p| p.inc_resp());
         }
 
         // command decode
@@ -294,9 +345,6 @@ impl MongoDBLog {
                                 msg_body.sections.c_string.unwrap_or(_UNKNOWN.to_string());
                         }
                         info.response_code = msg_body.sections.doc.get_i32("code").unwrap_or(0);
-                        if info.response_code > 0 {
-                            self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                        }
                     }
                     _ => {
                         info.request = msg_body.sections.doc.to_string();
@@ -307,9 +355,7 @@ impl MongoDBLog {
                 // "OP_REPLY"
                 let mut msg_body = MongoOpReply::default();
                 msg_body.decode(&payload[_HEADER_SIZE..])?;
-                if !msg_body.reply_ok {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                }
+                info.reply_false = !msg_body.reply_ok;
                 info.response = msg_body.doc.to_string();
                 info.exception = msg_body.response_msg;
             }
@@ -319,9 +365,11 @@ impl MongoDBLog {
                     .map_err(|_| Error::L7ProtocolUnknown)?
                     .to_string_lossy()
                     .into_owned();
-                let update = Document::from_reader(&payload[24 + info.exception.len() + 1..])
-                    .unwrap_or(Document::default());
-                info.request = update.to_string();
+                if payload.len() > 24 + info.exception.len() + 1 {
+                    let update = Document::from_reader(&payload[24 + info.exception.len() + 1..])
+                        .unwrap_or(Document::default());
+                    info.request = update.to_string();
+                }
             }
             _OP_INSERT if payload.len() > 20 => {
                 // OP_INSERT
@@ -329,9 +377,11 @@ impl MongoDBLog {
                     .map_err(|_| Error::L7ProtocolUnknown)?
                     .to_string_lossy()
                     .into_owned();
-                let insert = Document::from_reader(&payload[20 + info.exception.len() + 1..])
-                    .unwrap_or(Document::default());
-                info.request = insert.to_string();
+                if payload.len() > 20 + info.exception.len() + 1 {
+                    let insert = Document::from_reader(&payload[20 + info.exception.len() + 1..])
+                        .unwrap_or(Document::default());
+                    info.request = insert.to_string();
+                }
             }
             _OP_QUERY if payload.len() > 28 => {
                 // "OP_QUERY"
@@ -341,11 +391,13 @@ impl MongoDBLog {
                         .to_string_lossy()
                         .into_owned();
 
-                let query = Document::from_reader(
-                    &payload[_QUERY_DOC_OFFSET + collection_name.len() + 1..],
-                )
-                .unwrap_or(Document::default());
-                info.request = query.to_string();
+                if payload.len() > _QUERY_DOC_OFFSET + collection_name.len() + 1 {
+                    let query = Document::from_reader(
+                        &payload[_QUERY_DOC_OFFSET + collection_name.len() + 1..],
+                    )
+                    .unwrap_or(Document::default());
+                    info.request = query.to_string();
+                }
             }
             _OP_GET_MORE | _OP_DELETE if payload.len() > 20 => {
                 // OP_GET_MORE
@@ -384,7 +436,7 @@ impl MongoDBHeader {
         if payload.len() < 16 {
             return -1;
         }
-        self.length = bytes::read_u32_le(payload) & 0xffffff;
+        self.length = bytes::read_u32_le(payload);
         if self.length < payload.len() as u32 {
             return -1;
         }
@@ -450,7 +502,7 @@ impl MongoOpMsg {
         let section_len = bytes::read_u32_le(
             &payload[Self::_DOC_LENGTH_OFFSET..Self::_DOC_LENGTH_OFFSET + Self::_DOC_LENGTH_LEN],
         );
-        if payload.len() < Self::_DOC_LENGTH_LEN + section_len as usize {
+        if payload.len() < Self::_KIND_LEN + section_len as usize {
             return Ok(false);
         }
         let _ = sections.decode(&payload);
@@ -634,20 +686,29 @@ mod tests {
             };
 
             let mut mongo = MongoDBLog::default();
-            let param = &ParseParam::new(packet as &MetaPacket, log_cache.clone(), true, true);
+            let param = &mut ParseParam::new(
+                packet as &MetaPacket,
+                log_cache.clone(),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
+            param.set_captured_byte(payload.len());
 
             let is_mongo = mongo.check_payload(payload, param);
             let info = mongo.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {
                     L7ProtocolInfo::MongoDBInfo(i) => {
-                        output.push_str(&format!("{:?} is_mongo: {}\r\n", i, is_mongo));
+                        output.push_str(&format!("{:?} is_mongo: {}\n", i, is_mongo));
                     }
                     _ => unreachable!(),
                 }
             } else {
                 output.push_str(&format!(
-                    "{:?} is_mongo: {}\r\n",
+                    "{:?} is_mongo: {}\n",
                     MongoDBInfo::default(),
                     is_mongo
                 ));
@@ -658,7 +719,10 @@ mod tests {
 
     #[test]
     fn check() {
-        let files = vec![("mongo.pcap", "mongo.result")];
+        let files = vec![
+            ("mongo.pcap", "mongo.result"),
+            ("mongo-msg.pcap", "mongo-msg.result"),
+        ];
 
         for item in files.iter() {
             let expected = fs::read_to_string(&Path::new(FILE_DIR).join(item.1)).unwrap();

@@ -18,25 +18,20 @@ package db
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type VPC struct {
-	OperatorBase[mysql.VPC]
+	OperatorBase[*metadbmodel.VPC, metadbmodel.VPC]
 }
 
 func NewVPC() *VPC {
 	operater := &VPC{
-		OperatorBase[mysql.VPC]{
-			resourceTypeName: ctrlrcommon.RESOURCE_TYPE_VPC_EN,
-			softDelete:       true,
-			allocateID:       true,
-		},
+		newOperatorBase[*metadbmodel.VPC](
+			ctrlrcommon.RESOURCE_TYPE_VPC_EN,
+			true,
+			true,
+		),
 	}
-	operater.setter = operater
 	return operater
-}
-
-func (a *VPC) setDBItemID(dbItem *mysql.VPC, id int) {
-	dbItem.ID = id
 }

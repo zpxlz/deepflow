@@ -17,37 +17,38 @@
 package tagrecorder
 
 import (
-	"github.com/deepflowio/deepflow/server/controller/db/mysql"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 )
 
 type ChLbListener struct {
-	UpdaterBase[mysql.ChLBListener, IDKey]
+	UpdaterComponent[metadbmodel.ChLBListener, IDKey]
 	resourceTypeToIconID map[IconKey]int
 }
 
 func NewChLbListener(resourceTypeToIconID map[IconKey]int) *ChLbListener {
 	updater := &ChLbListener{
-		UpdaterBase[mysql.ChLBListener, IDKey]{
-			resourceTypeName: RESOURCE_TYPE_CH_LB_LISTENER,
-		},
+		newUpdaterComponent[metadbmodel.ChLBListener, IDKey](
+			RESOURCE_TYPE_CH_LB_LISTENER,
+		),
 		resourceTypeToIconID,
 	}
 
-	updater.dataGenerator = updater
+	updater.updaterDG = updater
 	return updater
 }
 
-func (l *ChLbListener) generateNewData() (map[IDKey]mysql.ChLBListener, bool) {
-	var lbListeners []mysql.LBListener
-	var lbTargetServers []mysql.LBTargetServer
-	err := mysql.Db.Unscoped().Find(&lbListeners).Error
+func (l *ChLbListener) generateNewData(db *metadb.DB) (map[IDKey]metadbmodel.ChLBListener, bool) {
+	var lbListeners []metadbmodel.LBListener
+	var lbTargetServers []metadbmodel.LBTargetServer
+	err := db.Unscoped().Find(&lbListeners).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
-	err = mysql.Db.Unscoped().Find(&lbTargetServers).Error
+	err = db.Unscoped().Find(&lbTargetServers).Error
 	if err != nil {
-		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err))
+		log.Errorf(dbQueryResourceFailed(l.resourceTypeName, err), db.LogPrefixORGID)
 		return nil, false
 	}
 
@@ -55,32 +56,33 @@ func (l *ChLbListener) generateNewData() (map[IDKey]mysql.ChLBListener, bool) {
 	for _, lbTargetServer := range lbTargetServers {
 		lbTargetSertverMap[lbTargetServer.LBListenerID] += 1
 	}
-
-	keyToItem := make(map[IDKey]mysql.ChLBListener)
+	keyToItem := make(map[IDKey]metadbmodel.ChLBListener)
 	for _, lbListener := range lbListeners {
 		if lbTargetSertverMap[lbListener.ID] == 0 {
 			continue
 		}
 		if lbListener.DeletedAt.Valid {
-			keyToItem[IDKey{ID: lbListener.ID}] = mysql.ChLBListener{
-				ID:   lbListener.ID,
-				Name: lbListener.Name + " (deleted)",
+			keyToItem[IDKey{ID: lbListener.ID}] = metadbmodel.ChLBListener{
+				ID:     lbListener.ID,
+				Name:   lbListener.Name + " (deleted)",
+				TeamID: DomainToTeamID[lbListener.Domain],
 			}
 		} else {
-			keyToItem[IDKey{ID: lbListener.ID}] = mysql.ChLBListener{
-				ID:   lbListener.ID,
-				Name: lbListener.Name,
+			keyToItem[IDKey{ID: lbListener.ID}] = metadbmodel.ChLBListener{
+				ID:     lbListener.ID,
+				Name:   lbListener.Name,
+				TeamID: DomainToTeamID[lbListener.Domain],
 			}
 		}
 	}
 	return keyToItem, true
 }
 
-func (l *ChLbListener) generateKey(dbItem mysql.ChLBListener) IDKey {
+func (l *ChLbListener) generateKey(dbItem metadbmodel.ChLBListener) IDKey {
 	return IDKey{ID: dbItem.ID}
 }
 
-func (l *ChLbListener) generateUpdateInfo(oldItem, newItem mysql.ChLBListener) (map[string]interface{}, bool) {
+func (l *ChLbListener) generateUpdateInfo(oldItem, newItem metadbmodel.ChLBListener) (map[string]interface{}, bool) {
 	updateInfo := make(map[string]interface{})
 	if oldItem.Name != newItem.Name {
 		updateInfo["name"] = newItem.Name
